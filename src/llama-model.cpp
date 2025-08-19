@@ -10,6 +10,9 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+// experimental memory that stores post-norm X and rematerializes K/V
+#include "llama-memory-xquant.h"
+#include "llama-memory-xquant-wrap.h"
 
 #include "ggml-cpp.h"
 
@@ -24,6 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib>
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -18233,11 +18237,13 @@ struct llm_build_smallthinker : public llm_graph_context{
 };
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
-    llama_memory_i * res;
+    // runtime toggles (default OFF)
+    const char *xq_env  = std::getenv("LLAMA_XQUANT");
+    const bool  xq_on   = (xq_env && std::atoi(xq_env) != 0);
+
+    llama_memory_i * res = nullptr;
 
     switch (arch) {
-        // Models that need specific instantiation should be handled in the
-        // switch statement
         case LLM_ARCH_BERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
@@ -18268,22 +18274,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     cparams.n_ctx = GGML_PAD(cparams.n_ctx, padding);
 
                     res = new llama_memory_hybrid(
-                        /* model             */ *this,
-                        /* attn_type_k       */ params.type_k,
-                        /* attn_type_v       */ params.type_v,
-                        /* attn_v_trans      */ !cparams.flash_attn,
-                        /* attn_kv_size      */ cparams.n_ctx,
-                        /* attn_n_pad        */ padding,
-                        /* attn_n_swa        */ hparams.n_swa,
-                        /* attn_swa_type     */ hparams.swa_type,
-                        /* recurrent_type_k  */ GGML_TYPE_F32,
-                        /* recurrent_type_v  */ GGML_TYPE_F32,
-                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                        /* n_seq_max         */ cparams.n_seq_max,
-                        /* offload           */ cparams.offload_kqv,
-                        /* unified           */ cparams.kv_unified,
-                        /* filter_attn       */ (arch == LLM_ARCH_FALCON_H1) ? [&](int32_t) { return true; } : (llama_memory_hybrid::layer_filter_cb)nullptr,
-                        /* filter_recr       */ (arch == LLM_ARCH_FALCON_H1) ? [&](int32_t) { return true; } : (llama_memory_hybrid::layer_filter_cb)nullptr);
+                            *this,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx,
+                            /* attn_n_pad        */ padding,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ (arch == LLM_ARCH_FALCON_H1) ? [&](int32_t) { return true; } : (llama_memory_hybrid::layer_filter_cb)nullptr,
+                            /* filter_recr       */ (arch == LLM_ARCH_FALCON_H1) ? [&](int32_t) { return true; } : (llama_memory_hybrid::layer_filter_cb)nullptr);
                 } else {
                     const auto padding = llama_kv_cache::get_padding(cparams);
 
@@ -18335,7 +18341,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.swa_type);
                     }
                 }
-            }
+            } break;
+    }
+
+    // Optional XQuant wrapper (keeps base memory behavior intact)
+    if (xq_on && res) {
+        // Wrap the base KV memory with XQuant logic. Ownership transferred.
+        llama_memory_ptr base(res);
+        llama_memory_ptr wrapped = llama_memory_make_xquant_wrap(this, std::move(base), /*n_ctx_tokens=*/(int32_t)cparams.n_ctx);
+        return wrapped.release();
     }
 
     return res;
