@@ -8,8 +8,19 @@
 #include <vector>
 #include <cstdio>
 #include <climits>
+#include <limits>
 
 namespace {
+
+// Upstream-friendly helpers: assert then cast (no templates/pragmas/deps)
+static inline int32_t to_i32(int64_t v) {
+    GGML_ASSERT(v >= 0 && v <= INT32_MAX);
+    return (int32_t) v;
+}
+static inline int to_int(size_t v) {
+    GGML_ASSERT(v <= (size_t)INT_MAX);
+    return (int) v;
+}
 
 struct xq_layer_buf {
     // model dims
@@ -30,8 +41,8 @@ public:
         const int64_t d64  = llama_model_n_embd(mdl_);
         GGML_ASSERT(nl64 >= 0 && nl64 <= INT32_MAX);
         GGML_ASSERT(d64  >  0 && d64  <= INT32_MAX);
-        const int32_t nl = (int32_t) nl64;
-        const int32_t d  = (int32_t) d64;
+        const int32_t nl = to_i32(nl64);
+        const int32_t d  = to_i32(d64);
 
         const char * tname = ggml_type_name(LLAMA_XQ_GGML_TYPE);
         // cast to (int) for MSVC's printf family to avoid width warnings
@@ -41,7 +52,7 @@ public:
         // sanity: embedding must align to quant block size
         const int64_t blck64 = ggml_blck_size(LLAMA_XQ_GGML_TYPE);
         GGML_ASSERT(blck64 > 0 && blck64 <= INT32_MAX);
-        const int32_t blck = (int32_t) blck64;
+        const int32_t blck = to_i32(blck64);
 
         GGML_ASSERT(blck > 0 && d % blck == 0 && "n_embd must be multiple of quant block size");
 
@@ -100,6 +111,12 @@ public:
         if (n_embd != L.n_embd) return false;
         if (L.n_written + n_tokens > n_ctx_) return false;
 
+        // MVP assumes single-stream usage; if you later support multi-stream, replace with per-seq bookkeeping.
+        GGML_ASSERT(n_tokens > 0);
+        GGML_ASSERT(L.n_embd > 0);
+        GGML_ASSERT(L.n_written >= 0 && L.n_written <= n_ctx_);
+        GGML_ASSERT((int64_t)L.n_embd <= INT_MAX);
+
         std::vector<float> row_fp32((size_t)L.n_embd);
 
         // public quantization hooks
@@ -114,7 +131,7 @@ public:
 
             if (is_fp16) {
                 const ggml_fp16_t * s = (const ggml_fp16_t *)src;
-                for (int i = 0; i < L.n_embd; ++i) row_fp32[i] = ggml_fp16_to_fp32(s[i]);
+                for (int32_t i = 0; i < L.n_embd; ++i) row_fp32[(size_t)i] = ggml_fp16_to_fp32(s[i]);
             } else {
                 std::memcpy(row_fp32.data(), src, (size_t)L.n_embd * sizeof(float));
             }
@@ -124,8 +141,8 @@ public:
 
             GGML_ASSERT(L.n_embd <= INT_MAX);
             q_from(/*src f32*/ row_fp32.data(),
-                   /*dst q  */ dst_row,
-                   /*k     */ (int)L.n_embd);
+                /*dst q  */ dst_row, 
+                /*k*/ to_int((size_t)L.n_embd));
 
             ++L.n_written;
         }
@@ -144,8 +161,12 @@ public:
 
         // Xt: [n_embd, T]  (ne0=n_embd, ne1=T) — ggml takes int64 dims
         ggml_tensor * Xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, (int64_t)L.n_embd, (int64_t)T);
+        ggml_set_name(Xt, "xq_Xt[d,T]");
 
         std::vector<float> row_fp32((size_t)L.n_embd);
+
+        // Backend-safe staging buffer (F16) for the entire [d, T] block
+        std::vector<ggml_fp16_t> buf((size_t)L.n_embd * (size_t)T);
 
         const auto * tt = ggml_get_type_traits(LLAMA_XQ_GGML_TYPE);
         if (!tt || !tt->to_float) return nullptr;
@@ -157,13 +178,17 @@ public:
 
             GGML_ASSERT(L.n_embd <= INT_MAX);
             q_to(/*src q */ src_row,
-                 /*dst f */ row_fp32.data(),
-                 /*k     */ (int)L.n_embd);
+                /*dst f */ row_fp32.data(),
+                /*k     */ to_int((size_t)L.n_embd));
 
-            ggml_fp32_to_fp16_row(row_fp32.data(),
-                (ggml_fp16_t *)((char*)Xt->data + (size_t)t * Xt->nb[1]),
-                (int)L.n_embd);
+            // Pack into the staging buffer at row t
+            ggml_fp16_t * dst_row_f16 = buf.data() + (size_t)t * (size_t)L.n_embd;
+            ggml_fp32_to_fp16_row(row_fp32.data(), dst_row_f16, to_int((size_t)L.n_embd));
         }
+
+        // Commit the entire block to the (possibly backend-managed) tensor
+        const size_t nbytes = buf.size() * sizeof(ggml_fp16_t);
+        ggml_backend_tensor_set(Xt, buf.data(), 0, nbytes);
 
         return Xt;
     }
@@ -229,16 +254,27 @@ llama_xq_remat_result llama_xquant_remat_kv(
     auto * m = as_xq(mem);
     if (!m) return R;
 
-    const int32_t d = (int32_t) Wk->ne[0];
+    const int32_t d = to_i32((int64_t) Wk->ne[0]);
     const int32_t T = t1 - t0;
 
-    ggml_tensor * Xt = m->dequant_window_fp16(ctx, il, t0, t1, d); // [d, T] in our construction
+    // bounds
+    GGML_ASSERT(d > 0);
+    GGML_ASSERT(t0 >= 0);
+    GGML_ASSERT(t1 >= t0);
+    // note: bounds for [t0,t1) are validated inside dequant_window_fp16()
+
+    // dequant window
+    ggml_tensor * Xt = m->dequant_window_fp16(ctx, il, t0, t1, d); // [d,T]
     if (!Xt) return R;
 
-    ggml_tensor * Ktmp = ggml_mul_mat(ctx, Wk, Xt);
-    ggml_tensor * Vtmp = ggml_mul_mat(ctx, Wv, Xt);
+    ggml_tensor * Ktmp = ggml_mul_mat(ctx, Wk, Xt); // [d,d] x [d,T] -> [d,T]
+    ggml_tensor * Vtmp = ggml_mul_mat(ctx, Wv, Xt); // [d,d] x [d,T] -> [d,T]
 
     auto to_Td = [&](ggml_tensor *M) -> ggml_tensor * {
+        GGML_ASSERT(M);
+        GGML_ASSERT(M->ne[0] > 0);
+        GGML_ASSERT(M->ne[1] > 0);
+
         // Some backends can yield [d,T] or [T,d]. Normalize to [T,d].
         if (M->ne[0] == d && M->ne[1] == T) {
             return ggml_transpose(ctx, M); // [d,T] -> [T,d]
@@ -252,7 +288,7 @@ llama_xq_remat_result llama_xquant_remat_kv(
 
     ggml_tensor * K = to_Td(Ktmp);
     ggml_tensor * V = to_Td(Vtmp);
-
+    
     R.K = K; R.V = V; R.ok = true;
     return R;
 }

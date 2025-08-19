@@ -3,8 +3,16 @@
 #include "llama-batch.h"
 #include "llama.h"
 #include "ggml.h"
+#define LLAMA_API_INTERNAL
+#include "llama-impl.h"
+#include "llama.h"
+#include "ggml.h"
+#include <mutex>
 #include <memory>
 #include <utility>
+#include <mutex>
+
+static std::once_flag g_xq_once;
 
 namespace {
 class llama_memory_xquant_wrap final : public llama_memory_i {
@@ -13,7 +21,9 @@ public:
     : mdl_(mdl)
     , base_(std::move(base_kv))
     , store_(llama_memory_make_xquant(mdl, n_ctx)) {
-        // nothing else
+        std::call_once(g_xq_once, []{
+            LLAMA_LOG_INFO("[xquant] wrapper active (capturing post-norm X, rematerializing K/V)\n");
+        });
     }
 
     // delegate everything to base memory (no behavior change)

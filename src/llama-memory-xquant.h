@@ -6,6 +6,12 @@
 #include <cstdint>
 #include <memory>
 
+// NOTE (MVP):
+//  - Single-stream / single-sequence usage assumed.
+//  - GQA disabled by caller for now (n_head_kv < n_head).
+//  - K is returned pre-RoPE; caller must apply RoPE exactly as baseline does.
+//  - seq_rm/seq_cp/seq_div are no-ops (documented in the .cpp).
+
 // MVP constants (hardcoded knobs)
 #ifndef LLAMA_XQ_GGML_TYPE
 #define LLAMA_XQ_GGML_TYPE GGML_TYPE_Q4_0    // 4-bit, block=32; reuses tested ggml kernels

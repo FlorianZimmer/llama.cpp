@@ -27,7 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
-#include <cstdlib>
+#include <cstdlib> // std::getenv, std::atoi
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -18344,11 +18344,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
     }
 
-    // Optional XQuant wrapper (keeps base memory behavior intact)
+    // --- Optional XQuant wrapper (no graph changes; KV-backend will use it) ---
+    // For recurrent-only architectures we skip; for unified/hybrid caches it's safe to wrap.
     if (xq_on && res) {
-        // Wrap the base KV memory with XQuant logic. Ownership transferred.
+        // Transfer ownership of the base memory to the wrapper.
         llama_memory_ptr base(res);
-        llama_memory_ptr wrapped = llama_memory_make_xquant_wrap(this, std::move(base), /*n_ctx_tokens=*/(int32_t)cparams.n_ctx);
+        // n_ctx here is "tokens per stream" after any padding/unification above.
+        // It’s OK to pass cparams.n_ctx as the wrapper’s capacity.
+        llama_memory_ptr wrapped = llama_memory_make_xquant_wrap(
+            this, std::move(base), /*n_ctx_tokens=*/(int32_t)cparams.n_ctx);
         return wrapped.release();
     }
 
