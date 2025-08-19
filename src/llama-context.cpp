@@ -750,6 +750,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // XQuant: run any deferred host copies / appends (prefill X capture)
+    res->run_post_cbs();
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -812,7 +815,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status); // XQuant: non-const for post-cbs
 
     cparams.causal_attn = causal_attn_org;
 
@@ -893,6 +896,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         // overlap with device computation.
         ggml_backend_sched_reset(sched.get());
     }
+
+    // XQuant: run deferred post-run callbacks for encoder graphs too
+    res->run_post_cbs();
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -1053,7 +1059,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status); // XQuant: non-const for post-cbs
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the KV cache
@@ -1167,6 +1173,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
             }
         }
+
+        // XQuant: run deferred post-run callbacks (e.g., capture X from device)
+        res->run_post_cbs();
 
         n_outputs_prev += n_outputs;
     } while (mctx->next());

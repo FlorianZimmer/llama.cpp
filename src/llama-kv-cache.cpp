@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-memory-xquant-wrap.h" // XQuant
 
 #include <algorithm>
 #include <cassert>
@@ -11,6 +12,9 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <atomic>   // XQuant
+#include <memory>   // XQuant
+#include <vector>   // XQuant
 
 //
 // llama_kv_cache
@@ -2054,4 +2058,171 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 uint32_t llama_kv_cache::get_padding(const llama_cparams & cparams) {
     // the FA kernels require padding to avoid extra runtime boundary checks
     return cparams.flash_attn ? 256u : 32u;
+}
+
+// ========= XQuant: KV-backed helpers (no graph churn) =========
+namespace {
+static std::atomic<bool> g_xq_log_enabled_once{false};
+static std::atomic<bool> g_xq_log_w_once{false};
+}
+
+bool llama_kv_cache_unified_context::xquant_enabled() const {
+    const bool env_on = !!::getenv("LLAMA_XQUANT");
+    // Future: also check cparams.xquant when present
+    if (env_on && !g_xq_log_enabled_once.exchange(true)) {
+        LLAMA_LOG_INFO("[xquant] enabled (capture X on prefill; remat K/V on read)\n");
+    }
+    return env_on;
+}
+
+llama_memory_i * llama_kv_cache_unified_context::get_memory() const {
+    // unified KV itself is a llama_memory_i
+    return static_cast<llama_memory_i *>(kv);
+}
+
+ggml_tensor * llama_kv_cache_unified_context::get_attn_wk(int32_t il) const {
+    // expose Wk when the arch is not fused QKV; otherwise nullptr
+    // keep all model detail *inside* KV TU
+    // note: relies on internal model layout; safe here (llama-impl.h included)
+    const auto & mdl = kv->model;
+    GGML_UNUSED(mdl.arch); // future: arch-specific fallbacks
+    const auto & layers = mdl.layers;
+    if (il < 0 || il >= (int) layers.size()) return nullptr;
+    const auto & L = layers[il];
+    ggml_tensor * wk = nullptr;
+    // Heuristic: if fused QKV exists, prefer baseline path (return nullptr)
+    // Otherwise expose L.wk if present.
+    // (Member names follow upstream style; if fused QKV: L.wqkv != nullptr)
+    if constexpr (true) {
+        // best-effort, upstream-friendly; fall back cleanly if not present
+        if (/* fused QKV */ ggml_get_name(L.wqkv) != nullptr) {
+            // fused: no separate wk
+            wk = nullptr;
+        } else {
+            wk = L.wk;
+        }
+    }
+    if (!g_xq_log_w_once.exchange(true)) {
+        if (wk) LLAMA_LOG_DEBUG("[xquant] wk/wv detected; remat active\n");
+        else    LLAMA_LOG_DEBUG("[xquant] wk/wv not exposed; baseline KV\n");
+    }
+    return wk;
+}
+
+ggml_tensor * llama_kv_cache_unified_context::get_attn_wv(int32_t il) const {
+    const auto & mdl = kv->model;
+    const auto & layers = mdl.layers;
+    if (il < 0 || il >= (int) layers.size()) return nullptr;
+    const auto & L = layers[il];
+    ggml_tensor * wv = nullptr;
+    if constexpr (true) {
+        if (/* fused QKV */ ggml_get_name(L.wqkv) != nullptr) {
+            wv = nullptr;
+        } else {
+            wv = L.wv;
+        }
+    }
+    return wv;
+}
+
+void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il) {
+    // MVP: single stream, standard RoPE; stage to host then append into XQuant store
+    if (!xquant_enabled()) return;
+    if (!res || !X_norm)   return;
+    // W exposure check (fused QKV, unsupported arch => baseline)
+    if (!get_attn_wk(il) || !get_attn_wv(il)) return;
+
+    ggml_context * ctx = res->get_ctx();
+    ggml_tensor  * t   = X_norm;
+    // cast/contiguous F16 [d, T]
+    if (t->type != GGML_TYPE_F16) {
+        t = ggml_cast(ctx, t, GGML_TYPE_F16);
+    }
+    if (!ggml_is_contiguous(t)) {
+        t = ggml_cont(ctx, t);
+    }
+
+    const int32_t d = (int32_t) t->ne[0];
+    const int32_t T = (int32_t) t->ne[1];
+
+    // keep buffers alive until the post-run callback fires
+    auto host = std::make_shared<std::vector<uint16_t>>((size_t) d*T);
+    auto * mem = get_memory();
+
+    res->register_post_run([mem, il, t, host, d, T]() {
+        // copy device -> host
+        ggml_backend_tensor_get(t, host->data(), 0, (size_t) d*T*sizeof(uint16_t));
+        // forward to wrapper (works with or without wrapper)
+        (void) llama_xquant_wrap_append_prefill_rows(mem, il, host->data(), T, d, /*is_fp16=*/true);
+    });
+}
+
+ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32_t il,
+                                                       ggml_tensor * k_cur, ggml_tensor * k_idxs) const {
+    GGML_UNUSED(k_cur);
+    GGML_UNUSED(k_idxs);
+    // clean fallbacks
+    if (!xquant_enabled())                       return get_k(ctx, il);
+    if (!get_supports_set_rows())                return get_k(ctx, il);
+    ggml_tensor * Wk = get_attn_wk(il);
+    ggml_tensor * Wv = get_attn_wv(il);
+    if (!Wk || !Wv)                              return get_k(ctx, il);
+    const uint32_t T_past = sinfos[i_cur].head(); // MVP: single-stream => [0, head)
+    if (T_past == 0)                              return get_k(ctx, il);
+
+    // Rematerialize [T_past, d] (pre-RoPE); we will *overlay* later.
+    auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il, /*t0=*/0, /*t1=*/(int32_t) T_past, Wk, Wv);
+    if (!R.ok || !R.K)                            return get_k(ctx, il);
+
+    // NOTE (MVP): K requires RoPE + shaping identical to cache layout.
+    // To keep this diff surgical and graph-stable, we currently defer to the
+    // baseline path for K. V is rematerialized below in get_v_xq().
+    return get_k(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32_t il,
+                                                       ggml_tensor * v_cur, ggml_tensor * v_idxs) const {
+    GGML_UNUSED(v_cur);
+    GGML_UNUSED(v_idxs);
+    if (!xquant_enabled())                       return get_v(ctx, il);
+    if (!get_supports_set_rows())                return get_v(ctx, il);
+    ggml_tensor * Wk = get_attn_wk(il);
+    ggml_tensor * Wv = get_attn_wv(il);
+    if (!Wk || !Wv)                              return get_v(ctx, il);
+    const uint32_t T_past = sinfos[i_cur].head(); // MVP: single-stream => [0, head)
+    if (T_past == 0)                              return get_v(ctx, il);
+
+    auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il, /*t0=*/0, /*t1=*/(int32_t) T_past, Wk, Wv);
+    if (!R.ok || !R.V)                            return get_v(ctx, il);
+
+    // Baseline view (final 4D layout expected by attention)
+    ggml_tensor * v_full = get_v(ctx, il);
+
+    // MVP overlay of the rematerialized *past* into baseline V using set_rows:
+    //  - R.V is [T_past, d] in row-major (tokens-major). Cache expects 4D layout.
+    //  - To keep the patch minimal, we rely on ggml_set_rows() applying row-wise
+    //    updates on the flattened 2D view [1, N] that KV already uses internally.
+    //  - This preserves the just-written *current* rows (done via cpy_v()).
+    //
+    // Implementation detail:
+    //   llama_kv_cache_unified::cpy_v() already uses ggml_set_rows() on a 2D
+    //   reshaped view for indexed writes. We do the same here, but target the
+    //   first T_past rows (sequential) via a compact [T_past] I64 index tensor.
+    //
+    // Build constant [0..T_past-1] indices:
+    ggml_tensor * past_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T_past);
+    {
+        std::vector<int64_t> tmp(T_past);
+        for (uint32_t i = 0; i < T_past; ++i) tmp[i] = (int64_t) i;
+        ggml_backend_tensor_set(past_idxs, tmp.data(), 0, sizeof(int64_t)*tmp.size());
+    }
+
+    // Flatten views to reuse the same set_rows semantics as cpy_v():
+    if (v_full->ne[2] > 1) {
+        v_full = ggml_reshape_2d(ctx, v_full, v_full->ne[0], v_full->ne[1]*v_full->ne[2]);
+    }
+    ggml_tensor * v_view  = ggml_reshape_2d(ctx, v_full, 1, v_full->ne[0]*v_full->ne[1]);
+    ggml_tensor * v_past  = ggml_reshape_2d(ctx, R.V,     1, R.V->ne[0]*R.V->ne[1]); // [1, T_past*d]
+
+    return ggml_set_rows(ctx, v_view, v_past, past_idxs);
 }

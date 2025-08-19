@@ -485,6 +485,11 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // XQuant: post-run callback support (executed right after graph compute)
+    using post_run_cb = std::function<void()>;         // XQuant
+    void register_post_run(post_run_cb cb);            // XQuant
+    void run_post_cbs();                               // XQuant
+
     // important graph nodes
     ggml_tensor * t_tokens      = nullptr;
     ggml_tensor * t_logits      = nullptr;
@@ -510,6 +515,9 @@ private:
 
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
+
+    // XQuant: queued callbacks for deferred device->host work (e.g., capture X)
+    std::vector<post_run_cb> post_cbs;                 // XQuant
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;

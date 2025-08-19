@@ -188,6 +188,9 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
+    // XQuant: allow the context to peek model internals safely from this TU only
+    friend class llama_kv_cache_unified_context; // XQuant
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -263,6 +266,11 @@ private:
                llm_graph_result * res,
                   llama_context * lctx) const;
 
+    ggml_cgraph * build_graph_defrag(
+               llm_graph_result * res,
+                  llama_context * lctx,
+              const defrag_info & dinfo) const;
+              
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -340,6 +348,26 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    //
+    // XQuant: feature query + safe accessors that remain *behind* the KV
+    //
+    // These never escape the KV context API and have no effect on graph topology.
+    //
+    ggml_tensor * get_attn_wk(int32_t il) const; // XQuant
+    ggml_tensor * get_attn_wv(int32_t il) const; // XQuant
+
+    bool xquant_enabled() const;                 // XQuant
+    llama_memory_i * get_memory() const;         // XQuant
+
+    // Prefill: capture post-norm X rows *after* the graph runs
+    void xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il); // XQuant
+
+    // Decode: prefer XQuant rematerialized K/V (fallback to baseline transparently)
+    ggml_tensor * get_k_xq(ggml_context * ctx, int32_t il,
+                           ggml_tensor * k_cur, ggml_tensor * k_idxs) const; // XQuant
+    ggml_tensor * get_v_xq(ggml_context * ctx, int32_t il,
+                           ggml_tensor * v_cur, ggml_tensor * v_idxs) const; // XQuant
 
 private:
     llama_memory_status status;

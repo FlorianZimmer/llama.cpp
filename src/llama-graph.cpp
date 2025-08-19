@@ -420,6 +420,7 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
+    post_cbs.clear(); // XQuant
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -479,6 +480,17 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+}
+
+// XQuant: enqueue a post-run callback
+void llm_graph_result::register_post_run(post_run_cb cb) {
+    if (cb) post_cbs.emplace_back(std::move(cb));
+}
+
+// XQuant: run and clear queued post-run callbacks
+void llm_graph_result::run_post_cbs() {
+    for (auto & cb : post_cbs) cb();
+    post_cbs.clear();
 }
 
 //
@@ -1468,8 +1480,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV
+    ggml_tensor * k = mctx_cur->xquant_enabled()
+        ? mctx_cur->get_k_xq(ctx0, il, k_cur, inp->get_k_idxs())  // XQuant
+        : mctx_cur->get_k   (ctx0, il);
+    ggml_tensor * v = mctx_cur->xquant_enabled()
+        ? mctx_cur->get_v_xq(ctx0, il, v_cur, inp->get_v_idxs())  // XQuant
+        : mctx_cur->get_v   (ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale);
     cb(cur, "kqv_out", il);
