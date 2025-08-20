@@ -1480,11 +1480,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV
-    ggml_tensor * k = mctx_cur->xquant_enabled()
+    // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV.
+    // Hoist the feature check so we don't evaluate it twice.
+    const bool xq_on = mctx_cur->xquant_enabled();
+    ggml_tensor * k = xq_on
         ? mctx_cur->get_k_xq(ctx0, il, k_cur, inp->get_k_idxs())  // XQuant
         : mctx_cur->get_k   (ctx0, il);
-    ggml_tensor * v = mctx_cur->xquant_enabled()
+    ggml_tensor * v = xq_on
         ? mctx_cur->get_v_xq(ctx0, il, v_cur, inp->get_v_idxs())  // XQuant
         : mctx_cur->get_v   (ctx0, il);
 

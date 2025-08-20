@@ -154,6 +154,21 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
 
+// ---- XQuant: shared env parsing (accept 1/true/on/yes) ----
+namespace {
+static bool xq_env_enabled() {
+    const char *s = std::getenv("LLAMA_XQUANT");
+    if (!s || !*s) return false;
+    unsigned char c = static_cast<unsigned char>(*s);
+    if (std::isdigit(c)) return std::atoi(s) != 0;
+    std::string v(s);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char ch){ return std::tolower(ch); });
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+} // namespace
+
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -18268,9 +18283,8 @@ struct llm_build_smallthinker : public llm_graph_context{
 };
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
-    // runtime toggles (default OFF)
-    const char *xq_env  = std::getenv("LLAMA_XQUANT");
-    const bool  xq_on   = (xq_env && std::atoi(xq_env) != 0);
+    // XQuant: enable only if env explicitly true; wrapper is added below.
+    const bool xq_on = xq_env_enabled();
 
     llama_memory_i * res = nullptr;
 

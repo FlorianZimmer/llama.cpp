@@ -15,6 +15,8 @@
 #include <atomic>   // XQuant
 #include <memory>   // XQuant
 #include <vector>   // XQuant
+#include <cctype>   // XQuant
+#include <string>   // XQuant
 
 //
 // llama_kv_cache
@@ -2066,13 +2068,26 @@ static std::atomic<bool> g_xq_log_enabled_once{false};
 static std::atomic<bool> g_xq_log_w_once{false};
 }
 
+// Parse LLAMA_XQUANT as a *real* boolean.
+// Accept: 1/true/on/yes (case-insensitive) or any non-zero integer.
+static bool xq_env_enabled() {
+    const char *s = std::getenv("LLAMA_XQUANT");
+    if (!s || !*s) return false;
+    if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
+    std::string v(s);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+
 bool llama_kv_cache_unified_context::xquant_enabled() const {
-    const bool env_on = !!::getenv("LLAMA_XQUANT");
-    // Future: also check cparams.xquant when present
-    if (env_on && !g_xq_log_enabled_once.exchange(true)) {
-        LLAMA_LOG_INFO("[xquant] enabled (capture X on prefill; remat K/V on read)\n");
+    // Require BOTH: env enabled AND the XQuant wrapper is actually present.
+    const bool env_on  = xq_env_enabled();
+    const bool wrap_on = llama_memory_is_xquant_enabled(get_memory());
+    const bool on = env_on && wrap_on;
+    if (on && !g_xq_log_enabled_once.exchange(true)) {
+        return on;
     }
-    return env_on;
 }
 
 llama_memory_i * llama_kv_cache_unified_context::get_memory() const {
@@ -2146,15 +2161,13 @@ void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res,
     const int32_t d = (int32_t) t->ne[0];
     const int32_t T = (int32_t) t->ne[1];
 
-    // keep buffers alive until the post-run callback fires
-    auto host = std::make_shared<std::vector<uint16_t>>((size_t) d*T);
     auto * mem = get_memory(); // NOTE: if get_memory() is non-const, make it const or const_cast here.
 
-    res->register_post_run([mem, il, t, host, d, T]() {
-        // copy device -> host
-        ggml_backend_tensor_get(t, host->data(), 0, (size_t) d*T*sizeof(uint16_t));
-        // forward to wrapper (works with or without wrapper)
-        (void) llama_xquant_wrap_append_prefill_rows(mem, il, host->data(), T, d, /*is_fp16=*/true);
+    // Allocate the staging buffer *inside* the callback to avoid peak RSS spikes.
+    res->register_post_run([mem, il, t, d, T]() {
+        std::vector<uint16_t> host((size_t) d * (size_t) T);
+        ggml_backend_tensor_get(t, host.data(), 0, (size_t) d*T*sizeof(uint16_t));
+        (void) llama_xquant_wrap_append_prefill_rows(mem, il, host.data(), T, d, /*is_fp16=*/true);
     });
 }
 
