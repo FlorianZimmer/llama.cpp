@@ -6056,6 +6056,14 @@ struct llm_build_llama : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
 
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
+
             // self-attention
             {
                 // rope freq factors for llama3; may return nullptr for llama2 and other models
@@ -6217,6 +6225,14 @@ struct llm_build_llama_iswa : public llm_graph_context {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
 
             // self-attention
             {
@@ -15169,6 +15185,14 @@ struct llm_build_granite : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
 
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
+
             // self-attention
             cur = build_attention_layer(
                 cur, inp_pos, inp_attn,
@@ -15380,6 +15404,13 @@ struct llm_build_granite_hybrid : public llm_graph_context_mamba {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+            
+            // XQuant: capture post-norm X (prefill). For recurrent layers this no-ops.
+            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
 
             if (hparams.is_recurrent(il)) {
                 // ssm layer //

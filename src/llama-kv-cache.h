@@ -361,7 +361,7 @@ public:
     llama_memory_i * get_memory() const;         // XQuant
 
     // Prefill: capture post-norm X rows *after* the graph runs
-    void xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il); // XQuant
+    void xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il) const; // XQuant
 
     // Decode: prefer XQuant rematerialized K/V (fallback to baseline transparently)
     ggml_tensor * get_k_xq(ggml_context * ctx, int32_t il,

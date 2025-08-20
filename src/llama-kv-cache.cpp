@@ -2125,7 +2125,8 @@ ggml_tensor * llama_kv_cache_unified_context::get_attn_wv(int32_t il) const {
     return wv;
 }
 
-void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il) {
+void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res,
+                                                        ggml_tensor * X_norm, int32_t il) const {
     // MVP: single stream, standard RoPE; stage to host then append into XQuant store
     if (!xquant_enabled()) return;
     if (!res || !X_norm)   return;
@@ -2147,7 +2148,7 @@ void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res, 
 
     // keep buffers alive until the post-run callback fires
     auto host = std::make_shared<std::vector<uint16_t>>((size_t) d*T);
-    auto * mem = get_memory();
+    auto * mem = get_memory(); // NOTE: if get_memory() is non-const, make it const or const_cast here.
 
     res->register_post_run([mem, il, t, host, d, T]() {
         // copy device -> host
@@ -2196,7 +2197,17 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
 
     // Only standard NEOX RoPE supported here; advanced variants fall back.
     const int rope_type = kv->hparams.rope_type;
+
+    // Per-arch rope enablement:
+    //  - Granite: rotate only if rope_finetuned
+    //  - ISWA: skip rotation on periodic "no-rope" layers
+    const bool granite_uses_rope = kv->hparams.rope_finetuned;
+    const bool iswa_uses_rope = (kv->hparams.n_no_rope_layer_step == 0) ||
+                                (((il + 1) % kv->hparams.n_no_rope_layer_step) != 0);
+    const bool layer_uses_rope = granite_uses_rope && iswa_uses_rope;
+
     if (rope_type != LLAMA_ROPE_TYPE_NEOX && rope_type != LLAMA_ROPE_TYPE_NONE) {
+        // advanced RoPE (Yarn / M-RoPE) -> baseline
         return get_k(ctx, il);
     }
 
@@ -2213,12 +2224,12 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
     const float   yarn_beta_fast   = 0.0f;
     const float   yarn_beta_slow   = 0.0f;
 
-    ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX)
+    ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX && layer_uses_rope)
         ? ggml_rope_ext(ctx, k_pre3d, pos, /*factors*/ nullptr,
                         n_rot, rope_type, n_ctx_orig_yarn,
                         rope_freq_base, rope_freq_scale,
                         yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow)
-        : k_pre3d; // LLAMA_ROPE_TYPE_NONE (no rotation)
+        : k_pre3d; // LLAMA_ROPE_TYPE_NONE or rope disabled on this layer
 
     // Back to [n_embd_head_k, T_past] to mirror cpy_k() semantics
     ggml_tensor * k_past2d = ggml_reshape_2d(ctx, k_rope3d, n_embd_head_k, (int64_t) T_past);
