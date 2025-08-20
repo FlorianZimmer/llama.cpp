@@ -2163,6 +2163,7 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
     GGML_UNUSED(k_idxs);
     // XQuant: rematerialize + overlay K for the *past* rows only
     // Guard rails first, then fall back cleanly to baseline.
+#if defined(LLAMA_XQ_K_OVERLAY_NEOX_ONLY)
     if (!xquant_enabled())                     return get_k(ctx, il);
     if (!get_supports_set_rows())              return get_k(ctx, il);
 
@@ -2237,6 +2238,11 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
     }
 
     return ggml_set_rows(ctx, k_view2d, k_past2d, past_idxs);
+#else
+    // Compiled-out K overlay: conservative default keeps baseline behavior.
+    // (V overlay and all other XQuant pieces remain runtime-gated as before.)
+    return get_k(ctx, il);
+#endif
 }
 
 ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32_t il,

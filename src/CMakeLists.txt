@@ -50,3 +50,13 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# -----------------------------------------------------------------------------
+# XQuant: narrow compile-time guard for K overlay (NEOX-only builds)
+# Default OFF to keep upstream-style binaries behaviorally identical.
+# Enable with: -DLLAMA_XQ_K_OVERLAY_NEOX_ONLY=ON
+# -----------------------------------------------------------------------------
+option(LLAMA_XQ_K_OVERLAY_NEOX_ONLY "Enable XQuant K overlay (NEOX-only builds)" OFF)
+if(LLAMA_XQ_K_OVERLAY_NEOX_ONLY)
+  add_compile_definitions(LLAMA_XQ_K_OVERLAY_NEOX_ONLY=1)
+endif()
