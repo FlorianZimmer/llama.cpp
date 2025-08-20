@@ -2161,23 +2161,82 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
                                                        ggml_tensor * k_cur, ggml_tensor * k_idxs) const {
     GGML_UNUSED(k_cur);
     GGML_UNUSED(k_idxs);
-    // clean fallbacks
-    if (!xquant_enabled())                       return get_k(ctx, il);
-    if (!get_supports_set_rows())                return get_k(ctx, il);
+    // XQuant: rematerialize + overlay K for the *past* rows only
+    // Guard rails first, then fall back cleanly to baseline.
+    if (!xquant_enabled())                     return get_k(ctx, il);
+    if (!get_supports_set_rows())              return get_k(ctx, il);
+
+    // Detect exposed wk/wv; if fused QKV, stay baseline (DEBUG logged in helper).
     ggml_tensor * Wk = get_attn_wk(il);
     ggml_tensor * Wv = get_attn_wv(il);
-    if (!Wk || !Wv)                              return get_k(ctx, il);
-    const uint32_t T_past = sinfos[i_cur].head(); // MVP: single-stream => [0, head)
-    if (T_past == 0)                              return get_k(ctx, il);
+    if (!Wk || !Wv)                          return get_k(ctx, il);
 
-    // Rematerialize [T_past, d] (pre-RoPE); we will *overlay* later.
-    auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il, /*t0=*/0, /*t1=*/(int32_t) T_past, Wk, Wv);
-    if (!R.ok || !R.K)                            return get_k(ctx, il);
+    // MVP: single stream – overlay past rows [0 .. head())
+    const uint32_t T_past = sinfos[i_cur].head();
+    if (T_past == 0)                          return get_k(ctx, il);
 
-    // NOTE (MVP): K requires RoPE + shaping identical to cache layout.
-    // To keep this diff surgical and graph-stable, we currently defer to the
-    // baseline path for K. V is rematerialized below in get_v_xq().
-    return get_k(ctx, il);
+    // 1) Rematerialize pre-RoPE [T_past, d_model] via XQuant core
+    auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il,
+                                        /*t0=*/0, /*t1=*/(int32_t) T_past, Wk, Wv);
+    if (!R.ok || !R.K)                        return get_k(ctx, il);
+
+    // 2) Shape & apply RoPE to K using existing ggml primitive
+    //    Baseline K view consumed by attention: [n_embd_head_k, n_head_kv, n_kv, ns]
+    //    R.K is pre-RoPE row-major [T_past, d_model].
+    ggml_tensor * k_full = get_k(ctx, il);
+
+    const int64_t n_embd_head_k = k_full->ne[0];
+    const int64_t n_head_kv     = k_full->ne[1];
+
+    // Reshape R.K -> [n_embd_head_k, n_head_kv, T_past]
+    ggml_tensor * k_pre2d = ggml_reshape_2d(ctx, R.K, n_embd_head_k*n_head_kv, (int64_t) T_past);
+    ggml_tensor * k_pre3d = ggml_reshape_3d(ctx, k_pre2d,
+                                            n_embd_head_k, n_head_kv, (int64_t) T_past);
+
+    // Only standard NEOX RoPE supported here; advanced variants fall back.
+    const int rope_type = kv->hparams.rope_type;
+    if (rope_type != LLAMA_ROPE_TYPE_NEOX && rope_type != LLAMA_ROPE_TYPE_NONE) {
+        return get_k(ctx, il);
+    }
+
+    // Positions [0..T_past-1]
+    ggml_tensor * pos = xq_get_iota_i32_view(ctx, (int64_t) T_past);
+
+    // Pull defaults from model hparams (Yarn/M-RoPE are handled by fallback).
+    const int32_t n_rot            = kv->hparams.n_rot;
+    const int32_t n_ctx_orig_yarn  = kv->model.hparams.n_ctx_train;
+    const float   rope_freq_base   = kv->model.hparams.rope_freq_base_train;
+    const float   rope_freq_scale  = kv->model.hparams.rope_freq_scale_train;
+    const float   yarn_ext_factor  = 0.0f;
+    const float   yarn_attn_factor = 1.0f;
+    const float   yarn_beta_fast   = 0.0f;
+    const float   yarn_beta_slow   = 0.0f;
+
+    ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX)
+        ? ggml_rope_ext(ctx, k_pre3d, pos, /*factors*/ nullptr,
+                        n_rot, rope_type, n_ctx_orig_yarn,
+                        rope_freq_base, rope_freq_scale,
+                        yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow)
+        : k_pre3d; // LLAMA_ROPE_TYPE_NONE (no rotation)
+
+    // Back to [n_embd_head_k, T_past] to mirror cpy_k() semantics
+    ggml_tensor * k_past2d = ggml_reshape_2d(ctx, k_rope3d, n_embd_head_k, (int64_t) T_past);
+
+    // 3) Overlay the *past* rows into the baseline K view consumed by attention.
+    // Flatten K view to the same 2-D semantics as in cpy_k():
+    ggml_tensor * k_view2d = k_full;
+    if (k_view2d->ne[2] > 1) {
+        k_view2d = ggml_reshape_2d(ctx, k_view2d, k_view2d->ne[0], k_view2d->ne[1]*k_view2d->ne[2]);
+    }
+
+    ggml_tensor * past_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) T_past);
+    {
+        std::vector<int64_t> tmp(T_past);
+        for (uint32_t i = 0; i < T_past; ++i) tmp[i] = (int64_t) i;
+        ggml_backend_tensor_set(past_idxs, tmp.data(), 0, sizeof(int64_t) * tmp.size());
+    }
+
+    return ggml_set_rows(ctx, k_view2d, k_past2d, past_idxs);
 }
 
 ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32_t il,
@@ -2209,13 +2268,8 @@ ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32
     //   reshaped view for indexed writes. We do the same here, but target the
     //   first T_past rows (sequential) via a compact [T_past] I64 index tensor.
     //
-    // Build constant [0..T_past-1] indices:
-    ggml_tensor * past_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T_past);
-    {
-        std::vector<int64_t> tmp(T_past);
-        for (uint32_t i = 0; i < T_past; ++i) tmp[i] = (int64_t) i;
-        ggml_backend_tensor_set(past_idxs, tmp.data(), 0, sizeof(int64_t)*tmp.size());
-    }
+    // Build constant [0..T_past-1] indices (cached per-graph, served via a view).
+    ggml_tensor * past_idxs = xq_get_iota_i64_view(ctx, (int64_t) T_past);
 
     // Flatten views to reuse the same set_rows semantics as cpy_v():
     if (v_full->ne[2] > 1) {
@@ -2225,4 +2279,44 @@ ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32
     ggml_tensor * v_past  = ggml_reshape_2d(ctx, R.V,     1, R.V->ne[0]*R.V->ne[1]); // [1, T_past*d]
 
     return ggml_set_rows(ctx, v_view, v_past, past_idxs);
+}
+
+
+// XQuant: cached iota helpers (per-graph ggml_context)
+ggml_tensor * llama_kv_cache_unified_context::xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const {
+    // ensure capacity at least current n_kv (past length) and requested n
+    const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
+    if (xq_iota_ctx != ctx || xq_iota_i64 == nullptr || xq_iota_cap < need) {
+        xq_iota_ctx = ctx;
+        xq_iota_cap = need;
+        xq_iota_i64 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, xq_iota_cap);
+        if (ggml_backend_buffer_is_host(xq_iota_i64->buffer)) {
+            auto * data = (int64_t *) xq_iota_i64->data;
+            for (int64_t i = 0; i < xq_iota_cap; ++i) data[i] = i;
+        } else {
+            std::vector<int64_t> tmp((size_t) xq_iota_cap);
+            for (int64_t i = 0; i < xq_iota_cap; ++i) tmp[(size_t)i] = i;
+            ggml_backend_tensor_set(xq_iota_i64, tmp.data(), 0, sizeof(int64_t) * (size_t) xq_iota_cap);
+        }
+    }
+    // return a view of the first n elements
+    return ggml_view_1d(ctx, xq_iota_i64, n, /*offset bytes*/ 0);
+}
+
+ggml_tensor * llama_kv_cache_unified_context::xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const {
+    const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
+    if (xq_iota_ctx != ctx || xq_iota_i32 == nullptr || xq_iota_cap < need) {
+        xq_iota_ctx = ctx;
+        xq_iota_cap = need;
+        xq_iota_i32 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, xq_iota_cap);
+        if (ggml_backend_buffer_is_host(xq_iota_i32->buffer)) {
+            auto * data = (int32_t *) xq_iota_i32->data;
+            for (int64_t i = 0; i < xq_iota_cap; ++i) data[i] = (int32_t) i;
+        } else {
+            std::vector<int32_t> tmp((size_t) xq_iota_cap);
+            for (int64_t i = 0; i < xq_iota_cap; ++i) tmp[(size_t)i] = (int32_t) i;
+            ggml_backend_tensor_set(xq_iota_i32, tmp.data(), 0, sizeof(int32_t) * (size_t) xq_iota_cap);
+        }
+    }
+    return ggml_view_1d(ctx, xq_iota_i32, n, /*offset bytes*/ 0);
 }

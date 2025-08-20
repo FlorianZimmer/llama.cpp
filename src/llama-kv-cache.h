@@ -370,6 +370,18 @@ public:
                            ggml_tensor * v_cur, ggml_tensor * v_idxs) const; // XQuant
 
 private:
+    // XQuant: cached iota tensors per-graph to avoid per-layer allocations
+    // These are tied to the lifetime of the current ggml_context (graph). When ctx changes,
+    // we rebuild them lazily on first use.
+    mutable ggml_context * xq_iota_ctx = nullptr; // XQuant
+    mutable ggml_tensor  * xq_iota_i64 = nullptr; // XQuant
+    mutable ggml_tensor  * xq_iota_i32 = nullptr; // XQuant
+    mutable int64_t        xq_iota_cap = 0;       // XQuant
+
+    // Return a view of length n into a cached [0..cap-1] iota tensor in the given ctx. // XQuant
+    ggml_tensor * xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const; // XQuant
+    ggml_tensor * xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const; // XQuant
+
     llama_memory_status status;
 
     llama_kv_cache * kv;
