@@ -2088,6 +2088,9 @@ bool llama_kv_cache_context::xquant_enabled() const {
     if (on && !g_xq_log_enabled_once.exchange(true)) {
         return on;
     }
+    else {
+        return false;
+    }
 }
 
 llama_memory_i * llama_kv_cache_context::get_memory() const {
