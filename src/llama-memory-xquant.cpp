@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <climits>
 #include <limits>
+#include <atomic>
 
 namespace {
 

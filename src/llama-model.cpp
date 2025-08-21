@@ -18398,6 +18398,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // It’s OK to pass cparams.n_ctx as the wrapper’s capacity.
         llama_memory_ptr wrapped = llama_memory_make_xquant_wrap(
             this, std::move(base), /*n_ctx_tokens=*/(int32_t)cparams.n_ctx);
+        LLAMA_LOG_INFO("[xquant] wrapper attached: n_ctx=%d\n", (int)cparams.n_ctx);
         return wrapped.release();
     }
 

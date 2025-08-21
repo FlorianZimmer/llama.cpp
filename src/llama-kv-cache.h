@@ -390,6 +390,13 @@ private:
     ggml_tensor * xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const; // XQuant
     ggml_tensor * xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const; // XQuant
 
+    // Return a slice starting at offset "off" of length "n" from the cached iota. // XQuant
+    ggml_tensor * xq_get_iota_i64_slice(ggml_context * ctx, int64_t off, int64_t n) const; // XQuant
+    ggml_tensor * xq_get_iota_i32_slice(ggml_context * ctx, int64_t off, int64_t n) const; // XQuant
+
+    // Track the last overlaid end position per layer so we only remat the delta. // XQuant
+    mutable std::vector<uint32_t> xq_last_overlay_t1; // XQuant
+    
     llama_memory_status status;
 
     llama_kv_cache * kv;

@@ -1,6 +1,9 @@
 #pragma once
 #include "llama-memory.h"
 #include "llama-memory-xquant.h"  // <- brings the ONE true llama_xq_remat_result and base helpers
+// Process-wide flag: true once the XQuant wrapper is attached in this process.
+// Implemented in llama-memory-xquant-wrap.cpp
+bool llama_xquant_runtime_active();
 
 // forward decls
 struct llama_model;

@@ -8,9 +8,11 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-xquant-wrap.h"
 
 #include <cassert>
 #include <cmath>
+#include <atomic>
 #include <cstring>
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1463,26 +1465,21 @@ ggml_tensor * llm_graph_context::build_attn(
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, k_cur);
-    ggml_build_forward_expand(gf, v_cur);
+    if (k_cur) ggml_build_forward_expand(gf, k_cur);
+    if (v_cur) ggml_build_forward_expand(gf, v_cur);
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-    }
+    // XQuant feature flag (process-wide; wrapper attached)
+    const bool xq_on = llama_xquant_runtime_active();
+    const bool is_prefill = (k_cur && k_cur->ne[2] > 1);
+    static std::atomic<uint64_t> g_xq_prefill_skipped{0};
+    static std::atomic<uint64_t> g_xq_reads{0};
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV.
-    // Hoist the feature check so we don't evaluate it twice.
-    const bool xq_on = mctx_cur->xquant_enabled();
     ggml_tensor * k = xq_on
         ? mctx_cur->get_k_xq(ctx0, il, k_cur, inp->get_k_idxs())  // XQuant
         : mctx_cur->get_k   (ctx0, il);
@@ -1520,6 +1517,11 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il) const {
+    static std::atomic<bool> g_attn_iswa_once{false};
+    if (!g_attn_iswa_once.exchange(true)) {
+        LLAMA_LOG_INFO("[xquant] path: build_attn(KV_ISWA)\n");
+    }
+    
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -1576,6 +1578,8 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 llm_graph_input_attn_cross * llm_graph_context::build_attn_inp_cross() const {
+    static std::atomic<bool> g_attn_cross_once{false};
+    
     auto inp = std::make_unique<llm_graph_input_attn_cross>(cross);
 
     const int32_t n_enc = !cross->v_embd.empty() ? cross->n_enc : hparams.n_ctx_train;
@@ -1600,6 +1604,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il) const {
+    static std::atomic<bool> g_attn_nocache_once{false};
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);

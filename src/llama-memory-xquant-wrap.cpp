@@ -11,6 +11,13 @@
 #include <memory>
 #include <utility>
 #include <mutex>
+#include <atomic>
+
+// single definition lives here
+static std::atomic<bool> g_xq_runtime_on{false};
+bool llama_xquant_runtime_active() {
+    return g_xq_runtime_on.load(std::memory_order_acquire);
+}
 
 static std::once_flag g_xq_once;
 
@@ -21,9 +28,7 @@ public:
     : mdl_(mdl)
     , base_(std::move(base_kv))
     , store_(llama_memory_make_xquant(mdl, n_ctx)) {
-        std::call_once(g_xq_once, []{
-            LLAMA_LOG_INFO("[xquant] wrapper active (capturing post-norm X, rematerializing K/V)\n");
-        });
+        std::call_once(g_xq_once, []{});
     }
 
     // delegate everything to base memory (no behavior change)
@@ -75,6 +80,7 @@ llama_memory_ptr llama_memory_make_xquant_wrap(
     const llama_model * mdl,
     llama_memory_ptr    base_kv,
     int32_t             n_ctx_tokens) {
+    g_xq_runtime_on.store(true, std::memory_order_release);
     return llama_memory_ptr(new llama_memory_xquant_wrap(mdl, std::move(base_kv), n_ctx_tokens));
 }
 

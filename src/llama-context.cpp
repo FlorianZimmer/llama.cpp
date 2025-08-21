@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-kv-cache.h"             // XQuant: access llama_kv_cache_context
 
 #include <cinttypes>
 #include <cstring>
@@ -1413,7 +1414,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(mctx, res),
         /*.res         =*/ res,
     };
 }
@@ -1445,8 +1446,14 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(const llama_memory_context_i * mctx,
+                                         llm_graph_result * res) const {
+    // If the active memory context is the KV cache, we can XQuant-capture X at the first RMSNorm per layer
+    const auto * kv_mctx = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    // track "first norm per layer" within this graph build
+    auto seen_first_norm = std::make_shared<std::vector<uint8_t>>(model.hparams.n_layer, 0);
+
+    return [this, kv_mctx, res, seen_first_norm](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -1473,6 +1480,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         }
                     }
                 }
+            }
+        }
+        
+        // XQuant: capture X right after the attention RMSNorm (the first "norm" seen per layer)
+        if (kv_mctx && il >= 0 && strcmp(name, "norm") == 0) {
+            if (il < (int) seen_first_norm->size() && (*seen_first_norm)[il] == 0) {
+                (*seen_first_norm)[il] = 1;
+                // Defer any device->host copy to run after the forward pass finishes
+                kv_mctx->xq_capture_X_defer(res, cur, il);
             }
         }
     };
