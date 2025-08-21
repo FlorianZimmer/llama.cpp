@@ -2080,7 +2080,7 @@ static bool xq_env_enabled() {
     return v == "1" || v == "true" || v == "on" || v == "yes";
 }
 
-bool llama_kv_cache_unified_context::xquant_enabled() const {
+bool llama_kv_cache_context::xquant_enabled() const {
     // Require BOTH: env enabled AND the XQuant wrapper is actually present.
     const bool env_on  = xq_env_enabled();
     const bool wrap_on = llama_memory_is_xquant_enabled(get_memory());
@@ -2090,12 +2090,12 @@ bool llama_kv_cache_unified_context::xquant_enabled() const {
     }
 }
 
-llama_memory_i * llama_kv_cache_unified_context::get_memory() const {
+llama_memory_i * llama_kv_cache_context::get_memory() const {
     // unified KV itself is a llama_memory_i
     return static_cast<llama_memory_i *>(kv);
 }
 
-ggml_tensor * llama_kv_cache_unified_context::get_attn_wk(int32_t il) const {
+ggml_tensor * llama_kv_cache_context::get_attn_wk(int32_t il) const {
     // expose Wk when the arch is not fused QKV; otherwise nullptr
     // keep all model detail *inside* KV TU
     // note: relies on internal model layout; safe here (llama-impl.h included)
@@ -2124,7 +2124,7 @@ ggml_tensor * llama_kv_cache_unified_context::get_attn_wk(int32_t il) const {
     return wk;
 }
 
-ggml_tensor * llama_kv_cache_unified_context::get_attn_wv(int32_t il) const {
+ggml_tensor * llama_kv_cache_context::get_attn_wv(int32_t il) const {
     const auto & mdl = kv->model;
     const auto & layers = mdl.layers;
     if (il < 0 || il >= (int) layers.size()) return nullptr;
@@ -2140,7 +2140,7 @@ ggml_tensor * llama_kv_cache_unified_context::get_attn_wv(int32_t il) const {
     return wv;
 }
 
-void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res,
+void llama_kv_cache_context::xq_capture_X_defer(llm_graph_result * res,
                                                         ggml_tensor * X_norm, int32_t il) const {
     // MVP: single stream, standard RoPE; stage to host then append into XQuant store
     if (!xquant_enabled()) return;
@@ -2171,7 +2171,7 @@ void llama_kv_cache_unified_context::xq_capture_X_defer(llm_graph_result * res,
     });
 }
 
-ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32_t il,
+ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
                                                        ggml_tensor * k_cur, ggml_tensor * k_idxs) const {
     GGML_UNUSED(k_cur);
     GGML_UNUSED(k_idxs);
@@ -2269,7 +2269,7 @@ ggml_tensor * llama_kv_cache_unified_context::get_k_xq(ggml_context * ctx, int32
 #endif
 }
 
-ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32_t il,
+ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
                                                        ggml_tensor * v_cur, ggml_tensor * v_idxs) const {
     GGML_UNUSED(v_cur);
     GGML_UNUSED(v_idxs);
@@ -2313,7 +2313,7 @@ ggml_tensor * llama_kv_cache_unified_context::get_v_xq(ggml_context * ctx, int32
 
 
 // XQuant: cached iota helpers (per-graph ggml_context)
-ggml_tensor * llama_kv_cache_unified_context::xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const {
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const {
     // ensure capacity at least current n_kv (past length) and requested n
     const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
     if (xq_iota_ctx != ctx || xq_iota_i64 == nullptr || xq_iota_cap < need) {
@@ -2333,7 +2333,7 @@ ggml_tensor * llama_kv_cache_unified_context::xq_get_iota_i64_view(ggml_context 
     return ggml_view_1d(ctx, xq_iota_i64, n, /*offset bytes*/ 0);
 }
 
-ggml_tensor * llama_kv_cache_unified_context::xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const {
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const {
     const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
     if (xq_iota_ctx != ctx || xq_iota_i32 == nullptr || xq_iota_cap < need) {
         xq_iota_ctx = ctx;

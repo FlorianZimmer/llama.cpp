@@ -189,7 +189,7 @@ public:
 
 private:
     // XQuant: allow the context to peek model internals safely from this TU only
-    friend class llama_kv_cache_unified_context; // XQuant
+    friend class llama_kv_cache_context; // XQuant
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -368,6 +368,10 @@ public:
                            ggml_tensor * k_cur, ggml_tensor * k_idxs) const; // XQuant
     ggml_tensor * get_v_xq(ggml_context * ctx, int32_t il,
                            ggml_tensor * v_cur, ggml_tensor * v_idxs) const; // XQuant
+    struct xq_kv_pair { ggml_tensor *K=nullptr; ggml_tensor *V=nullptr; bool ok=false; }; // XQuant
+    xq_kv_pair get_kv_xq(ggml_context * ctx, int32_t il,
+                         ggml_tensor * k_cur, ggml_tensor * v_cur,
+                         ggml_tensor * k_idxs, ggml_tensor * v_idxs) const;
 
 private:
     // XQuant: cached iota tensors per-graph to avoid per-layer allocations
@@ -377,6 +381,10 @@ private:
     mutable ggml_tensor  * xq_iota_i64 = nullptr; // XQuant
     mutable ggml_tensor  * xq_iota_i32 = nullptr; // XQuant
     mutable int64_t        xq_iota_cap = 0;       // XQuant
+
+    mutable ggml_context * xq_last_ctx = nullptr;
+    mutable int32_t        xq_last_il  = -1;
+    mutable xq_kv_pair     xq_last_kv;
 
     // Return a view of length n into a cached [0..cap-1] iota tensor in the given ctx. // XQuant
     ggml_tensor * xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const; // XQuant

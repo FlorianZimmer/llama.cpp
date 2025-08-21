@@ -6072,7 +6072,7 @@ struct llm_build_llama : public llm_graph_context {
             cb(cur, "attn_norm", il);
 
             // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
-            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
                 if (u->xquant_enabled()) {
                     // note: registering here keeps graph unchanged; data movement happens post-run
                     u->xq_capture_X_defer(res, cur, il);
@@ -6242,7 +6242,7 @@ struct llm_build_llama_iswa : public llm_graph_context {
             cb(cur, "attn_norm", il);
 
             // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
-            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
                 if (u->xquant_enabled()) {
                     // note: registering here keeps graph unchanged; data movement happens post-run
                     u->xq_capture_X_defer(res, cur, il);
@@ -15201,7 +15201,7 @@ struct llm_build_granite : public llm_graph_context {
             cb(cur, "attn_norm", il);
 
             // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
-            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
                 if (u->xquant_enabled()) {
                     // note: registering here keeps graph unchanged; data movement happens post-run
                     u->xq_capture_X_defer(res, cur, il);
@@ -15421,7 +15421,7 @@ struct llm_build_granite_hybrid : public llm_graph_context_mamba {
             cb(cur, "attn_norm", il);
             
             // XQuant: capture post-norm X (prefill). For recurrent layers this no-ops.
-            if (auto * u = dynamic_cast<const llama_kv_cache_unified_context *>(mctx)) {
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
                 if (u->xquant_enabled()) {
                     u->xq_capture_X_defer(res, cur, il);
                 }
