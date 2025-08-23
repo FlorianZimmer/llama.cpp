@@ -19,6 +19,9 @@
 #include <string>   // XQuant
 #include <cstdlib>  // XQuant (std::getenv, std::atoi)
 
+// --- forward decls for env gates used early in this TU -----------------------
+static bool xq_env_nobase();
+
 //
 // llama_kv_cache
 //
@@ -132,11 +135,14 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-        ggml_tensor * k;
-        ggml_tensor * v;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
 
-        k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
-        v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+        // When XQuant runs fully materialized (no-base), don't allocate persistent KV.
+        if (!xq_env_nobase()) {
+            k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+            v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+        }
 
         ggml_format_name(k, "cache_k_l%d", il);
         ggml_format_name(v, "cache_v_l%d", il);
@@ -145,8 +151,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
-            v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
+            if (k) k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*(k ? k->nb[2] : 0)));
+            if (v) v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*(v ? v->nb[2] : 0)));
         }
 
         map_layer_ids[il] = layers.size();
@@ -184,7 +190,11 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        size_t bufsz = ggml_backend_buffer_get_size(buf);
+        if (bufsz > 0) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buft_name(buft), bufsz/1024.0/1024.0);
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         bufs.emplace_back(buf);
@@ -2083,6 +2093,33 @@ uint32_t llama_kv_cache::get_padding(const llama_cparams & cparams) {
     return cparams.flash_attn ? 256u : 32u;
 }
 
+// ---------------------------------------------------------------------------
+// XQuant: configuration
+// ---------------------------------------------------------------------------
+
+static bool xq_env_enabled() {
+    if (const char *s = std::getenv("LLAMA_XQUANT")) {
+        if (*s == '1') return true;
+        std::string v(s);
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        return v == "true" || v == "on" || v == "yes";
+    }
+    return false;
+}
+
+// When enabled, do not rely on the baseline persistent KV at all.
+// Materialize K/V fully from captured X + concat the current token.
+static bool xq_env_nobase() {
+    const char *s = std::getenv("LLAMA_XQ_NOBASE");
+    if (!s || !*s) return false;
+    if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
+    std::string v(s);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+
 // ========= XQuant: KV-backed helpers (no graph churn) =========
 namespace {
 static std::atomic<bool> g_xq_log_enabled_once{false};
@@ -2097,18 +2134,6 @@ static bool xq_env_overlay_v_enabled() {
     if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
     std::string v(s);
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return std::tolower(c); });
-    return v == "1" || v == "true" || v == "on" || v == "yes";
-}
-
-// Parse LLAMA_XQUANT as a *real* boolean.
-// Accept: 1/true/on/yes (case-insensitive) or any non-zero integer.
-static bool xq_env_enabled() {
-    const char *s = std::getenv("LLAMA_XQUANT");
-    if (!s || !*s) return false;
-    if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
-    std::string v(s);
-    std::transform(v.begin(), v.end(), v.begin(),
-                   [](unsigned char c){ return std::tolower(c); });
     return v == "1" || v == "true" || v == "on" || v == "yes";
 }
 
@@ -2233,7 +2258,6 @@ void llama_kv_cache_context::xq_capture_X_defer(llm_graph_result * res,
 
 ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
                                                        ggml_tensor * k_cur, ggml_tensor * k_idxs) const {
-    GGML_UNUSED(k_cur);
     GGML_UNUSED(k_idxs);
     // XQuant: rematerialize + overlay K for the *delta* of past rows only
     // Guard rails first, then fall back cleanly to baseline.
@@ -2266,11 +2290,53 @@ ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
                                         /*t0=*/(int32_t) t0, /*t1=*/(int32_t) T_past, Wk, Wv);
     if (!R.ok || !R.K)                        return get_k(ctx, il);
 
+    // Fast path when we want zero persistent KV usage:
+    // Return fully-materialized K (past-from-X plus current k_cur), properly RoPE’d and shaped for attention.
+    if (xq_env_nobase()) {
+        const uint32_t T_past = sinfos[i_cur].head();
+        const int64_t  ne0_d  = kv->hparams.n_embd_head_k;   // per-head dim
+        const int64_t  ne1_h  = kv->hparams.n_head_kv();     // kv heads
+
+        // R.K  : [T_past, d_model]
+        // -> [ne0_d*ne1_h, T_past] -> [ne0_d, ne1_h, T_past]
+        ggml_tensor * k_p2 = ggml_reshape_2d(ctx, R.K, ne0_d*ne1_h, (int64_t) T_past);
+        ggml_tensor * k_p3 = ggml_reshape_3d(ctx, k_p2, ne0_d, ne1_h, (int64_t) T_past);
+
+        // RoPE on [ne0_d, ne1_h, T_past]
+        const auto rope_type        = kv->hparams.rope_type;
+        const bool layer_uses_rope  = kv->hparams.rope_finetuned &&
+                                      ((kv->hparams.n_no_rope_layer_step == 0) ||
+                                       (((il + 1) % kv->hparams.n_no_rope_layer_step) != 0));
+        if (rope_type != LLAMA_ROPE_TYPE_NEOX && rope_type != LLAMA_ROPE_TYPE_NONE) {
+            return get_k(ctx, il); // advanced RoPE ⇒ fallback keeps correctness
+        }
+        ggml_tensor * pos = xq_get_iota_i32_slice(ctx, /*t0*/ 0, (int64_t) T_past);
+        const int32_t n_rot            = kv->hparams.n_rot;
+        const int32_t n_ctx_orig_yarn  = kv->model.hparams.n_ctx_train;
+        const float   rope_freq_base   = kv->model.hparams.rope_freq_base_train;
+        const float   rope_freq_scale  = kv->model.hparams.rope_freq_scale_train;
+        const float   yarn_ext_factor  = 0.0f, yarn_attn_factor = 1.0f, yarn_beta_fast = 0.0f, yarn_beta_slow = 0.0f;
+        ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX && layer_uses_rope)
+          ? ggml_rope_ext(ctx, k_p3, pos, /*factors*/ nullptr,
+                          n_rot, rope_type, n_ctx_orig_yarn,
+                          rope_freq_base, rope_freq_scale,
+                          yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow)
+          : k_p3;
+
+        // Current step: k_cur is shaped [ne0_d, ne1_h, 1] (from graph)
+        // ensure it’s 3D [ne0_d, ne1_h, 1]
+        ggml_tensor * k_cur2 = ggml_reshape_2d(ctx, k_cur, ne0_d*ne1_h, 1);
+        ggml_tensor * k_cur3 = ggml_reshape_3d(ctx, k_cur2, ne0_d, ne1_h, 1);
+
+        // Concat along time axis to form [ne0_d, ne1_h, T_past+1]
+        ggml_tensor * k_all3 = ggml_concat(ctx, k_rope3d, k_cur3, /*axis=*/2);
+        return k_all3;
+    }
+
     // 2) Shape & apply RoPE to K using existing ggml primitive
     //    Baseline K view consumed by attention: [n_embd_head_k, n_head_kv, n_kv, ns]
     //    R.K is pre-RoPE row-major [T_past, d_model].
     ggml_tensor * k_full = get_k(ctx, il);
-
     const int64_t n_embd_head_k = k_full->ne[0];
     const int64_t n_head_kv     = k_full->ne[1];
 
@@ -2368,8 +2434,44 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
     auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il, /*t0=*/(int32_t)t0, /*t1=*/(int32_t)T_past, Wk, Wv);
     if (!R.ok || !R.V)                            return get_v(ctx, il);
 
+    // Fast path when we want zero persistent KV usage:
+    // Return fully-materialized V (past-from-X plus current v_cur), shaped to attention’s layout.
+    if (xq_env_nobase()) {
+        const uint32_t T_past = sinfos[i_cur].head();
+        // V layout on CPU (no flash attention) is transposed:
+        // non-transposed: [n_embd_head_v, n_head_kv, n_kv, ns]
+        // transposed    : [n_kv, n_head_kv, n_embd_head_v, ns]
+        // If you enable flash attention on a backend where V isn't transposed,
+        // replace this with a proper query (e.g., exposing kv->v_trans via an accessor).
+        const bool     v_trans = true;
+        const int64_t  ne0_dv  = kv->hparams.n_embd_head_v;
+        const int64_t  ne1_h   = kv->hparams.n_head_kv();
+
+        // R.V : [T_past, d_v] -> [d_v, T_past]
+        ggml_tensor * v_p2 = ggml_transpose(ctx, R.V);
+
+        if (!v_trans) {
+            // dst: [d_v, kv]  with kv = T_past (+1 after concat)
+            ggml_tensor * v_cur2 = ggml_reshape_2d(ctx, v_cur, ne0_dv*ne1_h, 1);
+            ggml_tensor * v_all2 = ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1);  // [d_v, T_past+1]
+            ggml_tensor * v_all3 = ggml_reshape_3d(ctx, v_all2, ne0_dv, ne1_h, (int64_t) (T_past + 1));
+            // add stream dim = 1: [d_v, h, kv, 1]
+            return ggml_reshape_4d(ctx, v_all3, ne0_dv, ne1_h, (int64_t) (T_past + 1), 1);
+        } else {
+            // transposed dst: [kv, h, d_v, 1]  => flatten to [1, d_v*kv] for set_rows-like write
+            ggml_tensor * v_cur2  = ggml_reshape_2d(ctx, v_cur, ne0_dv*ne1_h, 1);   // [d_v, 1]
+            ggml_tensor * v_all2T = ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1);     // [d_v, T_past+1]
+            // rearrange to [kv, h, d_v, 1]
+            ggml_tensor * v_all3T = ggml_permute(ctx,
+                ggml_reshape_4d(ctx, ggml_reshape_2d(ctx, v_all2T, ne0_dv, ne1_h*(int64_t)(T_past + 1)),
+                                          ne0_dv, ne1_h, (int64_t)(T_past + 1), 1),
+                2, 1, 0, 3);
+            return v_all3T;
+        }
+    }
+
     // Baseline view (final 4D layout expected by attention)
-    ggml_tensor * v_full = get_v(ctx, il);
+    ggml_tensor * v_full  = get_v(ctx, il);
 
     // Allow bisecting the V overlay independently
     if (!xq_env_overlay_v_enabled())             return get_v(ctx, il);
