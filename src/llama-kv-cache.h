@@ -265,11 +265,6 @@ private:
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
                   llama_context * lctx) const;
-
-    ggml_cgraph * build_graph_defrag(
-               llm_graph_result * res,
-                  llama_context * lctx,
-              const defrag_info & dinfo) const;
               
     struct cell_ranges_t {
         uint32_t strm;
