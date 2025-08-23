@@ -235,6 +235,12 @@ llama_kv_cache::llama_kv_cache(
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
 
+        // XQuant visibility: show if baseline KV is allocated
+        const double kv_mib = (memory_size_k + memory_size_v)/1024.0/1024.0;
+        LLAMA_LOG_INFO("[xquant] baseline KV: %s (%.2f MiB total; K %.2f MiB, V %.2f MiB)\n",
+            kv_mib > 0.0 ? "ALLOCATED" : "NOT ALLOCATED",
+            kv_mib, memory_size_k/1024.0/1024.0, memory_size_v/1024.0/1024.0);
+
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
@@ -2420,6 +2426,8 @@ ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
     dep               = ggml_scale(ctx, dep, 0.0f);
     return ggml_add(ctx, k_full, dep);
 #else
+    static std::atomic<bool> g_k_overlay_once{false};
+    if (!g_k_overlay_once.exchange(true)) LLAMA_LOG_INFO("[xquant] K overlay path active (delta remat + set_rows)\n");
     // Compiled-out K overlay: conservative default keeps baseline behavior.
     // (V overlay and all other XQuant pieces remain runtime-gated as before.)
     return get_k(ctx, il);
@@ -2439,6 +2447,11 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
     const uint32_t T_past = sinfos[i_cur].head(); // MVP: single-stream => [0, head)
     if (T_past == 0)                              return get_v(ctx, il);
 
+    // one-time log guards
+    static std::atomic<bool> g_v_no_base_once{false};
+    static std::atomic<bool> g_v_iswa_once{false};
+    static std::atomic<bool> g_v_overlay_once{false};
+
     // Ensure we have a slot for this layer index
     if (xq_last_overlay_t1.size() <= (size_t) il) {
         xq_last_overlay_t1.resize((size_t) il + 1, /*init*/0);
@@ -2448,15 +2461,15 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
     const uint32_t T_delta = T_past - t0;
     if (T_delta == 0)                             return get_v(ctx, il);
 
-    if (!xq_env_overlay_v_enabled())              return get_v(ctx, il);
-
     auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il, /*t0=*/(int32_t)t0, /*t1=*/(int32_t)T_past, Wk, Wv);
     if (!R.ok || !R.V)                            return get_v(ctx, il);
 
-    // Fast path when we want zero persistent KV usage:
-    // Return fully-materialized V (past-from-X plus current v_cur), shaped to attention’s layout.
+    // Fast path 0: "no-base" runtime -> always concat, never touch baseline KV.
     if (no_base_kv()) {
         const uint32_t T_past = sinfos[i_cur].head();
+        if (!g_v_no_base_once.exchange(true)) {
+            LLAMA_LOG_INFO("[xquant] V no-base path: returning [past+present] concat (no baseline KV)\n");
+        }
         // V layout on CPU (no flash attention) is transposed:
         // non-transposed: [n_embd_head_v, n_head_kv, n_kv, ns]
         // transposed    : [n_kv, n_head_kv, n_embd_head_v, ns]
@@ -2489,11 +2502,42 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
         }
     }
 
+    // Fast path 1: ISWA layout available in the graph (v_idxs + v_cur provided).
+    // Return fully-materialized [past+present] V shaped for attention, without writing baseline.
+    if (v_idxs && v_cur) {
+        const uint32_t T_past2 = sinfos[i_cur].head();
+        if (!g_v_iswa_once.exchange(true)) {
+            LLAMA_LOG_INFO("[xquant] V ISWA path: using [past+present] concat (no baseline write)\n");
+        }
+        // Same shaping as no-base block above, but we keep baseline allocated; we just don't write to it.
+        // Prefer using known CPU layout (transposed) for speed; adjust if you run non-transposed V.
+        const bool     v_trans = true;
+        const int64_t  ne0_dv  = kv->hparams.n_embd_head_v; // or equivalent accessor in your tree
+        const int64_t  ne1_h   = kv->hparams.n_head_kv();
+        ggml_tensor * v_p2 = ggml_transpose(ctx, R.V); // [d_v, T_past]
+        if (!v_trans) {
+            ggml_tensor * v_cur2 = ggml_reshape_2d(ctx, v_cur, ne0_dv*ne1_h, 1);
+            ggml_tensor * v_all2 = ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1);  // [d_v, T_past+1]
+            ggml_tensor * v_all3 = ggml_reshape_3d(ctx, v_all2, ne0_dv, ne1_h, (int64_t) (T_past2 + 1));
+            return ggml_reshape_4d(ctx, v_all3, ne0_dv, ne1_h, (int64_t) (T_past2 + 1), 1);
+        } else {
+            ggml_tensor * v_cur2  = ggml_reshape_2d(ctx, v_cur, ne0_dv*ne1_h, 1);   // [d_v, 1]
+            ggml_tensor * v_all2T = ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1);     // [d_v, T_past+1]
+            ggml_tensor * v_all3T = ggml_permute(ctx,
+                ggml_reshape_4d(ctx, ggml_reshape_2d(ctx, v_all2T, ne0_dv, ne1_h*(int64_t)(T_past2 + 1)),
+                                          ne0_dv, ne1_h, (int64_t)(T_past2 + 1), 1),
+                2, 1, 0, 3); // -> [kv, h, d_v, 1]
+            return v_all3T;
+        }
+    }
+
     // Baseline view (final 4D layout expected by attention)
     ggml_tensor * v_full  = get_v(ctx, il);
 
-    // Allow bisecting the V overlay independently
-    if (!xq_env_overlay_v_enabled())             return get_v(ctx, il);
+    // Overlay (set_rows) path – write delta into baseline V
+    if (!g_v_overlay_once.exchange(true)) {
+        LLAMA_LOG_INFO("[xquant] V overlay path: set_rows delta into baseline buffer\n");
+    }
 
     // Heuristic used in attention path: nb[1] > nb[2] => transposed V layout
     const bool v_trans = v_full->nb[1] > v_full->nb[2];

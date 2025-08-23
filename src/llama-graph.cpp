@@ -1479,6 +1479,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
+
+    static std::atomic<bool> g_xq_logged{false};
+    auto log_once = [&](const char *msg){
+        if (!g_xq_logged.exchange(true)) LLAMA_LOG_INFO("%s", msg);
+    };
+
     // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV.
     ggml_tensor * k = xq_on
         ? mctx_cur->get_k_xq(ctx0, il, k_cur, inp->get_k_idxs())  // XQuant
@@ -1487,6 +1493,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ? mctx_cur->get_v_xq(ctx0, il, v_cur, inp->get_v_idxs())  // XQuant
         : mctx_cur->get_v   (ctx0, il);
 
+    if (xq_on) log_once("[xquant] using XQuant rematerialized KV for attention\n");
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale);
     cb(cur, "kqv_out", il);
 
