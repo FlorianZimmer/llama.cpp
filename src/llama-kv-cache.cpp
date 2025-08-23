@@ -16,11 +16,13 @@
 #include <memory>   // XQuant
 #include <vector>   // XQuant
 #include <cctype>   // XQuant
-#include <string>   // XQuant
-#include <cstdlib>  // XQuant (std::getenv, std::atoi)
+#include <cstdlib>   // getenv, atoi
+#include <string>
 
-// --- forward decls for env gates used early in this TU -----------------------
-static bool xq_env_nobase();
+bool llama_kv_cache_context::no_base_kv() const {
+    // Single source of truth: flag captured once in the KV at construction
+    return kv && kv->no_base_kv_;
+}
 
 //
 // llama_kv_cache
@@ -41,6 +43,33 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type    swa_type) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+
+    // --- XQuant "no-base" flag (env) ---------------------------------------
+    // Read NOBASE once (env) and keep as a member for the lifetime of this KV
+    if (const char *s = std::getenv("LLAMA_XQ_NOBASE")) {
+        if (*s) {
+            if (std::isdigit(static_cast<unsigned char>(*s))) {
+                no_base_kv_ = std::atoi(s) != 0;
+            } else {
+                std::string v(s);
+                std::transform(v.begin(), v.end(), v.begin(),
+                               [](unsigned char c){ return std::tolower(c); });
+                no_base_kv_ = (v == "1" || v == "true" || v == "on" || v == "yes");
+            }
+        }
+    }
+    // IMPORTANT:
+    // The XQuant wrapper is attached later (in model->create_memory). Until then,
+    // the graph still expects baseline KV tensors to exist. If the user set
+    // LLAMA_XQ_NOBASE=1 but the runtime is not yet active, ignore the flag to
+    // avoid nullptr derefs during construction.
+    if (no_base_kv_ && !llama_xquant_runtime_active()) {
+        LLAMA_LOG_WARN(
+            "[xquant] LLAMA_XQ_NOBASE is set but XQuant runtime is not active yet; "
+            "ignoring and allocating baseline KV.\n");
+        no_base_kv_ = false;
+    }
+    // -----------------------------------------------------------------------
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -139,20 +168,22 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * v = nullptr;
 
         // When XQuant runs fully materialized (no-base), don't allocate persistent KV.
-        if (!xq_env_nobase()) {
+        if (!no_base_kv_) {
             k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
             v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
         }
 
-        ggml_format_name(k, "cache_k_l%d", il);
-        ggml_format_name(v, "cache_v_l%d", il);
+        if (k) ggml_format_name(k, "cache_k_l%d", il);
+        if (v) ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            if (k) k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*(k ? k->nb[2] : 0)));
-            if (v) v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*(v ? v->nb[2] : 0)));
+            if (k) k_stream.push_back(ggml_view_2d(ctx, k,
+                                n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
+            if (v) v_stream.push_back(ggml_view_2d(ctx, v,
+                                n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
         }
 
         map_layer_ids[il] = layers.size();
@@ -1359,7 +1390,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        if (layer.k) size_k_bytes += ggml_nbytes(layer.k);
     }
 
     return size_k_bytes;
@@ -1369,7 +1400,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += ggml_nbytes(layer.v);
+        if (layer.v) size_v_bytes += ggml_nbytes(layer.v);
     }
 
     return size_v_bytes;
@@ -2108,18 +2139,6 @@ static bool xq_env_enabled() {
     return false;
 }
 
-// When enabled, do not rely on the baseline persistent KV at all.
-// Materialize K/V fully from captured X + concat the current token.
-static bool xq_env_nobase() {
-    const char *s = std::getenv("LLAMA_XQ_NOBASE");
-    if (!s || !*s) return false;
-    if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
-    std::string v(s);
-    std::transform(v.begin(), v.end(), v.begin(),
-                   [](unsigned char c){ return std::tolower(c); });
-    return v == "1" || v == "true" || v == "on" || v == "yes";
-}
-
 // ========= XQuant: KV-backed helpers (no graph churn) =========
 namespace {
 static std::atomic<bool> g_xq_log_enabled_once{false};
@@ -2292,7 +2311,7 @@ ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
 
     // Fast path when we want zero persistent KV usage:
     // Return fully-materialized K (past-from-X plus current k_cur), properly RoPE’d and shaped for attention.
-    if (xq_env_nobase()) {
+    if (no_base_kv()) {
         const uint32_t T_past = sinfos[i_cur].head();
         const int64_t  ne0_d  = kv->hparams.n_embd_head_k;   // per-head dim
         const int64_t  ne1_h  = kv->hparams.n_head_kv();     // kv heads
@@ -2436,7 +2455,7 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
 
     // Fast path when we want zero persistent KV usage:
     // Return fully-materialized V (past-from-X plus current v_cur), shaped to attention’s layout.
-    if (xq_env_nobase()) {
+    if (no_base_kv()) {
         const uint32_t T_past = sinfos[i_cur].head();
         // V layout on CPU (no flash attention) is transposed:
         // non-transposed: [n_embd_head_v, n_head_kv, n_kv, ns]
@@ -2513,7 +2532,6 @@ ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
     dep               = ggml_scale(ctx, dep, 0.0f);
     return ggml_add(ctx, v_full, dep);
 }
-
 
 // XQuant: cached iota helpers (per-graph ggml_context)
 ggml_tensor * llama_kv_cache_context::xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const {

@@ -246,6 +246,9 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // XQuant: when true, we do not allocate or use the baseline FP16 KV
+    bool no_base_kv_ = false;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -353,6 +356,7 @@ public:
     ggml_tensor * get_attn_wv(int32_t il) const; // XQuant
 
     bool xquant_enabled() const;                 // XQuant
+    bool no_base_kv() const;                     // XQuant: run without baseline FP16 KV
     llama_memory_i * get_memory() const;         // XQuant
 
     // Prefill: capture post-norm X rows *after* the graph runs
