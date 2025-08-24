@@ -411,7 +411,7 @@ function Run-BenchMode {
     Write-Host ">>> BENCH ($Mode) ..."
 
     # Arguments only (exe is passed separately)
-    $benchArgs = @('-m', $MODEL, '-p', $P_LEN, '-n', $N_TOK, '-b', $BATCH, '-t', $THREADS, '-ngl', $NGL)
+    $benchArgs = @('-m', $MODEL, '-p', $P_LEN, '-n', $N_TOK, '-b', $BATCH, '-t', $THREADS, '-ngl', $NGL, '--flash-attn', 1)
     if ($benchHasCtx) { $benchArgs += @('-c', $CTX) }
     if ($UBATCH -and $benchHasUb) { $benchArgs += @('-ub', $UBATCH) }
     if ($CTK -and $benchHasCTK) { $benchArgs += @('-ctk', $CTK) }
@@ -439,7 +439,7 @@ function Run-PplMode {
     if ($Mode -eq 'on') { $env:LLAMA_XQ_NOBASE = '1' } else { Remove-Item Env:LLAMA_XQ_NOBASE -ErrorAction SilentlyContinue }
     Write-Host ">>> PPL ($Mode) ..."
 
-    $pplArgs = @('-m', $MODEL, '-f', $PPL_FILE)
+    $pplArgs = @('-m', $MODEL, '-f', $PPL_FILE, '--flash-attn', 1)
     if ($pplHasCTK -and $CTK) { $pplArgs += @('-ctk', $CTK) }
     if ($pplHasCTV -and $CTV) { $pplArgs += @('-ctv', $CTV) }
     if ($pplHasCtx)           { $pplArgs += @('-c', $CTX) }
