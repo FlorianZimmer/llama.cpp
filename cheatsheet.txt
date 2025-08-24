@@ -1,0 +1,17 @@
+git remote -v
+git remote set-url origin   https://github.com/FlorianZimmer/llama.cpp.git     # your fork (RW)
+git remote add     upstream https://github.com/ggml-org/llama.cpp/  # upstream (RO)
+git config --global remote.pushDefault origin
+git remote set-url --push upstream DISABLE
+git config --global pull.rebase true
+
+
+git fetch upstream
+git switch -c feat/xcache-mvp upstream/master   # or upstream/main
+# commit in small chunks
+git push -u origin feat/xcache-mvp              # pushes only to your fork
+
+
+git fetch upstream
+git rebase upstream/master
+git push --force-with-lease

@@ -152,8 +152,4 @@ poetry.toml
 
 CMakeUserPresets.json
 results
-eval.ps1
-ppl.raw
 xquant-mvp*
-
-cheatsheet.txt

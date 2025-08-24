@@ -14,6 +14,7 @@
 #include <cmath>
 #include <atomic>
 #include <cstring>
+#include <utility>  // std::pair
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1354,6 +1355,34 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+// --- XQuant self-attention hook helpers (unified KV) -------------------------
+namespace {
+    // Return K/V for attention. If XQuant is disabled, this falls back to baseline.
+    // Also persists the present row into baseline KV unless "no-base" mode is active.
+    static inline std::pair<ggml_tensor *, ggml_tensor *>
+    xq_get_attn_kv_unified(const llama_kv_cache_context * kvctx,
+                           ggml_context * ctx0,
+                           ggml_cgraph  * gf,
+                           int            il,
+                           ggml_tensor  * k_cur,
+                           ggml_tensor  * v_cur,
+                           ggml_tensor  * k_idxs,   // may be nullptr if set_rows unsupported
+                           ggml_tensor  * v_idxs) { // may be nullptr if set_rows unsupported
+        // XQuant-aware K/V (falls back to baseline if disabled or unsupported)
+        ggml_tensor * K_for_attn = kvctx->get_k_xq(ctx0, il, k_cur, k_idxs);
+        ggml_tensor * V_for_attn = kvctx->get_v_xq(ctx0, il, v_cur, v_idxs);
+
+        // Persist present row to baseline KV (standard behavior) unless "no-base".
+        if (!kvctx->no_base_kv()) {
+            if (k_cur) { if (auto *wK = kvctx->cpy_k(ctx0, k_cur, k_idxs, il)) ggml_build_forward_expand(gf, wK); }
+            if (v_cur) { if (auto *wV = kvctx->cpy_v(ctx0, v_cur, v_idxs, il)) ggml_build_forward_expand(gf, wV); }
+        }
+        
+        return { K_for_attn, V_for_attn };
+    }
+}
+
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -1485,13 +1514,12 @@ ggml_tensor * llm_graph_context::build_attn(
         if (!g_xq_logged.exchange(true)) LLAMA_LOG_INFO("%s", msg);
     };
 
-    // XQuant: prefer rematerialized K/V on read; clean fallbacks inside KV.
-    ggml_tensor * k = xq_on
-        ? mctx_cur->get_k_xq(ctx0, il, k_cur, inp->get_k_idxs())  // XQuant
-        : mctx_cur->get_k   (ctx0, il);
-    ggml_tensor * v = xq_on
-        ? mctx_cur->get_v_xq(ctx0, il, v_cur, inp->get_v_idxs())  // XQuant
-        : mctx_cur->get_v   (ctx0, il);
+   // XQuant option 1: get K/V for attention and persist present row unless "no-base"
+   ggml_tensor * k = nullptr, * v = nullptr;
+   std::tie(k, v) = xq_get_attn_kv_unified(
+       mctx_cur, ctx0, gf, il,
+       k_cur, v_cur,
+       inp->get_k_idxs(), inp->get_v_idxs());
 
     if (xq_on) log_once("[xquant] using XQuant rematerialized KV for attention\n");
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale);
