@@ -7,9 +7,9 @@ git config --global pull.rebase true
 
 
 git fetch upstream
-git switch -c feat/xcache-mvp upstream/master   # or upstream/main
+git switch -c feat/xquant-mvp upstream/master   # or upstream/main
 # commit in small chunks
-git push -u origin feat/xcache-mvp              # pushes only to your fork
+git push -u origin feat/xquant-mvp              # pushes only to your fork
 
 
 git fetch upstream
