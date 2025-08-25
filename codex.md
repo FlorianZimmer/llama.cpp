@@ -1,5 +1,6 @@
 # Repository Codex
-- **Repo:** llama.cpp  • **Commit:** c247d06f • **Generated:** 2025-08-25 UTC
+
+- **Repo:** llama.cpp  • **Commit:** 2fb78f7e • **Generated:** 2025-08-25 UTC
 
 ## 1) High-level Overview
 llama.cpp is a C/C++ inference engine for large language models built on top of the ggml tensor library. The repo contains the core runtime, model loaders, kv-cache implementations, and multiple backend integrations (CUDA, Metal, HIP, SYCL, Vulkan, etc.) for executing GGML graphs on various hardware.
@@ -14,7 +15,7 @@ flowchart LR
 ```
 
 ## 2) Directory Map
-- **src/** – core library: context, graph builder, kv-cache, model loader, sampler, etc.
+- **src/** – core library: context, graph builder, kv-cache, memory modules, model loader, sampler, etc.
 - **include/** – public headers exposing the C API and C++ wrapper.
 - **ggml/** – tensor core and backend implementations (CUDA, Metal, HIP, SYCL, Vulkan, etc.).
 - **common/** – shared utilities: argument parsing, sampling, logging, ngram cache.
@@ -54,6 +55,7 @@ Backend libraries are compiled via `ggml_add_backend_library` and linked into `g
 | `src/llama.cpp` | Core API implementation: initialization, model loading, system info. Key functions: `llama_backend_init`【F:src/llama.cpp†L57-L66】, `llama_model_load` (loads model tensors)【F:src/llama.cpp†L86-L119】. |
 | `src/llama-context.cpp` | Runtime state for inference; synchronizes backend scheduler and tracks stats. Functions: `llama_context::~llama_context`【F:src/llama-context.cpp†L363-L366】, `llama_context::synchronize`【F:src/llama-context.cpp†L367-L395】. |
 | `src/llama-kv-cache.cpp` | KV-cache allocator and manipulation. Functions: constructor `llama_kv_cache::llama_kv_cache`【F:src/llama-kv-cache.cpp†L19-L55】, `clear`【F:src/llama-kv-cache.cpp†L214-L226】, `seq_rm`【F:src/llama-kv-cache.cpp†L227-L289】. |
+| `src/llama-memory.{h,cpp}` | Core memory interfaces and helpers used by all cache types; declares `llama_memory_i` and `llama_memory_context_i` plus status helpers like `llama_memory_status_combine`【F:src/llama-memory.h†L24-L61】【F:src/llama-memory.cpp†L1-L41】. |
 | `src/llama-graph.cpp` | Builds ggml computation graphs; `llm_graph_input_embd::set_input` configures embedding inputs【F:src/llama-graph.cpp†L16-L23】. |
 | `src/llama-quant.cpp` | Quantization helpers and formats. |
 | `src/llama-sampling.cpp` | Sampling strategies for token generation. |
@@ -85,6 +87,12 @@ Backend libraries are compiled via `ggml_add_backend_library` and linked into `g
 2. Expose configuration in `src/llama-cparams.{h,cpp}`.
 3. Update graph builder (`src/llama-graph.cpp`) if new tensors are needed.
 4. Add tests under `tests/` and run via `cmake -DLLAMA_BUILD_TESTS=ON && ctest`.
+
+### Adding a new memory module
+1. Implement a class deriving from `llama_memory_i` with a matching context implementing `llama_memory_context_i` in a new file under `src/llama-memory-*.cpp`【F:src/llama-memory.h†L38-L61】【F:src/llama-memory.h†L65-L117】.
+2. Optionally expose parameters in `src/llama-cparams.{h,cpp}` or via `llama_memory_params`【F:src/llama-memory.h†L15-L22】.
+3. Integrate the module where memory is created or updated in `llama.cpp` or related loaders.
+4. Add tests ensuring `llama_memory_status_is_fail` is handled and run via `ctest`.
 
 ### Adding a new backend kernel
 1. Create `ggml/src/ggml-<backend>/` with kernels and a `CMakeLists.txt` similar to CUDA【F:ggml/src/ggml-cuda/CMakeLists.txt†L48-L90】.
