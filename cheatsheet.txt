@@ -5,13 +5,33 @@ git config --global remote.pushDefault origin
 git remote set-url --push upstream DISABLE
 git config --global pull.rebase true
 
-
 git fetch upstream
 git switch -c feat/xquant-mvp upstream/master   # or upstream/main
 # commit in small chunks
 git push -u origin feat/xquant-mvp              # pushes only to your fork
 
-
 git fetch upstream
 git rebase upstream/master
 git push --force-with-lease
+
+mac
+gpu vuild
+cmake --preset arm64-apple-clang-release \
+  -DGGML_METAL=ON \
+  -DGGML_ACCELERATE=ON \
+  -DLLAMA_METAL_EMBED_LIBRARY=ON
+
+cmake --build build-arm64-apple-clang-release -j
+
+cpu only
+cmake --preset arm64-apple-clang-release \
+  -DGGML_METAL=OFF \
+  -DGGML_ACCELERATE=ON \
+  -DLLAMA_METAL_EMBED_LIBRARY=OFF
+
+cmake --build build-arm64-apple-clang-release -j
+
+./build-arm64-apple-clang-release/bin/llama-cli \
+  -m /Users/florian/Local/models/Qwen3-4B-Instruct-2507-UD-Q8_K_XL.gguf -p "Hello" -ngl 0
+
+./xquant-eval.sh -m /Users/florian/Local/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -c 8192 -p 4096 -n 1024 -b 1024 -t 8 -g 0 --ctk q4_0 --ctv q4_0 --bin-dir build-arm64-apple-clang-release/bin --results-dir results --ppl-file ppl.raw --debug
