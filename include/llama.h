@@ -320,6 +320,12 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // XQuant parameters
+        int32_t xq_bits;
+        int32_t xq_group;
+        int32_t xq_base_layers;
+        int32_t xq_svd_rank;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -338,6 +344,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool xquant;      // enable XQuant memory module
+        bool xquant_cl;   // enable XQuant cross-layer mode
+        bool xq_gqa_svd;  // enable GQA SVD path for XQuant
     };
 
     // model quantization parameters

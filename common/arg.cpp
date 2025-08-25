@@ -1524,6 +1524,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_SPLIT"));
     add_opt(common_arg(
+        {"--xquant"},
+        string_format("enable XQuant memory module (default: %s)", params.xquant ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.xquant = true;
+        }
+    ).set_env("LLAMA_ARG_XQUANT"));
+    add_opt(common_arg(
+        {"--xquant-cl"},
+        string_format("enable XQuant cross-layer delta (default: %s)", params.xquant_cl ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.xquant = true;
+            params.xquant_cl = true;
+        }
+    ).set_env("LLAMA_ARG_XQUANT_CL"));
+    add_opt(common_arg(
+        {"--xq-bits"}, "N",
+        string_format("bits per XQuant activation (default: %d)", params.xq_bits),
+        [](common_params & params, int value) {
+            params.xq_bits = value;
+        }
+    ).set_env("LLAMA_ARG_XQ_BITS"));
+    add_opt(common_arg(
+        {"--xq-group"}, "N",
+        string_format("group size for XQuant (default: %d)", params.xq_group),
+        [](common_params & params, int value) {
+            params.xq_group = value;
+        }
+    ).set_env("LLAMA_ARG_XQ_GROUP"));
+    add_opt(common_arg(
+        {"--xq-base-layers"}, "N",
+        string_format("number of base layers kept at higher precision for XQuant (default: %d)", params.xq_base_layers),
+        [](common_params & params, int value) {
+            params.xq_base_layers = value;
+        }
+    ).set_env("LLAMA_ARG_XQ_BASE_LAYERS"));
+    add_opt(common_arg(
+        {"--xq-gqa-svd"},
+        string_format("enable XQuant GQA SVD path (default: %s)", params.xq_gqa_svd ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.xq_gqa_svd = true;
+        }
+    ).set_env("LLAMA_ARG_XQ_GQA_SVD"));
+    add_opt(common_arg(
+        {"--xq-svd-rank"}, "N",
+        string_format("rank for XQuant SVD (default: %d, -1 = auto)", params.xq_svd_rank),
+        [](common_params & params, int value) {
+            params.xq_svd_rank = value;
+        }
+    ).set_env("LLAMA_ARG_XQ_SVD_RANK"));
+    add_opt(common_arg(
         {"--no-context-shift"},
         string_format("disables context shift on infinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
         [](common_params & params) {
