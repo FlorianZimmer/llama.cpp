@@ -25,6 +25,14 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    int32_t xq_bits;
+    int32_t xq_group;
+    int32_t xq_base_layers;
+    int32_t xq_svd_rank;
+
+    bool xquant;
+    bool xquant_cl;
+    bool xq_gqa_svd;
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;
