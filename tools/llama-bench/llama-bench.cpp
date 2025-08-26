@@ -255,6 +255,13 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<bool>                flash_attn;
+    std::vector<bool>                xquant;
+    std::vector<bool>                xquant_cl;
+    std::vector<int>                 xq_bits;
+    std::vector<int>                 xq_group;
+    std::vector<int>                 xq_base_layers;
+    std::vector<bool>                xq_gqa_svd;
+    std::vector<int>                 xq_svd_rank;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                use_mmap;
@@ -291,6 +298,13 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { false },
+    /* xquant               */ { false },
+    /* xquant_cl            */ { false },
+    /* xq_bits              */ { 4 },
+    /* xq_group             */ { 128 },
+    /* xq_base_layers       */ { 3 },
+    /* xq_gqa_svd           */ { false },
+    /* xq_svd_rank          */ { -1 },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* use_mmap             */ { true },
@@ -365,6 +379,20 @@ static void print_usage(int /* argc */, char ** argv) {
            join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>                   (default: %s)\n",
            join(cmd_params_defaults.flash_attn, ",").c_str());
+    printf("  --xquant <0|1>                            (default: %s)\n",
+           join(cmd_params_defaults.xquant, ",").c_str());
+    printf("  --xquant-cl <0|1>                         (default: %s)\n",
+           join(cmd_params_defaults.xquant_cl, ",").c_str());
+    printf("  --xq-bits <n>                             (default: %s)\n",
+           join(cmd_params_defaults.xq_bits, ",").c_str());
+    printf("  --xq-group <n>                            (default: %s)\n",
+           join(cmd_params_defaults.xq_group, ",").c_str());
+    printf("  --xq-base-layers <n>                      (default: %s)\n",
+           join(cmd_params_defaults.xq_base_layers, ",").c_str());
+    printf("  --xq-gqa-svd <0|1>                        (default: %s)\n",
+           join(cmd_params_defaults.xq_gqa_svd, ",").c_str());
+    printf("  --xq-svd-rank <n>                         (default: %s)\n",
+           join(cmd_params_defaults.xq_svd_rank, ",").c_str());
     printf("  -mmp, --mmap <0|1>                        (default: %s)\n",
            join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -embd, --embeddings <0|1>                 (default: %s)\n",
@@ -632,6 +660,55 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+            } else if (arg == "--xquant") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.xquant.insert(params.xquant.end(), p.begin(), p.end());
+            } else if (arg == "--xquant-cl") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.xquant_cl.insert(params.xquant_cl.end(), p.begin(), p.end());
+            } else if (arg == "--xq-bits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.xq_bits.insert(params.xq_bits.end(), p.begin(), p.end());
+            } else if (arg == "--xq-group") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.xq_group.insert(params.xq_group.end(), p.begin(), p.end());
+            } else if (arg == "--xq-base-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.xq_base_layers.insert(params.xq_base_layers.end(), p.begin(), p.end());
+            } else if (arg == "--xq-gqa-svd") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.xq_gqa_svd.insert(params.xq_gqa_svd.end(), p.begin(), p.end());
+            } else if (arg == "--xq-svd-rank") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.xq_svd_rank.insert(params.xq_svd_rank.end(), p.begin(), p.end());
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -883,6 +960,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
     }
+    if (params.xquant.empty()) {
+        params.xquant = cmd_params_defaults.xquant;
+    }
+    if (params.xquant_cl.empty()) {
+        params.xquant_cl = cmd_params_defaults.xquant_cl;
+    }
+    if (params.xq_bits.empty()) {
+        params.xq_bits = cmd_params_defaults.xq_bits;
+    }
+    if (params.xq_group.empty()) {
+        params.xq_group = cmd_params_defaults.xq_group;
+    }
+    if (params.xq_base_layers.empty()) {
+        params.xq_base_layers = cmd_params_defaults.xq_base_layers;
+    }
+    if (params.xq_gqa_svd.empty()) {
+        params.xq_gqa_svd = cmd_params_defaults.xq_gqa_svd;
+    }
+    if (params.xq_svd_rank.empty()) {
+        params.xq_svd_rank = cmd_params_defaults.xq_svd_rank;
+    }
 
     return params;
 }
@@ -906,6 +1004,13 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     bool               flash_attn;
+    bool               xquant;
+    bool               xquant_cl;
+    int                xq_bits;
+    int                xq_group;
+    int                xq_base_layers;
+    bool               xq_gqa_svd;
+    int                xq_svd_rank;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               use_mmap;
@@ -998,6 +1103,14 @@ struct cmd_params_instance {
         cparams.op_offload   = !no_op_offload;
         cparams.swa_full     = false;
 
+        cparams.xquant        = xquant;
+        cparams.xquant_cl     = xquant_cl;
+        cparams.xq_bits       = xq_bits;
+        cparams.xq_group      = xq_group;
+        cparams.xq_base_layers= xq_base_layers;
+        cparams.xq_gqa_svd    = xq_gqa_svd;
+        cparams.xq_svd_rank   = xq_svd_rank;
+
         return cparams;
     }
 };
@@ -1023,6 +1136,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & xq : params.xquant)
+    for (const auto & xqcl : params.xquant_cl)
+    for (const auto & xqbits : params.xq_bits)
+    for (const auto & xqgroup : params.xq_group)
+    for (const auto & xqbase : params.xq_base_layers)
+    for (const auto & xqgqa : params.xq_gqa_svd)
+    for (const auto & xqrank : params.xq_svd_rank)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1051,6 +1171,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .xquant       = */ xq,
+                /* .xquant_cl    = */ xqcl,
+                /* .xq_bits      = */ xqbits,
+                /* .xq_group     = */ xqgroup,
+                /* .xq_base_layers = */ xqbase,
+                /* .xq_gqa_svd   = */ xqgqa,
+                /* .xq_svd_rank  = */ xqrank,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
@@ -1083,6 +1210,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .xquant       = */ xq,
+                /* .xquant_cl    = */ xqcl,
+                /* .xq_bits      = */ xqbits,
+                /* .xq_group     = */ xqgroup,
+                /* .xq_base_layers = */ xqbase,
+                /* .xq_gqa_svd   = */ xqgqa,
+                /* .xq_svd_rank  = */ xqrank,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
@@ -1115,6 +1249,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .xquant       = */ xq,
+                /* .xquant_cl    = */ xqcl,
+                /* .xq_bits      = */ xqbits,
+                /* .xq_group     = */ xqgroup,
+                /* .xq_base_layers = */ xqbase,
+                /* .xq_gqa_svd   = */ xqgqa,
+                /* .xq_svd_rank  = */ xqrank,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
