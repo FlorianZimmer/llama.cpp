@@ -10,6 +10,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-xquant.h"
 
 #include "ggml-cpp.h"
 
@@ -18352,6 +18353,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    if (cparams.xquant) {
+        llama_xq_params xq;
+        xq.bits        = cparams.xq_bits;
+        xq.group_size  = cparams.xq_group;
+        xq.base_layers = cparams.xq_base_layers;
+        xq.use_cl      = cparams.xquant_cl;
+        xq.gqa_svd     = cparams.xq_gqa_svd;
+        return new llama_memory_xquant(xq, std::unique_ptr<llama_memory_i>(res));
     }
 
     return res;

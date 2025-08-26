@@ -378,6 +378,14 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    int32_t xq_bits        = 4;     // bits per activation
+    int32_t xq_group       = 128;   // group size for quantization
+    int32_t xq_base_layers = 3;     // number of base layers kept at higher precision
+    int32_t xq_svd_rank    = -1;    // SVD rank (-1 = auto)
+    bool xquant            = false; // enable XQuant memory
+    bool xquant_cl         = false; // enable XQuant cross-layer delta
+    bool xq_gqa_svd        = false; // enable XQuant GQA SVD path
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock         = false; // use mlock to keep model in memory
