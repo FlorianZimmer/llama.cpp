@@ -43,6 +43,13 @@ llama_context::llama_context(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
     cparams.no_perf          = params.no_perf;
+    cparams.xquant           = params.xquant;
+    cparams.xquant_cl        = params.xquant_cl;
+    cparams.xq_gqa_svd       = params.xq_gqa_svd;
+    cparams.xq_bits          = params.xq_bits;
+    cparams.xq_group         = params.xq_group;
+    cparams.xq_base_layers   = params.xq_base_layers;
+    cparams.xq_svd_rank      = params.xq_svd_rank;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
@@ -2240,6 +2247,10 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.xq_bits                     =*/ 4,
+        /*.xq_group                    =*/ 128,
+        /*.xq_base_layers              =*/ 3,
+        /*.xq_svd_rank                 =*/ -1,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2249,6 +2260,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.xquant                      =*/ false,
+        /*.xquant_cl                   =*/ false,
+        /*.xq_gqa_svd                  =*/ false,
     };
 
     return result;
