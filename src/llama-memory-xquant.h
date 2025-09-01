@@ -14,6 +14,9 @@ struct llama_xq_svd_layer {
     uint32_t rank_v;
 };
 
+struct llama_model;
+struct llama_context;
+
 class llama_memory_xquant : public llama_memory_i {
 public:
     llama_memory_xquant(const llama_model & model) { (void) model; }
