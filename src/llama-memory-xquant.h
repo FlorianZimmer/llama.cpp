@@ -2,6 +2,18 @@
 
 #include "llama-memory.h"
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct llama_model;
+struct llama_context;
+
+struct llama_xq_svd_layer {
+    uint32_t rank_k;
+    uint32_t rank_v;
+};
+
 struct llama_model;
 struct llama_context;
 
@@ -9,6 +21,8 @@ class llama_memory_xquant : public llama_memory_i {
 public:
     llama_memory_xquant(const llama_model & model) { (void) model; }
     ~llama_memory_xquant() override = default;
+
+    bool load_svd(const std::string & path, const llama_model & model);
 
     llama_memory_context_ptr init_batch(llama_batch_allocr &, uint32_t, bool) override { return nullptr; }
     llama_memory_context_ptr init_full() override { return nullptr; }
@@ -29,6 +43,10 @@ public:
 
     void state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const override {}
     void state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) override {}
+
+private:
+    bool svd_loaded = false;
+    std::vector<llama_xq_svd_layer> svd_layers;
 };
 
 class llama_memory_xquant_cl : public llama_memory_xquant {

@@ -25,6 +25,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <filesystem>
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -18243,6 +18244,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         } else {
             res = new llama_memory_xquant(*this);
         }
+
+        if (cparams.xq_gqa_svd) {
+            auto * mem_xq = static_cast<llama_memory_xquant *>(res);
+            std::string svd_path = cparams.xq_svd_path;
+            if (svd_path.empty()) {
+                namespace fs = std::filesystem;
+                fs::path base = path_model;
+                svd_path = base.replace_extension(".xqsvd").string();
+            }
+            if (!mem_xq->load_svd(svd_path, *this)) {
+                LLAMA_LOG_ERROR("%s: failed to load XQuant SVD factors from %s\n", __func__, svd_path.c_str());
+                throw std::runtime_error("missing XQuant SVD factors");
+            }
+        }
+
         return res;
     }
 
