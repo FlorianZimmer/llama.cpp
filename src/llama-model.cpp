@@ -6057,6 +6057,10 @@ struct llm_build_llama : public llm_graph_context {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+            if (cparams.xquant || cparams.xquant_cl) {
+                auto * xq_ctx = const_cast<llama_memory_xquant_context *>(static_cast<const llama_memory_xquant_context *>(mctx));
+                ggml_build_forward_expand(gf, xq_ctx->write(ctx0, cur, il));
+            }
 
             // self-attention
             {

@@ -1,3 +1,3 @@
-#include "llama.h"
+#include "llama-xq-quant.h"
 
-// Placeholder for XQuant quantization helpers
+// Implementation provided in the header as inline helpers.
