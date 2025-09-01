@@ -17,12 +17,9 @@ struct llama_xq_svd_layer {
     uint32_t rank_v;
 };
 
-struct llama_model;
-struct llama_context;
-
 class llama_memory_xquant : public llama_memory_i {
 public:
-    llama_memory_xquant(const llama_model & model) { (void) model; }
+    llama_memory_xquant(const llama_model & model) : model(model) {}
     ~llama_memory_xquant() override = default;
 
     std::vector<std::vector<ggml_tensor *>> layer_data;
@@ -50,6 +47,10 @@ public:
     void state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) override {}
 
 private:
+    friend class llama_memory_xquant_context;
+
+    const llama_model & model;
+
     bool svd_loaded = false;
     std::vector<llama_xq_svd_layer> svd_layers;
 };
@@ -71,6 +72,10 @@ public:
     llama_memory_status get_status() const override { return LLAMA_MEMORY_STATUS_SUCCESS; }
 
     ggml_tensor * write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il);
+
+    uint32_t get_n_kv() const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il);
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il);
 
 private:
     llama_memory_xquant & mem;

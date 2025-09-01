@@ -56,6 +56,64 @@ ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor
     return q;
 }
 
+uint32_t llama_memory_xquant_context::get_n_kv() const {
+    if (mem.layer_data.empty()) {
+        return 0;
+    }
+
+    uint32_t n = 0;
+    for (ggml_tensor * t : mem.layer_data[0]) {
+        n += t->ne[1];
+    }
+    return n;
+}
+
+// helper: dequantize and concatenate cached X for layer il
+static ggml_tensor * xq_dequant_concat(ggml_context * ctx, const std::vector<ggml_tensor *> & qs) {
+    ggml_tensor * cur = nullptr;
+    for (ggml_tensor * q : qs) {
+        ggml_tensor * deq = ggml_cast(ctx, q, GGML_TYPE_F32);
+        if (!cur) {
+            cur = deq;
+        } else {
+            cur = ggml_concat(ctx, cur, deq, 1);
+        }
+    }
+    return cur;
+}
+
+ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il) {
+    if (mem.layer_data.size() <= (size_t) il) {
+        return nullptr;
+    }
+
+    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il]);
+    if (!x) {
+        return nullptr;
+    }
+
+    const auto & hp = mem.model.hparams;
+    ggml_tensor * k = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
+    k = ggml_reshape_3d(ctx, k, hp.n_embd_head_k, hp.n_head_kv(il), get_n_kv());
+    return k;
+}
+
+ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il) {
+    if (mem.layer_data.size() <= (size_t) il) {
+        return nullptr;
+    }
+
+    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il]);
+    if (!x) {
+        return nullptr;
+    }
+
+    const auto & hp = mem.model.hparams;
+    ggml_tensor * v = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
+    v = ggml_reshape_3d(ctx, v, hp.n_embd_head_v, hp.n_head_kv(il), get_n_kv());
+    return v;
+}
+
 llama_memory_context_ptr llama_memory_xquant::init_batch(llama_batch_allocr &, uint32_t, bool) {
     return std::make_unique<llama_memory_xquant_context>(*this);
 }
