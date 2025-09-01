@@ -197,10 +197,19 @@ if (NOT LLAMA_SANITIZE_ADDRESS)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-gguf.cpp)
-llama_build_and_test(test-backend-ops.cpp)
+    llama_build_and_test(test-backend-ops.cpp)
 
-llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
-llama_build_and_test(test-autorelease.cpp        LABEL "model")
+    llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
+    llama_build_and_test(test-autorelease.cpp        LABEL "model")
+
+    llama_build_and_test(test-xq-quant.cpp)
+    llama_build_and_test(test-xq-svd.cpp)
+    llama_test_cmd(
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-xq-no-kv.sh
+        NAME test-xq-no-kv
+        WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        ARGS $<TARGET_FILE:test-xq-quant>
+    )
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
