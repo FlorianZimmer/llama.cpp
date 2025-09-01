@@ -46,3 +46,24 @@ bool llama_memory_xquant::load_svd(const std::string & path, const llama_model &
     svd_loaded = true;
     return true;
 }
+
+ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il) {
+    if (mem.layer_data.size() <= (size_t) il) {
+        mem.layer_data.resize(il + 1);
+    }
+    ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
+    mem.layer_data[il].push_back(q);
+    return q;
+}
+
+llama_memory_context_ptr llama_memory_xquant::init_batch(llama_batch_allocr &, uint32_t, bool) {
+    return std::make_unique<llama_memory_xquant_context>(*this);
+}
+
+llama_memory_context_ptr llama_memory_xquant::init_full() {
+    return std::make_unique<llama_memory_xquant_context>(*this);
+}
+
+llama_memory_context_ptr llama_memory_xquant::init_update(llama_context *, bool) {
+    return std::make_unique<llama_memory_xquant_context>(*this);
+}
