@@ -10,6 +10,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-xquant.h"
 
 #include "ggml-cpp.h"
 
@@ -18235,6 +18236,15 @@ struct llm_build_smallthinker : public llm_graph_context{
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    if (cparams.xquant || cparams.xquant_cl) {
+        if (cparams.xquant_cl) {
+            res = new llama_memory_xquant_cl(*this);
+        } else {
+            res = new llama_memory_xquant(*this);
+        }
+        return res;
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the

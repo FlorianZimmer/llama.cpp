@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 
 #define LLAMA_MAX_SEQ 64
 
@@ -33,6 +34,15 @@ struct llama_cparams {
     bool warmup;
     bool op_offload;
     bool kv_unified;
+
+    bool xquant;
+    bool xquant_cl;
+    int32_t xq_bits;
+    int32_t xq_group;
+    int32_t xq_base_layers;
+    bool xq_gqa_svd;
+    int32_t xq_svd_rank;
+    std::string xq_svd_path;
 
     enum llama_pooling_type pooling_type;
 

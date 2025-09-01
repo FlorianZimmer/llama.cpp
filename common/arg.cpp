@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdarg>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -1248,6 +1249,16 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         exit(1); // for other exceptions, we exit with status code 1
     }
 
+    if (ctx_arg.params.xquant || ctx_arg.params.xquant_cl) {
+        for (int i = 1; i < argc; ++i) {
+            if (strncmp(argv[i], "--kv-", 5) == 0 || strcmp(argv[i], "-kvu") == 0) {
+                fprintf(stderr, "error: --kv-* flags cannot be used with --xquant*\n");
+                ctx_arg.params = params_org;
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1523,6 +1534,75 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_unified = true;
         }
     ).set_env("LLAMA_ARG_KV_SPLIT"));
+
+    add_opt(common_arg(
+        {"--xquant"},
+        string_format("enable XQuant; disables KV cache (default: %s)", params.xquant ? "true" : "false"),
+        [](common_params & params) {
+            params.xquant = true;
+        }
+    ).set_env("LLAMA_XQUANT"));
+
+    add_opt(common_arg(
+        {"--xquant-cl"},
+        string_format("enable XQuant cross-layer deltas (default: %s)", params.xquant_cl ? "true" : "false"),
+        [](common_params & params) {
+            params.xquant = true;
+            params.xquant_cl = true;
+        }
+    ).set_env("LLAMA_XQ_CL"));
+
+    add_opt(common_arg(
+        {"--xq-bits"}, "N",
+        string_format("XQuant bit width (default: %d)", params.xq_bits),
+        [](common_params & params, int value) {
+            params.xq_bits = value;
+        }
+    ).set_env("LLAMA_XQ_BITS"));
+
+    add_opt(common_arg(
+        {"--xq-group"}, "N",
+        string_format("XQuant group size (default: %d)", params.xq_group),
+        [](common_params & params, int value) {
+            params.xq_group = value;
+        }
+    ).set_env("LLAMA_XQ_GROUP"));
+
+    add_opt(common_arg(
+        {"--xq-base-layers"}, "N",
+        string_format("early layers pinned to 4-bit (default: %d)", params.xq_base_layers),
+        [](common_params & params, int value) {
+            params.xq_base_layers = value;
+        }
+    ).set_env("LLAMA_XQ_BASE_LAYERS"));
+
+    add_opt(common_arg(
+        {"--xq-gqa-svd"},
+        string_format("enable latent caching for GQA (default: %s)", params.xq_gqa_svd ? "true" : "false"),
+        [](common_params & params) {
+            params.xq_gqa_svd = true;
+        }
+    ).set_env("LLAMA_XQ_GQA_SVD"));
+
+    add_opt(common_arg(
+        {"--xq-svd-rank"}, "R",
+        string_format("SVD rank (default: %s)", params.xq_svd_rank < 0 ? "auto" : std::to_string(params.xq_svd_rank).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.xq_svd_rank = -1;
+            } else {
+                params.xq_svd_rank = std::stoi(value);
+            }
+        }
+    ).set_env("LLAMA_XQ_SVD_RANK"));
+
+    add_opt(common_arg(
+        {"--xq-svd-path"}, "PATH",
+        "path to SVD factor file or directory",
+        [](common_params & params, const std::string & value) {
+            params.xq_svd_path = value;
+        }
+    ).set_env("LLAMA_XQ_SVD_PATH"));
     add_opt(common_arg(
         {"--no-context-shift"},
         string_format("disables context shift on infinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),

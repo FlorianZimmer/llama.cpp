@@ -25,6 +25,9 @@ add_library(llama
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-recurrent.cpp
+            llama-memory-xquant.cpp
+            llama-memory-xquant-cl.cpp
+            llama-xq-quant.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp

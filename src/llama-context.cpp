@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 
@@ -44,6 +45,14 @@ llama_context::llama_context(
     cparams.flash_attn       = params.flash_attn;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
+    cparams.xquant           = params.xquant;
+    cparams.xquant_cl        = params.xquant_cl;
+    cparams.xq_bits          = params.xq_bits;
+    cparams.xq_group         = params.xq_group;
+    cparams.xq_base_layers   = params.xq_base_layers;
+    cparams.xq_gqa_svd       = params.xq_gqa_svd;
+    cparams.xq_svd_rank      = params.xq_svd_rank;
+    cparams.xq_svd_path      = params.xq_svd_path ? params.xq_svd_path : "";
     cparams.warmup           = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -131,6 +140,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %d\n",   __func__, cparams.flash_attn);
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: xquant        = %s\n",   __func__, cparams.xquant ? "true" : "false");
+    LLAMA_LOG_INFO("%s: xquant_cl     = %s\n",   __func__, cparams.xquant_cl ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -209,6 +220,10 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (cparams.xquant || cparams.xquant_cl) {
+            GGML_ASSERT(dynamic_cast<llama_kv_cache *>(memory.get()) == nullptr);
+        }
     }
 
     // init backends
@@ -2240,6 +2255,11 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.xq_bits                     =*/ 4,
+        /*.xq_group                    =*/ 128,
+        /*.xq_base_layers              =*/ 3,
+        /*.xq_svd_rank                 =*/ -1,
+        /*.xq_svd_path                 =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2249,6 +2269,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.xquant                      =*/ false,
+        /*.xquant_cl                   =*/ false,
+        /*.xq_gqa_svd                  =*/ false,
     };
 
     return result;
