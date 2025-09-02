@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Microbenchmark helper for XQuant
 # Usage: ./xq-bench.sh <model.gguf>
+#
+# Searches for the llama-bench binary relative to this script. The
+# lookup order is:
+#   1. ../llama-bench/llama-bench
+#   2. $LLAMA_BENCH_BIN if set
+#   3. ../../build/bin/llama-bench
 
 set -euo pipefail
 MODEL=${1:?"model path required"}
 LLAMA_BENCH_DIR="$(dirname "$0")/../llama-bench"
 BIN="${LLAMA_BENCH_DIR}/llama-bench"
+
+if [ ! -x "$BIN" ]; then
+    BIN="${LLAMA_BENCH_BIN:-"$(dirname "$0")/../../build/bin/llama-bench"}"
+fi
 
 if [ ! -x "$BIN" ]; then
     echo "llama-bench binary not found at $BIN" >&2
