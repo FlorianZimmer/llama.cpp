@@ -126,21 +126,26 @@ bool llama_memory_xquant_context::apply() {
     return true;
 }
 
-uint32_t llama_memory_xquant_context::get_n_kv() const {
-    if (mem.layer_data.empty()) {
-        return 0;
-    }
-
+static uint32_t count_tokens_for_layer(
+    const llama_memory_xquant & mem,
+    const std::vector<llama_memory_xquant_context::pending_write> & pending,
+    int32_t il) {
     uint32_t n = 0;
-    for (const auto & blk : mem.layer_data[0]) {
-        n += blk.ne1;
+    if (mem.layer_data.size() > (size_t) il) {
+        for (const auto & blk : mem.layer_data[il]) {
+            n += (uint32_t) blk.ne1;
+        }
     }
     for (const auto & pw : pending) {
-        if (pw.il == 0) {
+        if (pw.il == il) {
             n += (uint32_t) pw.n_tokens;
         }
     }
     return n;
+}
+
+uint32_t llama_memory_xquant_context::get_n_kv() const {
+    return count_tokens_for_layer(mem, pending, 0);
 }
 
 // helper: dequantize and concatenate cached X for layer il
@@ -224,9 +229,17 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const auto &  hp = mem.model.hparams;
-    ggml_tensor * k  = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
-    k                = ggml_reshape_3d(ctx, k, hp.n_embd_head_k, hp.n_head_kv(il), get_n_kv());
+    const int64_t n_kv_x = ggml_nelements(x) / mem.model.hparams.n_embd;
+    GGML_ASSERT(n_kv_x == (int64_t) count_tokens_for_layer(mem, pending, il));
+
+    const auto & hp = mem.model.hparams;
+    const int64_t out_k = hp.n_embd_head_k * hp.n_head_kv(il);
+    LLAMA_LOG_DEBUG("wk out=%lld expected=%lld\n", (long long) mem.model.layers[il].wk->ne[1], (long long) out_k);
+
+    ggml_tensor * k_lin = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
+    const int64_t elems_k = ggml_nelements(k_lin);
+    GGML_ASSERT(elems_k == out_k * n_kv_x);
+    ggml_tensor * k = ggml_reshape_3d(ctx, k_lin, hp.n_embd_head_k, hp.n_head_kv(il), n_kv_x);
     return k;
 }
 
@@ -242,9 +255,17 @@ ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const auto &  hp = mem.model.hparams;
-    ggml_tensor * v  = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
-    v                = ggml_reshape_3d(ctx, v, hp.n_embd_head_v, hp.n_head_kv(il), get_n_kv());
+    const int64_t n_kv_x = ggml_nelements(x) / mem.model.hparams.n_embd;
+    GGML_ASSERT(n_kv_x == (int64_t) count_tokens_for_layer(mem, pending, il));
+
+    const auto & hp = mem.model.hparams;
+    const int64_t out_v = hp.n_embd_head_v * hp.n_head_kv(il);
+    LLAMA_LOG_DEBUG("wv out=%lld expected=%lld\n", (long long) mem.model.layers[il].wv->ne[1], (long long) out_v);
+
+    ggml_tensor * v_lin = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
+    const int64_t elems_v = ggml_nelements(v_lin);
+    GGML_ASSERT(elems_v == out_v * n_kv_x);
+    ggml_tensor * v = ggml_reshape_3d(ctx, v_lin, hp.n_embd_head_v, hp.n_head_kv(il), n_kv_x);
     return v;
 }
 
