@@ -6079,9 +6079,9 @@ struct llm_build_llama : public llm_graph_context {
 
                     Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-                    ggml_tensor * K = xq_ctx->get_k(ctx0, il);
-                    ggml_tensor * V = xq_ctx->get_v(ctx0, il);
-                    uint32_t n_kv = xq_ctx->get_n_kv();
+                    ggml_tensor * K     = xq_ctx->get_k(ctx0, il);
+                    ggml_tensor * V     = xq_ctx->get_v(ctx0, il);
+                    uint32_t      n_kv  = K ? K->ne[2] : 0;
                     ggml_tensor * k_pos = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), GGML_TYPE_I32);
 
                     Qcur = ggml_rope_ext(
