@@ -6059,7 +6059,7 @@ struct llm_build_llama : public llm_graph_context {
             cb(cur, "attn_norm", il);
             if (cparams.xquant || cparams.xquant_cl) {
                 auto * xq_ctx = const_cast<llama_memory_xquant_context *>(static_cast<const llama_memory_xquant_context *>(mctx));
-                ggml_build_forward_expand(gf, xq_ctx->write(ctx0, cur, il));
+                ggml_build_forward_expand(gf, xq_ctx->write(ctx0, cur, il, cparams.xq_bits));
             }
 
             // self-attention

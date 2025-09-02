@@ -17,6 +17,16 @@ XQuant replaces the traditional K/V cache with a compact stream of quantized pos
 
 XQuant flags are **mutually exclusive** with all `--kv-*` options. The model factory asserts that no KV cache is present whenever XQuant is active.
 
+### Bit Width Mapping
+
+The `--xq-bits` flag controls the ggml tensor type used to store activations:
+
+- `2` → `Q2_K`
+- `3` or `4` → `Q4_0`
+- `8` → `Q8_0`
+
+Values other than those listed fall back to `Q4_0`.
+
 ## RoPE Timing
 
 When using XQuant, cached activations are stored **pre‑RoPE**. RoPE is applied only after K/V rematerialization, keeping the on‑disk representation agnostic to position.
