@@ -6,6 +6,7 @@ This file provides guidance for contributors and automation working in this repo
 - Build the project with `cmake -B build`.
 - Compile with `cmake --build build`.
 - Run the test suite with `ctest --test-dir build`.
+- Rerun tests if failed with `ctest --test-dir build --output-on-failure --rerun-failed` to figure out why tests failed.
 - If only Python code is touched, run `pytest` instead of the CMake steps.
 
 ## Code Style
