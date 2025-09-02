@@ -158,58 +158,73 @@ static ggml_tensor * normalize_to_dm_by_elements(ggml_context * ctx, ggml_tensor
     return t;
 }
 
-static ggml_tensor * xq_build_pending_only(
+static ggml_tensor * xq_build_full_x(
     ggml_context * ctx,
+    const llama_memory_xquant & mem,
     const std::vector<llama_memory_xquant_context::pending_write> & pending,
     int32_t il,
     int64_t d_model) {
 
     ggml_tensor * cur = nullptr;
 
+    // A) Stored past blocks
+    if (mem.layer_data.size() > (size_t) il) {
+        for (const auto & blk : mem.layer_data[il]) {
+            ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, d_model, blk.ne1);
+            memcpy(qt->data, blk.data.data(), blk.data.size());
+            ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
+            deq = normalize_to_dm_by_elements(ctx, deq, d_model);
+            if (!ggml_is_contiguous(deq)) {
+                deq = ggml_cont(ctx, deq);
+            }
+            cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
+            cur = normalize_to_dm_by_elements(ctx, cur, d_model);
+        }
+    }
+
+    // B) Pending writes
     for (const auto & pw : pending) {
         if (pw.il != il) continue;
 
-        // Cast quant node (may have padding / non-canonical strides)
         ggml_tensor * deq_full = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-
-        // Normalize width to d_model by element count, then contiguize
         deq_full = normalize_to_dm_by_elements(ctx, deq_full, d_model);
         ggml_tensor * deq_cont = ggml_cont(ctx, deq_full);
 
-        // Clamp to the logical token count captured at write()
         const int64_t cols_full = ggml_nelements(deq_cont) / d_model;
         const int64_t cols_take = pw.n_tokens <= cols_full ? pw.n_tokens : cols_full;
 
-        // Slice first cols_take tokens (no buffer read)
         ggml_tensor * deq = ggml_view_2d(ctx,
                                         deq_cont,
                                         /*ne0*/ d_model,
                                         /*ne1*/ cols_take,
                                         /*nb1*/ deq_cont->nb[1],
                                         /*offs*/ 0);
-
-        // Fold to strict [d_model, -1]
         deq = normalize_to_dm_by_elements(ctx, deq, d_model);
 
-        // Concat along tokens
         cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
         cur = normalize_to_dm_by_elements(ctx, cur, d_model);
     }
 
-    return cur; // may be nullptr if no pending for this layer
+    if (cur) {
+        cur = normalize_to_dm_by_elements(ctx, cur, d_model);
+    }
+
+    return cur;
 }
 
 ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il) {
     const int64_t d_model = mem.model.hparams.n_embd;
 
-    ggml_tensor * x = xq_build_pending_only(ctx, pending, il, d_model);
+    ggml_tensor * x = xq_build_full_x(ctx, mem, pending, il, d_model);
     if (!x) {
         return nullptr;
     }
 
     x = normalize_to_dm_by_elements(ctx, x, d_model);
-    const int64_t n_tok = ggml_nelements(x) / d_model;
-    LLAMA_LOG_DEBUG("xq layer %d: n_tok(pending)=%lld\n", il, (long long) n_tok);
+    const int64_t n_tok      = ggml_nelements(x) / d_model;
+    const uint32_t n_tok_cnt = count_tokens_for_layer(mem, pending, il);
+    LLAMA_LOG_DEBUG("xq layer %d: n_tok(built)=%lld n_tok(counted)=%u\n", il, (long long) n_tok, n_tok_cnt);
+    GGML_ASSERT((uint64_t) n_tok == (uint64_t) n_tok_cnt);
 
     const auto & hp   = mem.model.hparams;
     const int64_t out_k = hp.n_embd_head_k * hp.n_head_kv(il);
@@ -224,14 +239,16 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
 ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il) {
     const int64_t d_model = mem.model.hparams.n_embd;
 
-    ggml_tensor * x = xq_build_pending_only(ctx, pending, il, d_model);
+    ggml_tensor * x = xq_build_full_x(ctx, mem, pending, il, d_model);
     if (!x) {
         return nullptr;
     }
 
     x = normalize_to_dm_by_elements(ctx, x, d_model);
-    const int64_t n_tok = ggml_nelements(x) / d_model;
-    LLAMA_LOG_DEBUG("xq layer %d: n_tok(pending)=%lld\n", il, (long long) n_tok);
+    const int64_t n_tok      = ggml_nelements(x) / d_model;
+    const uint32_t n_tok_cnt = count_tokens_for_layer(mem, pending, il);
+    LLAMA_LOG_DEBUG("xq layer %d: n_tok(built)=%lld n_tok(counted)=%u\n", il, (long long) n_tok, n_tok_cnt);
+    GGML_ASSERT((uint64_t) n_tok == (uint64_t) n_tok_cnt);
 
     const auto & hp   = mem.model.hparams;
     const int64_t out_v = hp.n_embd_head_v * hp.n_head_kv(il);
