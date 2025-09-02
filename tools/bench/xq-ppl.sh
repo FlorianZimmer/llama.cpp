@@ -9,7 +9,7 @@ PERP_DIR="$(dirname "$0")/../llama-perplexity"
 BIN="${PERP_DIR}/llama-perplexity"
 
 if [ ! -x "$BIN" ]; then
-    BIN="${LLAMA_BENCH_BIN:-"$(dirname "$0")/../../build/bin/llama-perplexity"}"
+    BIN="${LLAMA_PERPLEXITY_BIN:-"$(dirname "$0")/../../build/bin/llama-perplexity"}"
 fi
 
 if [ ! -x "$BIN" ]; then
@@ -25,5 +25,13 @@ run_case() {
 }
 
 run_case baseline
-run_case xquant4 --xquant --xq-bits 4
-run_case xquant-cl3 --xquant-cl --xq-bits 3
+
+# XQuant with optional GQA latent caching via SVD factors
+SVD_PATH="${MODEL%.gguf}.xqsvd"
+XQ_ARGS=()
+if [ -f "$SVD_PATH" ]; then
+    XQ_ARGS+=(--xq-gqa-svd --xq-svd-path "$SVD_PATH")
+fi
+
+run_case xquant4 --xquant --xq-bits 4 "${XQ_ARGS[@]}"
+run_case xquant-cl3 --xquant-cl --xq-bits 3 "${XQ_ARGS[@]}"
