@@ -20,9 +20,17 @@ repo=$1
 folder=$2
 
 if [ -d $folder ] && [ -d $folder/.git ]; then
-    (cd $folder; git pull)
+    (
+        cd $folder
+        git pull
+        git lfs pull >/dev/null 2>&1 || true
+    )
 else
     git clone $repo $folder
+    (
+        cd $folder
+        git lfs pull >/dev/null 2>&1 || true
+    )
 fi
 
 shopt -s globstar
