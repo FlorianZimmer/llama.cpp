@@ -114,27 +114,30 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
         int32_t il, int64_t d_model) {
     ggml_tensor * cur = nullptr;
 
+    auto normalize = [&](ggml_tensor * t) {
+        int64_t elems = ggml_nelements(t);
+        GGML_ASSERT(elems % d_model == 0);
+        int64_t cols = elems / d_model;
+        if (t->ne[0] != d_model || t->ne[1] != cols) {
+            t = ggml_reshape_2d(ctx, t, d_model, cols);
+        }
+        return t;
+    };
+
     // 1) dequantize pre-existing blocks
     for (const auto & blk : qs) {
         ggml_tensor * qt  = ggml_new_tensor_2d(ctx, blk.type, d_model, blk.ne1);
         // copy raw bytes into the tensor buffer
-        ggml_backend_tensor_set(qt, blk.data.data(), 0, blk.data.size());
+        memcpy(qt->data, blk.data.data(), blk.data.size());
 
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        if (deq->ne[0] != d_model) {
-            deq = ggml_cont(ctx, ggml_transpose(ctx, deq));
-        }
-        int64_t cols = ggml_nrows(deq);
-        deq = ggml_reshape_2d(ctx, deq, d_model, cols);
+        deq = normalize(deq);
 
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            // ggml_concat may promote to >2-D; fold it back explicitly
-            int64_t cur_ne0 = cur->ne[0];
-            int64_t cur_cols = ggml_nrows(cur);
-            cur = ggml_reshape_2d(ctx, cur, cur_ne0, cur_cols);
+            cur = normalize(cur);
         }
     }
 
@@ -144,18 +147,13 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
             continue;
         }
         ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-        if (deq->ne[0] != d_model) {
-            deq = ggml_cont(ctx, ggml_transpose(ctx, deq));
-        }
-        int64_t cols = ggml_nrows(deq);
-        deq = ggml_reshape_2d(ctx, deq, d_model, cols);
+        deq = normalize(deq);
 
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            int64_t cur_cols = ggml_nrows(cur);
-            cur = ggml_reshape_2d(ctx, cur, d_model, cur_cols);
+            cur = normalize(cur);
         }
     }
 
@@ -172,6 +170,18 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
         return nullptr;
     }
 
+    auto normalize = [&](ggml_tensor * t) {
+        int64_t elems = ggml_nelements(t);
+        GGML_ASSERT(elems % mem.model.hparams.n_embd == 0);
+        int64_t cols = elems / mem.model.hparams.n_embd;
+        if (t->ne[0] != mem.model.hparams.n_embd || t->ne[1] != cols) {
+            t = ggml_reshape_2d(ctx, t, mem.model.hparams.n_embd, cols);
+        }
+        return t;
+    };
+
+    x = normalize(x);
+
     const auto & hp = mem.model.hparams;
     ggml_tensor * k = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
     k = ggml_reshape_3d(ctx, k, hp.n_embd_head_k, hp.n_head_kv(il), get_n_kv());
@@ -187,6 +197,18 @@ ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il)
     if (!x) {
         return nullptr;
     }
+
+    auto normalize = [&](ggml_tensor * t) {
+        int64_t elems = ggml_nelements(t);
+        GGML_ASSERT(elems % mem.model.hparams.n_embd == 0);
+        int64_t cols = elems / mem.model.hparams.n_embd;
+        if (t->ne[0] != mem.model.hparams.n_embd || t->ne[1] != cols) {
+            t = ggml_reshape_2d(ctx, t, mem.model.hparams.n_embd, cols);
+        }
+        return t;
+    };
+
+    x = normalize(x);
 
     const auto & hp = mem.model.hparams;
     ggml_tensor * v = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
