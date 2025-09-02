@@ -29,6 +29,6 @@ run_case() {
     echo
 }
 
-run_case baseline ""
+run_case baseline
 run_case xquant4 --xquant --xq-bits 4
 run_case xquant-cl3 --xquant-cl --xq-bits 3
