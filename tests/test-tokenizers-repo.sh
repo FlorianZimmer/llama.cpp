@@ -27,6 +27,7 @@ if [ -d $folder ] && [ -d $folder/.git ]; then
             echo "git lfs pull failed: is git-lfs installed?" >&2
             exit 1
         fi
+        git lfs pull >/dev/null 2>&1 || true
     )
 else
     git clone $repo $folder
@@ -36,6 +37,7 @@ else
             echo "git lfs pull failed: is git-lfs installed?" >&2
             exit 1
         fi
+        git lfs pull >/dev/null 2>&1 || true
     )
 fi
 
