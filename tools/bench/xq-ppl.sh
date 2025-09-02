@@ -5,8 +5,12 @@
 set -euo pipefail
 MODEL=${1:?"model path required"}
 DATA=${2:?"dataset required"}
-PERP_DIR="$(dirname "$0")/../perplexity"
-BIN="${PERP_DIR}/perplexity"
+PERP_DIR="$(dirname "$0")/../llama-perplexity"
+BIN="${PERP_DIR}/llama-perplexity"
+
+if [ ! -x "$BIN" ]; then
+    BIN="${LLAMA_BENCH_BIN:-"$(dirname "$0")/../../build/bin/llama-perplexity"}"
+fi
 
 if [ ! -x "$BIN" ]; then
     echo "perplexity binary not found at $BIN" >&2
