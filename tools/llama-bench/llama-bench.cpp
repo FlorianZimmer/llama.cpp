@@ -260,6 +260,14 @@ struct cmd_params {
     std::vector<bool>                use_mmap;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
+    bool                             xquant;
+    bool                             xquant_cl;
+    int                              xq_bits;
+    int                              xq_group;
+    int                              xq_base_layers;
+    bool                             xq_gqa_svd;
+    int                              xq_svd_rank;
+    std::string                      xq_svd_path;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -296,6 +304,14 @@ static const cmd_params cmd_params_defaults = {
     /* use_mmap             */ { true },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
+    /* xquant               */ false,
+    /* xquant_cl            */ false,
+    /* xq_bits              */ 4,
+    /* xq_group             */ 128,
+    /* xq_base_layers       */ 3,
+    /* xq_gqa_svd           */ false,
+    /* xq_svd_rank          */ -1,
+    /* xq_svd_path          */ "",
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -373,6 +389,15 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                            (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>              (default: 0)\n");
+    printf("  --xquant                                enable XQuant (default: %s)\n", cmd_params_defaults.xquant ? "true" : "false");
+    printf("  --xquant-cl                             enable XQuant cross-layer deltas (default: %s)\n", cmd_params_defaults.xquant_cl ? "true" : "false");
+    printf("  --xq-bits <n>                           XQuant bit width (default: %d)\n", cmd_params_defaults.xq_bits);
+    printf("  --xq-group <n>                          XQuant group size (default: %d)\n", cmd_params_defaults.xq_group);
+    printf("  --xq-base-layers <n>                    early layers pinned to 4-bit (default: %d)\n", cmd_params_defaults.xq_base_layers);
+    printf("  --xq-gqa-svd                            enable latent caching for GQA (default: %s)\n", cmd_params_defaults.xq_gqa_svd ? "true" : "false");
+    std::string xq_svd_rank_default = cmd_params_defaults.xq_svd_rank < 0 ? "auto" : std::to_string(cmd_params_defaults.xq_svd_rank);
+    printf("  --xq-svd-rank <n|auto>                  SVD rank (default: %s)\n", xq_svd_rank_default.c_str());
+    printf("  --xq-svd-path <path>                    path to SVD factors (default: %s)\n", cmd_params_defaults.xq_svd_path.c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -425,6 +450,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.xquant               = cmd_params_defaults.xquant;
+    params.xquant_cl            = cmd_params_defaults.xquant_cl;
+    params.xq_bits              = cmd_params_defaults.xq_bits;
+    params.xq_group             = cmd_params_defaults.xq_group;
+    params.xq_base_layers       = cmd_params_defaults.xq_base_layers;
+    params.xq_gqa_svd           = cmd_params_defaults.xq_gqa_svd;
+    params.xq_svd_rank          = cmd_params_defaults.xq_svd_rank;
+    params.xq_svd_path          = cmd_params_defaults.xq_svd_path;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -653,6 +686,48 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_op_offload.insert(params.no_op_offload.end(), p.begin(), p.end());
+            } else if (arg == "--xquant") {
+                params.xquant = true;
+            } else if (arg == "--xquant-cl") {
+                params.xquant    = true;
+                params.xquant_cl = true;
+            } else if (arg == "--xq-bits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.xq_bits = std::stoi(argv[i]);
+            } else if (arg == "--xq-group") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.xq_group = std::stoi(argv[i]);
+            } else if (arg == "--xq-base-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.xq_base_layers = std::stoi(argv[i]);
+            } else if (arg == "--xq-gqa-svd") {
+                params.xq_gqa_svd = true;
+            } else if (arg == "--xq-svd-rank") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                std::string value(argv[i]);
+                if (value == "auto") {
+                    params.xq_svd_rank = -1;
+                } else {
+                    params.xq_svd_rank = std::stoi(value);
+                }
+            } else if (arg == "--xq-svd-path") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.xq_svd_path = argv[i];
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -911,6 +986,14 @@ struct cmd_params_instance {
     bool               use_mmap;
     bool               embeddings;
     bool               no_op_offload;
+    bool               xquant;
+    bool               xquant_cl;
+    int                xq_bits;
+    int                xq_group;
+    int                xq_base_layers;
+    bool               xq_gqa_svd;
+    int                xq_svd_rank;
+    std::string        xq_svd_path;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -997,6 +1080,14 @@ struct cmd_params_instance {
         cparams.embeddings   = embeddings;
         cparams.op_offload   = !no_op_offload;
         cparams.swa_full     = false;
+        cparams.xquant       = xquant || xquant_cl;
+        cparams.xquant_cl    = xquant_cl;
+        cparams.xq_bits      = xq_bits;
+        cparams.xq_group     = xq_group;
+        cparams.xq_base_layers = xq_base_layers;
+        cparams.xq_gqa_svd   = xq_gqa_svd;
+        cparams.xq_svd_rank  = xq_svd_rank;
+        cparams.xq_svd_path  = xq_svd_path.c_str();
 
         return cparams;
     }
@@ -1056,6 +1147,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .xquant       = */ params.xquant,
+                /* .xquant_cl    = */ params.xquant_cl,
+                /* .xq_bits      = */ params.xq_bits,
+                /* .xq_group     = */ params.xq_group,
+                /* .xq_base_layers = */ params.xq_base_layers,
+                /* .xq_gqa_svd   = */ params.xq_gqa_svd,
+                /* .xq_svd_rank  = */ params.xq_svd_rank,
+                /* .xq_svd_path  = */ params.xq_svd_path,
             };
             instances.push_back(instance);
         }
@@ -1088,6 +1187,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .xquant       = */ params.xquant,
+                /* .xquant_cl    = */ params.xquant_cl,
+                /* .xq_bits      = */ params.xq_bits,
+                /* .xq_group     = */ params.xq_group,
+                /* .xq_base_layers = */ params.xq_base_layers,
+                /* .xq_gqa_svd   = */ params.xq_gqa_svd,
+                /* .xq_svd_rank  = */ params.xq_svd_rank,
+                /* .xq_svd_path  = */ params.xq_svd_path,
             };
             instances.push_back(instance);
         }
@@ -1120,6 +1227,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .xquant       = */ params.xquant,
+                /* .xquant_cl    = */ params.xquant_cl,
+                /* .xq_bits      = */ params.xq_bits,
+                /* .xq_group     = */ params.xq_group,
+                /* .xq_base_layers = */ params.xq_base_layers,
+                /* .xq_gqa_svd   = */ params.xq_gqa_svd,
+                /* .xq_svd_rank  = */ params.xq_svd_rank,
+                /* .xq_svd_path  = */ params.xq_svd_path,
             };
             instances.push_back(instance);
         }
