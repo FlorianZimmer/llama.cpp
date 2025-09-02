@@ -71,38 +71,49 @@ ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor
 
     ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
     LLAMA_LOG_DEBUG("xq_quantize: qtype=%d ne=(%lld,%lld,%lld,%lld) nbytes=%zu\n",
-            (int) q->type,
-            (long long) q->ne[0],
-            (long long) q->ne[1],
-            (long long) q->ne[2],
-            (long long) q->ne[3],
-            ggml_nbytes(q));
+                    (int) q->type,
+                    (long long) q->ne[0],
+                    (long long) q->ne[1],
+                    (long long) q->ne[2],
+                    (long long) q->ne[3],
+                    ggml_nbytes(q));
     pending.push_back({ il, q });
     return q;
 }
 
-
 bool llama_memory_xquant_context::apply() {
-    const int64_t d_model = mem.model.hparams.n_embd;
+    const int64_t              d_model = mem.model.hparams.n_embd;
+    std::vector<pending_write> remaining;
+    remaining.reserve(pending.size());
     for (const auto & pw : pending) {
+        if (pw.q->buffer == nullptr) {
+            remaining.push_back(pw);
+            continue;
+        }
+
         if (mem.layer_data.size() <= (size_t) pw.il) {
             mem.layer_data.resize(pw.il + 1);
         }
 
         llama_memory_xquant::xq_block blk{};
-        blk.type = pw.q->type;
-        blk.ne0  = d_model;
+        blk.type     = pw.q->type;
+        blk.ne0      = d_model;
         size_t bytes = ggml_nbytes(pw.q);
         size_t row_b = ggml_row_size(blk.type, d_model);
         LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                __func__, (int) blk.type, (long long) d_model, bytes, row_b, bytes % row_b);
+                        __func__,
+                        (int) blk.type,
+                        (long long) d_model,
+                        bytes,
+                        row_b,
+                        bytes % row_b);
         GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
-        blk.ne1  = bytes / row_b;
+        blk.ne1 = bytes / row_b;
         blk.data.resize(bytes);
         ggml_backend_tensor_get(pw.q, blk.data.data(), 0, bytes);
         mem.layer_data[pw.il].push_back(std::move(blk));
     }
-    pending.clear();
+    pending = std::move(remaining);
     return true;
 }
 
@@ -112,7 +123,7 @@ uint32_t llama_memory_xquant_context::get_n_kv() const {
     }
 
     const int64_t d_model = mem.model.hparams.n_embd;
-    uint32_t n = 0;
+    uint32_t      n       = 0;
     for (const auto & blk : mem.layer_data[0]) {
         n += blk.ne1;
     }
@@ -121,7 +132,12 @@ uint32_t llama_memory_xquant_context::get_n_kv() const {
             size_t bytes = ggml_nbytes(pw.q);
             size_t row_b = ggml_row_size(pw.q->type, d_model);
             LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                    __func__, (int) pw.q->type, (long long) d_model, bytes, row_b, bytes % row_b);
+                            __func__,
+                            (int) pw.q->type,
+                            (long long) d_model,
+                            bytes,
+                            row_b,
+                            bytes % row_b);
             GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
             n += bytes / row_b;
         }
@@ -140,31 +156,34 @@ static ggml_tensor * normalize_to_dm_by_elements(ggml_context * ctx, ggml_tensor
     return t;
 }
 
-static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
-        const std::vector<llama_memory_xquant::xq_block> & qs,
-        const std::vector<llama_memory_xquant_context::pending_write> & pending,
-        int32_t il, int64_t d_model) {
+static ggml_tensor * xq_dequant_concat(ggml_context *                                                  ctx,
+                                       const std::vector<llama_memory_xquant::xq_block> &              qs,
+                                       const std::vector<llama_memory_xquant_context::pending_write> & pending,
+                                       int32_t                                                         il,
+                                       int64_t                                                         d_model) {
     ggml_tensor * cur = nullptr;
 
     // 1) dequantize pre-existing blocks
     for (const auto & blk : qs) {
-        size_t bytes = blk.data.size();
         size_t row_b = ggml_row_size(blk.type, d_model);
+        size_t bytes = blk.data.size();
         LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                __func__, (int) blk.type, (long long) d_model, bytes, row_b, bytes % row_b);
+                        __func__,
+                        (int) blk.type,
+                        (long long) d_model,
+                        bytes,
+                        row_b,
+                        bytes % row_b);
         GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
         int64_t tokens = bytes / row_b;
 
-        ggml_tensor * qt  = ggml_new_tensor_2d(ctx, blk.type, d_model, tokens);
+        ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, d_model, tokens);
         memcpy(qt->data, blk.data.data(), bytes);
-
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        deq = normalize_to_dm_by_elements(ctx, deq, d_model);
+        deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
 
-        if (!cur) {
-            cur = deq;
-        } else {
-            cur = ggml_concat(ctx, cur, deq, 1);
+        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
+        if (cur) {
             cur = normalize_to_dm_by_elements(ctx, cur, d_model);
         }
     }
@@ -177,23 +196,19 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
         size_t bytes = ggml_nbytes(pw.q);
         size_t row_b = ggml_row_size(pw.q->type, d_model);
         LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                __func__, (int) pw.q->type, (long long) d_model, bytes, row_b, bytes % row_b);
+                        __func__,
+                        (int) pw.q->type,
+                        (long long) d_model,
+                        bytes,
+                        row_b,
+                        bytes % row_b);
         GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
-        int64_t tokens = bytes / row_b;
 
-        std::vector<uint8_t> tmp(bytes);
-        ggml_backend_tensor_get(pw.q, tmp.data(), 0, bytes);
+        ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
+        deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
 
-        ggml_tensor * qt  = ggml_new_tensor_2d(ctx, pw.q->type, d_model, tokens);
-        memcpy(qt->data, tmp.data(), bytes);
-
-        ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        deq = normalize_to_dm_by_elements(ctx, deq, d_model);
-
-        if (!cur) {
-            cur = deq;
-        } else {
-            cur = ggml_concat(ctx, cur, deq, 1);
+        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
+        if (cur) {
             cur = normalize_to_dm_by_elements(ctx, cur, d_model);
         }
     }
@@ -213,9 +228,9 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const auto & hp = mem.model.hparams;
-    ggml_tensor * k = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
-    k = ggml_reshape_3d(ctx, k, hp.n_embd_head_k, hp.n_head_kv(il), get_n_kv());
+    const auto &  hp = mem.model.hparams;
+    ggml_tensor * k  = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
+    k                = ggml_reshape_3d(ctx, k, hp.n_embd_head_k, hp.n_head_kv(il), get_n_kv());
     return k;
 }
 
@@ -231,9 +246,9 @@ ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const auto & hp = mem.model.hparams;
-    ggml_tensor * v = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
-    v = ggml_reshape_3d(ctx, v, hp.n_embd_head_v, hp.n_head_kv(il), get_n_kv());
+    const auto &  hp = mem.model.hparams;
+    ggml_tensor * v  = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
+    v                = ggml_reshape_3d(ctx, v, hp.n_embd_head_v, hp.n_head_kv(il), get_n_kv());
     return v;
 }
 
