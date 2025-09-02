@@ -48,12 +48,38 @@ bool llama_memory_xquant::load_svd(const std::string & path, const llama_model &
 }
 
 ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il) {
-    if (mem.layer_data.size() <= (size_t) il) {
+    if (mem.layer_data.size() <= static_cast<size_t>(il)) {
         mem.layer_data.resize(il + 1);
     }
+    // `x_cur` may arrive with tokens as the leading dimension during prefill.
+    // Ensure the cached representation is always [n_embd, n_tokens] so that
+    // concatenation across time steps works reliably.
+    if (x_cur->ne[0] != mem.model.hparams.n_embd) {
+        x_cur = ggml_cont(ctx, ggml_transpose(ctx, x_cur));
+    }
+
     ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
-    mem.layer_data[il].push_back(q);
+    pending.push_back({ il, q });
     return q;
+}
+
+
+bool llama_memory_xquant_context::apply() {
+    for (const auto & pw : pending) {
+        if (mem.layer_data.size() <= (size_t) pw.il) {
+            mem.layer_data.resize(pw.il + 1);
+        }
+
+        llama_memory_xquant::xq_block blk{};
+        blk.type = pw.q->type;
+        blk.ne0  = pw.q->ne[0];
+        blk.ne1  = pw.q->ne[1];
+        blk.data.resize(ggml_nbytes(pw.q));
+        ggml_backend_tensor_get(pw.q, blk.data.data(), 0, blk.data.size());
+        mem.layer_data[pw.il].push_back(std::move(blk));
+    }
+    pending.clear();
+    return true;
 }
 
 uint32_t llama_memory_xquant_context::get_n_kv() const {
@@ -62,28 +88,59 @@ uint32_t llama_memory_xquant_context::get_n_kv() const {
     }
 
     uint32_t n = 0;
-    for (ggml_tensor * t : mem.layer_data[0]) {
-        n += t->ne[1];
+    for (const auto & blk : mem.layer_data[0]) {
+        n += blk.ne1;
+    }
+    for (const auto & pw : pending) {
+        if (pw.il == 0) {
+            n += pw.q->ne[1];
+        }
     }
     return n;
 }
 
 // helper: dequantize and concatenate cached X for layer il
-static ggml_tensor * xq_dequant_concat(ggml_context * ctx, const std::vector<ggml_tensor *> & qs) {
+static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
+        const std::vector<llama_memory_xquant::xq_block> & qs,
+        const std::vector<llama_memory_xquant_context::pending_write> & pending,
+        int32_t il) {
     ggml_tensor * cur = nullptr;
-    for (ggml_tensor * q : qs) {
-        ggml_tensor * deq = ggml_cast(ctx, q, GGML_TYPE_F32);
-        // ensure the tensor is 2-D so future concats see matching shapes
+
+    // 1) dequantize pre-existing blocks
+    for (const auto & blk : qs) {
+        ggml_tensor * qt  = ggml_new_tensor_2d(ctx, blk.type, blk.ne0, blk.ne1);
+        // copy raw bytes into the tensor buffer
+        memcpy(qt->data, blk.data.data(), blk.data.size());
+
+        ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
+        // ensure 2-D so subsequent concats see matching shapes
         deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            // ggml_concat may promote the tensor to 4-D; fold back to 2-D to
-            // avoid dimension mismatches on subsequent concatenations
+            // ggml_concat may promote to 4-D; fold back to 2-D
             cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
         }
     }
+
+    // 2) append any pending writes for this layer
+    for (const auto & pw : pending) {
+        if (pw.il != il) {
+            continue;
+        }
+        ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
+        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+
+        if (!cur) {
+            cur = deq;
+        } else {
+            cur = ggml_concat(ctx, cur, deq, 1);
+            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
+        }
+    }
+
     return cur;
 }
 
@@ -92,7 +149,7 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
         return nullptr;
     }
 
-    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il]);
+    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il], pending, il);
     if (!x) {
         return nullptr;
     }
@@ -108,7 +165,7 @@ ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il)
         return nullptr;
     }
 
-    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il]);
+    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il], pending, il);
     if (!x) {
         return nullptr;
     }

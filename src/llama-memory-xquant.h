@@ -22,7 +22,14 @@ public:
     llama_memory_xquant(const llama_model & model) : model(model) {}
     ~llama_memory_xquant() override = default;
 
-    std::vector<std::vector<ggml_tensor *>> layer_data;
+    struct xq_block {
+        ggml_type type;
+        int64_t   ne0;
+        int64_t   ne1;
+        std::vector<uint8_t> data;
+    };
+
+    std::vector<std::vector<xq_block>> layer_data;
 
     bool load_svd(const std::string & path, const llama_model & model);
 
@@ -63,11 +70,16 @@ public:
 
 class llama_memory_xquant_context : public llama_memory_context_i {
 public:
+    struct pending_write {
+        int32_t     il;
+        ggml_tensor * q;
+    };
+
     llama_memory_xquant_context(llama_memory_xquant & mem) : mem(mem) {}
     ~llama_memory_xquant_context() override = default;
 
     bool next() override { return processed ? false : (processed = true); }
-    bool apply() override { return true; }
+    bool apply() override;
     const llama_ubatch & get_ubatch() const override { return dummy; }
     llama_memory_status get_status() const override { return LLAMA_MEMORY_STATUS_SUCCESS; }
 
@@ -79,6 +91,7 @@ public:
 
 private:
     llama_memory_xquant & mem;
+    std::vector<pending_write> pending;
     mutable llama_ubatch dummy{};
     bool processed = false;
 };
