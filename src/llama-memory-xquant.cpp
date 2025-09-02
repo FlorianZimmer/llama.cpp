@@ -118,13 +118,14 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
     for (const auto & blk : qs) {
         ggml_tensor * qt  = ggml_new_tensor_2d(ctx, blk.type, d_model, blk.ne1);
         // copy raw bytes into the tensor buffer
-        memcpy(qt->data, blk.data.data(), blk.data.size());
+        ggml_backend_tensor_set(qt, blk.data.data(), 0, blk.data.size());
 
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        // ggml_cast may promote tensors to higher dimensions depending on the
-        // backend.  Force a clean 2-D view with a fixed leading dimension so
-        // that all subsequent concatenations are well-defined.
-        deq = ggml_reshape_2d(ctx, deq, d_model, ggml_nelements(deq) / d_model);
+        if (deq->ne[0] != d_model) {
+            deq = ggml_cont(ctx, ggml_transpose(ctx, deq));
+        }
+        int64_t cols = ggml_nrows(deq);
+        deq = ggml_reshape_2d(ctx, deq, d_model, cols);
 
         if (!cur) {
             cur = deq;
@@ -132,8 +133,8 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
             cur = ggml_concat(ctx, cur, deq, 1);
             // ggml_concat may promote to >2-D; fold it back explicitly
             int64_t cur_ne0 = cur->ne[0];
-            int64_t cur_ne1 = ggml_nelements(cur) / cur_ne0;
-            cur = ggml_reshape_2d(ctx, cur, cur_ne0, cur_ne1);
+            int64_t cur_cols = ggml_nrows(cur);
+            cur = ggml_reshape_2d(ctx, cur, cur_ne0, cur_cols);
         }
     }
 
@@ -143,13 +144,18 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
             continue;
         }
         ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-        deq = ggml_reshape_2d(ctx, deq, d_model, ggml_nelements(deq) / d_model);
+        if (deq->ne[0] != d_model) {
+            deq = ggml_cont(ctx, ggml_transpose(ctx, deq));
+        }
+        int64_t cols = ggml_nrows(deq);
+        deq = ggml_reshape_2d(ctx, deq, d_model, cols);
 
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            cur = ggml_reshape_2d(ctx, cur, d_model, ggml_nelements(cur) / d_model);
+            int64_t cur_cols = ggml_nrows(cur);
+            cur = ggml_reshape_2d(ctx, cur, d_model, cur_cols);
         }
     }
 
