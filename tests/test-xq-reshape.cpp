@@ -36,8 +36,27 @@ static ggml_tensor * xq_dequant_concat_test(ggml_context *                      
         if (pw.il != il) {
             continue;
         }
-        ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-        deq               = normalize(ctx, deq, d_model);
+
+        // cast the quantized tensor to F32 (may include padding)
+        ggml_tensor * deq_full = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
+
+        // ensure width is d_model before slicing
+        if (deq_full->ne[0] != d_model) {
+            deq_full = normalize(ctx, deq_full, d_model);
+        }
+
+        // slice away padding on the token axis
+        ggml_tensor * deq = ggml_view_2d(
+            ctx,
+            deq_full,
+            d_model,
+            pw.n_tokens,
+            deq_full->nb[1],
+            0);
+
+        // fold back to [d_model, -1]
+        deq = normalize(ctx, deq, d_model);
+
         if (!cur) {
             cur = deq;
         } else {
