@@ -20,7 +20,9 @@ fi
 run_case() {
     local NAME=$1; shift
     echo "===== $NAME ====="
-    "$BIN" -m "$MODEL" -f "$DATA" "$@"
+    if ! "$BIN" -m "$MODEL" -f "$DATA" "$@"; then
+        echo "perplexity run failed for $NAME" >&2
+    fi
     echo
 }
 

@@ -25,7 +25,9 @@ fi
 run_case() {
     local NAME=$1; shift
     echo "===== $NAME ====="
-    "$BIN" -m "$MODEL" "$@"
+    if ! "$BIN" -m "$MODEL" "$@"; then
+        echo "benchmark failed for $NAME" >&2
+    fi
     echo
 }
 
