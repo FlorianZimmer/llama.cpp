@@ -158,152 +158,88 @@ static ggml_tensor * normalize_to_dm_by_elements(ggml_context * ctx, ggml_tensor
     return t;
 }
 
-static ggml_tensor * xq_dequant_concat(ggml_context *                                                  ctx,
-                                       const std::vector<llama_memory_xquant::xq_block> &              qs,
-                                       const std::vector<llama_memory_xquant_context::pending_write> & pending,
-                                       int32_t                                                         il,
-                                       int64_t                                                         d_model) {
+static ggml_tensor * xq_build_pending_only(
+    ggml_context * ctx,
+    const std::vector<llama_memory_xquant_context::pending_write> & pending,
+    int32_t il,
+    int64_t d_model) {
+
     ggml_tensor * cur = nullptr;
 
-    // 1) dequantize pre-existing blocks
-    static int dbg_cached = 0;
-    for (const auto & blk : qs) {
-        const size_t bytes = blk.data.size();
-        const size_t row_b = ggml_row_size(blk.type, d_model);
-        if (row_b == 0 || bytes % row_b != 0 || (bytes / row_b) != (size_t) blk.ne1) {
-            LLAMA_LOG_DEBUG(
-                "xq dequant cached: qtype=%d d_model=%lld bytes=%zu row_b=%zu tokens(stored)=%lld tokens(bytes?)=%zu\n",
-                (int) blk.type,
-                (long long) d_model,
-                bytes,
-                row_b,
-                (long long) blk.ne1,
-                row_b ? bytes / row_b : (size_t) -1);
-        } else if (dbg_cached < 8) {
-            LLAMA_LOG_DEBUG("xq dequant cached: qtype=%d d_model=%lld tokens=%lld\n",
-                            (int) blk.type,
-                            (long long) d_model,
-                            (long long) blk.ne1);
-            ++dbg_cached;
-        }
-
-        ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, d_model, blk.ne1);
-        memcpy(qt->data, blk.data.data(), bytes);
-        ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
-        deq               = ggml_cont(ctx, deq);
-
-        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
-        if (cur) {
-            cur = normalize_to_dm_by_elements(ctx, cur, d_model);
-        }
-    }
-
-    // 2) append any pending writes for this layer
     for (const auto & pw : pending) {
-        if (pw.il != il) {
-            continue;
-        }
+        if (pw.il != il) continue;
 
-        // 1) Cast quant node to F32 (may have padding and non-standard strides)
+        // Cast quant node (may have padding / non-canonical strides)
         ggml_tensor * deq_full = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
 
-        // 2) Normalize shape to [d_model, -1] by element count (pure view op)
+        // Normalize width to d_model by element count, then contiguize
         deq_full = normalize_to_dm_by_elements(ctx, deq_full, d_model);
-
-        // 3) Make it contiguous so nb0/nb1 are canonical
         ggml_tensor * deq_cont = ggml_cont(ctx, deq_full);
 
-        // 4) Determine actual column count and clamp
+        // Clamp to the logical token count captured at write()
         const int64_t cols_full = ggml_nelements(deq_cont) / d_model;
         const int64_t cols_take = pw.n_tokens <= cols_full ? pw.n_tokens : cols_full;
-        LLAMA_LOG_DEBUG("xq pending slice: il=%d d_model=%lld cols_full=%lld take=%lld nb0=%lld nb1=%lld nbytes=%zu\n",
-                        il,
-                        (long long) d_model,
-                        (long long) cols_full,
-                        (long long) cols_take,
-                        (long long) deq_cont->nb[0],
-                        (long long) deq_cont->nb[1],
-                        ggml_nbytes(deq_cont));
 
-        // 5) Slice first cols_take columns with a 2-D view on the contiguous tensor
-        ggml_tensor * deq_slice = ggml_view_2d(ctx,
-                                               deq_cont,
-                                               /* ne0 (width)  */ d_model,
-                                               /* ne1 (height) */ cols_take,
-                                               /* nb1 (stride) */ deq_cont->nb[1],
-                                               /* offset      */ 0);
+        // Slice first cols_take tokens (no buffer read)
+        ggml_tensor * deq = ggml_view_2d(ctx,
+                                        deq_cont,
+                                        /*ne0*/ d_model,
+                                        /*ne1*/ cols_take,
+                                        /*nb1*/ deq_cont->nb[1],
+                                        /*offs*/ 0);
 
-        // 6) Fold back to strict [d_model, -1] and concat
-        deq_slice = normalize_to_dm_by_elements(ctx, deq_slice, d_model);
-        cur       = cur ? ggml_concat(ctx, cur, deq_slice, 1) : deq_slice;
-        cur       = normalize_to_dm_by_elements(ctx, cur, d_model);
+        // Fold to strict [d_model, -1]
+        deq = normalize_to_dm_by_elements(ctx, deq, d_model);
+
+        // Concat along tokens
+        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
+        cur = normalize_to_dm_by_elements(ctx, cur, d_model);
     }
 
-    return cur;
+    return cur; // may be nullptr if no pending for this layer
 }
 
 ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il) {
-    if (mem.layer_data.size() <= (size_t) il) {
-        return nullptr;
-    }
+    const int64_t d_model = mem.model.hparams.n_embd;
 
-    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il], pending, il, mem.model.hparams.n_embd);
+    ggml_tensor * x = xq_build_pending_only(ctx, pending, il, d_model);
     if (!x) {
         return nullptr;
     }
 
-    x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
+    x = normalize_to_dm_by_elements(ctx, x, d_model);
+    const int64_t n_tok = ggml_nelements(x) / d_model;
+    LLAMA_LOG_DEBUG("xq layer %d: n_tok(pending)=%lld\n", il, (long long) n_tok);
 
-    const int64_t  n_kv_x    = ggml_nelements(x) / mem.model.hparams.n_embd;
-    const uint32_t n_kv_book = count_tokens_for_layer(mem, pending, il);
-    if (n_kv_x != (int64_t) n_kv_book) {
-        LLAMA_LOG_DEBUG("xq: layer %d: n_kv_x=%lld, book=%u (pending padding trimmed)\n",
-                        il,
-                        (long long) n_kv_x,
-                        (unsigned) n_kv_book);
-    }
-
-    const auto &  hp    = mem.model.hparams;
+    const auto & hp   = mem.model.hparams;
     const int64_t out_k = hp.n_embd_head_k * hp.n_head_kv(il);
-    LLAMA_LOG_DEBUG("wk out=%lld expected=%lld\n", (long long) mem.model.layers[il].wk->ne[1], (long long) out_k);
 
-    ggml_tensor * k_lin   = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
-    const int64_t elems_k = ggml_nelements(k_lin);
-    GGML_ASSERT(elems_k == out_k * n_kv_x);
-    ggml_tensor * k = ggml_reshape_3d(ctx, k_lin, hp.n_embd_head_k, hp.n_head_kv(il), n_kv_x);
+    ggml_tensor * k_lin = ggml_mul_mat(ctx, mem.model.layers[il].wk, x);
+    GGML_ASSERT(ggml_nelements(k_lin) == out_k * n_tok);
+
+    ggml_tensor * k = ggml_reshape_3d(ctx, k_lin, hp.n_embd_head_k, hp.n_head_kv(il), n_tok);
     return k;
 }
 
 ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il) {
-    if (mem.layer_data.size() <= (size_t) il) {
-        return nullptr;
-    }
+    const int64_t d_model = mem.model.hparams.n_embd;
 
-    ggml_tensor * x = xq_dequant_concat(ctx, mem.layer_data[il], pending, il, mem.model.hparams.n_embd);
+    ggml_tensor * x = xq_build_pending_only(ctx, pending, il, d_model);
     if (!x) {
         return nullptr;
     }
 
-    x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
+    x = normalize_to_dm_by_elements(ctx, x, d_model);
+    const int64_t n_tok = ggml_nelements(x) / d_model;
+    LLAMA_LOG_DEBUG("xq layer %d: n_tok(pending)=%lld\n", il, (long long) n_tok);
 
-    const int64_t  n_kv_x    = ggml_nelements(x) / mem.model.hparams.n_embd;
-    const uint32_t n_kv_book = count_tokens_for_layer(mem, pending, il);
-    if (n_kv_x != (int64_t) n_kv_book) {
-        LLAMA_LOG_DEBUG("xq: layer %d: n_kv_x=%lld, book=%u (pending padding trimmed)\n",
-                        il,
-                        (long long) n_kv_x,
-                        (unsigned) n_kv_book);
-    }
-
-    const auto &  hp    = mem.model.hparams;
+    const auto & hp   = mem.model.hparams;
     const int64_t out_v = hp.n_embd_head_v * hp.n_head_kv(il);
-    LLAMA_LOG_DEBUG("wv out=%lld expected=%lld\n", (long long) mem.model.layers[il].wv->ne[1], (long long) out_v);
 
-    ggml_tensor * v_lin   = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
-    const int64_t elems_v = ggml_nelements(v_lin);
-    GGML_ASSERT(elems_v == out_v * n_kv_x);
-    ggml_tensor * v = ggml_reshape_3d(ctx, v_lin, hp.n_embd_head_v, hp.n_head_kv(il), n_kv_x);
+    ggml_tensor * v_lin = ggml_mul_mat(ctx, mem.model.layers[il].wv, x);
+    GGML_ASSERT(ggml_nelements(v_lin) == out_v * n_tok);
+
+    ggml_tensor * v = ggml_reshape_3d(ctx, v_lin, hp.n_embd_head_v, hp.n_head_kv(il), n_tok);
     return v;
 }
 
