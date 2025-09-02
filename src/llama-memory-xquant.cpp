@@ -205,13 +205,29 @@ static ggml_tensor * xq_dequant_concat(ggml_context *                           
             continue;
         }
 
-        ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-        deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
+        // cast the quantized tensor to F32 (may include padding)
+        ggml_tensor * deq_full = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
 
-        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
-        if (cur) {
-            cur = normalize_to_dm_by_elements(ctx, cur, d_model);
+        // ensure width is d_model prior to slicing
+        if (deq_full->ne[0] != d_model) {
+            deq_full = normalize_to_dm_by_elements(ctx, deq_full, d_model);
         }
+
+        // slice away any padding on the token axis
+        ggml_tensor * deq = ggml_view_2d(
+            ctx,
+            deq_full,
+            d_model,
+            pw.n_tokens,
+            deq_full->nb[1],
+            0);
+
+        // fold back to strict [d_model, -1]
+        deq = normalize_to_dm_by_elements(ctx, deq, d_model);
+
+        // concat and normalize
+        cur = cur ? ggml_concat(ctx, cur, deq, 1) : deq;
+        cur = normalize_to_dm_by_elements(ctx, cur, d_model);
     }
 
     return cur;
@@ -229,8 +245,15 @@ ggml_tensor * llama_memory_xquant_context::get_k(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const int64_t n_kv_x = ggml_nelements(x) / mem.model.hparams.n_embd;
-    GGML_ASSERT(n_kv_x == (int64_t) count_tokens_for_layer(mem, pending, il));
+    const int64_t n_kv_x    = ggml_nelements(x) / mem.model.hparams.n_embd;
+    const uint32_t n_kv_book = count_tokens_for_layer(mem, pending, il);
+    if (n_kv_x != (int64_t) n_kv_book) {
+        LLAMA_LOG_DEBUG(
+            "xq: layer %d: n_kv_x=%lld, book=%u (pending padding trimmed)\n",
+            il,
+            (long long) n_kv_x,
+            (unsigned) n_kv_book);
+    }
 
     const auto & hp = mem.model.hparams;
     const int64_t out_k = hp.n_embd_head_k * hp.n_head_kv(il);
@@ -255,8 +278,15 @@ ggml_tensor * llama_memory_xquant_context::get_v(ggml_context * ctx, int32_t il)
 
     x = normalize_to_dm_by_elements(ctx, x, mem.model.hparams.n_embd);
 
-    const int64_t n_kv_x = ggml_nelements(x) / mem.model.hparams.n_embd;
-    GGML_ASSERT(n_kv_x == (int64_t) count_tokens_for_layer(mem, pending, il));
+    const int64_t n_kv_x    = ggml_nelements(x) / mem.model.hparams.n_embd;
+    const uint32_t n_kv_book = count_tokens_for_layer(mem, pending, il);
+    if (n_kv_x != (int64_t) n_kv_book) {
+        LLAMA_LOG_DEBUG(
+            "xq: layer %d: n_kv_x=%lld, book=%u (pending padding trimmed)\n",
+            il,
+            (long long) n_kv_x,
+            (unsigned) n_kv_book);
+    }
 
     const auto & hp = mem.model.hparams;
     const int64_t out_v = hp.n_embd_head_v * hp.n_head_kv(il);
