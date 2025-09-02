@@ -108,16 +108,29 @@ bool llama_memory_xquant_context::apply() {
         blk.data.resize(bytes);
         ggml_backend_tensor_get(pw.q, blk.data.data(), 0, bytes);
 
-        const size_t row_b = ggml_row_size(blk.type, d_model);
-        if (row_b == 0 || bytes % row_b != 0 || (bytes / row_b) != (size_t) blk.ne1) {
-            LLAMA_LOG_DEBUG(
-                "xq apply: qtype=%d d_model=%lld bytes=%zu row_b=%zu tokens(write)=%lld tokens(bytes?)=%zu\n",
+        const size_t row_b      = ggml_row_size(blk.type, d_model);
+        const size_t expected_b = row_b * (size_t) pw.n_tokens;
+
+        if (row_b == 0 || bytes % row_b != 0) {
+            LLAMA_LOG_ERROR(
+                "xq apply: qtype=%d d_model=%lld bytes=%zu row_b=%zu tokens(write)=%lld -- incompatible backend output\n",
                 (int) blk.type,
                 (long long) d_model,
                 bytes,
                 row_b,
-                (long long) blk.ne1,
-                row_b ? bytes / row_b : (size_t) -1);
+                (long long) pw.n_tokens);
+            continue;
+        }
+
+        const size_t tokens_bytes = bytes / row_b;
+        if (bytes != expected_b) {
+            LLAMA_LOG_WARN(
+                "xq apply: backend returned %zu bytes (%zu tokens) but expected %zu bytes for %lld tokens\n",
+                bytes,
+                tokens_bytes,
+                expected_b,
+                (long long) pw.n_tokens);
+            blk.ne1 = tokens_bytes;
         }
 
         mem.layer_data[pw.il].push_back(std::move(blk));
