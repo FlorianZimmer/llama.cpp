@@ -113,15 +113,22 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
         memcpy(qt->data, blk.data.data(), blk.data.size());
 
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
-        // ensure 2-D so subsequent concats see matching shapes
-        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+        // ggml_cast preserves all dimensions, but subsequent concat may
+        // introduce implicit higher dimensions.  Collapse any such
+        // promotion back to a simple 2-D view using the total element
+        // count instead of relying on the potentially stale `ne[1]`.
+        int64_t deq_ne0 = deq->ne[0];
+        int64_t deq_ne1 = ggml_nelements(deq) / deq_ne0;
+        deq = ggml_reshape_2d(ctx, deq, deq_ne0, deq_ne1);
 
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            // ggml_concat may promote to 4-D; fold back to 2-D
-            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
+            // ggml_concat may promote to >2-D; fold it back explicitly
+            int64_t cur_ne0 = cur->ne[0];
+            int64_t cur_ne1 = ggml_nelements(cur) / cur_ne0;
+            cur = ggml_reshape_2d(ctx, cur, cur_ne0, cur_ne1);
         }
     }
 
@@ -131,13 +138,17 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
             continue;
         }
         ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
-        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+        int64_t deq_ne0 = deq->ne[0];
+        int64_t deq_ne1 = ggml_nelements(deq) / deq_ne0;
+        deq = ggml_reshape_2d(ctx, deq, deq_ne0, deq_ne1);
 
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
-            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
+            int64_t cur_ne0 = cur->ne[0];
+            int64_t cur_ne1 = ggml_nelements(cur) / cur_ne0;
+            cur = ggml_reshape_2d(ctx, cur, cur_ne0, cur_ne1);
         }
     }
 
