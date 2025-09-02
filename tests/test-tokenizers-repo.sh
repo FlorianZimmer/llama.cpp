@@ -20,14 +20,32 @@ repo=$1
 folder=$2
 
 if [ -d $folder ] && [ -d $folder/.git ]; then
-    (cd $folder; git pull)
+    (
+        cd $folder
+        git pull
+        if ! git lfs pull --exclude="" --include="*"; then
+            echo "git lfs pull failed: is git-lfs installed?" >&2
+            exit 1
+        fi
+    )
 else
     git clone $repo $folder
+    (
+        cd $folder
+        if ! git lfs pull --exclude="" --include="*"; then
+            echo "git lfs pull failed: is git-lfs installed?" >&2
+            exit 1
+        fi
+    )
 fi
 
 shopt -s globstar
 for gguf in $folder/**/*.gguf; do
     if [ -f $gguf.inp ] && [ -f $gguf.out ]; then
+        if [ "$(head -c4 "$gguf")" != "GGUF" ]; then
+            echo "error: $gguf is not a valid GGUF file (missing Git LFS content?)" >&2
+            exit 1
+        fi
         $toktest $gguf
     else
         printf "Found \"$gguf\" without matching inp/out files, ignoring...\n"
