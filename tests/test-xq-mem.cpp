@@ -69,7 +69,9 @@ int main() {
     ggml_tensor * Xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, T);
     memcpy(Xt->data, X.data(), X.size() * sizeof(float));
 
-    xq_ctx->write(ctx, Xt, 0);
+    int bits = 4;
+    ggml_tensor * q = xq_ctx->write(ctx, Xt, 0, bits);
+    GGML_ASSERT(q->type == llama_xq_bits_to_type(bits));
     ggml_tensor * K = xq_ctx->get_k(ctx, 0);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, K);

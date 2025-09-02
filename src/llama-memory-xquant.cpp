@@ -48,7 +48,7 @@ bool llama_memory_xquant::load_svd(const std::string & path, const llama_model &
     return true;
 }
 
-ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il) {
+ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il, int32_t bits) {
     if (mem.layer_data.size() <= static_cast<size_t>(il)) {
         mem.layer_data.resize(il + 1);
     }
@@ -71,7 +71,7 @@ ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor
 
     const int64_t n_tokens = x_cur->ne[1];
 
-    ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
+    ggml_tensor * q = llama_xq_quantize(ctx, x_cur, bits);
     LLAMA_LOG_DEBUG("xq_quantize: qtype=%d ne=(%lld,%lld,%lld,%lld) nbytes=%zu tokens=%lld\n",
                     (int) q->type,
                     (long long) q->ne[0],

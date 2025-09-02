@@ -94,7 +94,7 @@ class llama_memory_xquant_context : public llama_memory_context_i {
 
     llama_memory_status get_status() const override { return LLAMA_MEMORY_STATUS_SUCCESS; }
 
-    ggml_tensor * write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il);
+    ggml_tensor * write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il, int32_t bits);
 
     uint32_t      get_n_kv() const;
     ggml_tensor * get_k(ggml_context * ctx, int32_t il);

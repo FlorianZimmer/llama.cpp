@@ -17,8 +17,13 @@ int main() {
     ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
     std::memcpy(t->data, src.data(), n * sizeof(float));
 
-    ggml_tensor * q   = llama_xq_quantize(ctx, t, 4);
-    ggml_tensor * deq = ggml_cast(ctx, q, GGML_TYPE_F32);
+    for (int bits : {2, 4, 8}) {
+        ggml_tensor * q = llama_xq_quantize(ctx, t, bits);
+        GGML_ASSERT(q->type == llama_xq_bits_to_type(bits));
+    }
+
+    ggml_tensor * q4   = llama_xq_quantize(ctx, t, 4);
+    ggml_tensor * deq = ggml_cast(ctx, q4, GGML_TYPE_F32);
 
     float         max_err = 0.f;
     const float * d       = (const float *) deq->data;
