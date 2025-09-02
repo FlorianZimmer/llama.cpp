@@ -207,6 +207,7 @@ llama_build_and_test(test-gguf.cpp)
     llama_build_and_test(test-xq-mem.cpp)
     llama_build_and_test(test-xq-reshape.cpp)
     llama_build_and_test(test-xq-full.cpp)
+    llama_build_and_test(test-xq-apply.cpp)
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-xq-no-kv.sh
         NAME test-xq-no-kv
