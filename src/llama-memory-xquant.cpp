@@ -105,27 +105,42 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx,
         const std::vector<llama_memory_xquant_context::pending_write> & pending,
         int32_t il) {
     ggml_tensor * cur = nullptr;
+
+    // 1) dequantize pre-existing blocks
     for (const auto & blk : qs) {
-        ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, blk.ne0, blk.ne1);
+        ggml_tensor * qt  = ggml_new_tensor_2d(ctx, blk.type, blk.ne0, blk.ne1);
+        // copy raw bytes into the tensor buffer
         memcpy(qt->data, blk.data.data(), blk.data.size());
+
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
+        // ensure 2-D so subsequent concats see matching shapes
+        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
+            // ggml_concat may promote to 4-D; fold back to 2-D
+            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
         }
     }
+
+    // 2) append any pending writes for this layer
     for (const auto & pw : pending) {
         if (pw.il != il) {
             continue;
         }
         ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
+        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
+
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
+            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
         }
     }
+
     return cur;
 }
 
