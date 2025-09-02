@@ -1,3 +1,4 @@
+#include "../src/llama-impl.h"
 #include "../src/llama-memory-xquant.h"
 #include "ggml.h"
 
@@ -25,6 +26,7 @@ static ggml_tensor * xq_dequant_concat_test(ggml_context *                      
         memcpy(qt->data, blk.data.data(), blk.data.size());
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
         deq               = normalize(ctx, deq, d_model);
+        deq               = ggml_cont(ctx, deq);
         if (!cur) {
             cur = deq;
         } else {
@@ -37,30 +39,41 @@ static ggml_tensor * xq_dequant_concat_test(ggml_context *                      
             continue;
         }
 
-        // cast the quantized tensor to F32 (may include padding)
+        // 1) Cast quant node to F32 (may have padding and non-standard strides)
         ggml_tensor * deq_full = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
 
-        // ensure width is d_model before slicing
-        if (deq_full->ne[0] != d_model) {
-            deq_full = normalize(ctx, deq_full, d_model);
-        }
+        // 2) Normalize shape to [d_model, -1] by element count (pure view op)
+        deq_full = normalize(ctx, deq_full, d_model);
 
-        // slice away padding on the token axis
-        ggml_tensor * deq = ggml_view_2d(
-            ctx,
-            deq_full,
-            d_model,
-            pw.n_tokens,
-            deq_full->nb[1],
-            0);
+        // 3) Make it contiguous so nb0/nb1 are canonical
+        ggml_tensor * deq_cont = ggml_cont(ctx, deq_full);
 
-        // fold back to [d_model, -1]
-        deq = normalize(ctx, deq, d_model);
+        // 4) Determine actual column count and clamp
+        const int64_t cols_full = ggml_nelements(deq_cont) / d_model;
+        const int64_t cols_take = pw.n_tokens <= cols_full ? pw.n_tokens : cols_full;
+        LLAMA_LOG_DEBUG("xq pending slice: il=%d d_model=%lld cols_full=%lld take=%lld nb0=%lld nb1=%lld nbytes=%zu\n",
+                        il,
+                        (long long) d_model,
+                        (long long) cols_full,
+                        (long long) cols_take,
+                        (long long) deq_cont->nb[0],
+                        (long long) deq_cont->nb[1],
+                        ggml_nbytes(deq_cont));
 
+        // 5) Slice first cols_take columns with a 2-D view on the contiguous tensor
+        ggml_tensor * deq_slice = ggml_view_2d(ctx,
+                                               deq_cont,
+                                               /* ne0 (width)  */ d_model,
+                                               /* ne1 (height) */ cols_take,
+                                               /* nb1 (stride) */ deq_cont->nb[1],
+                                               /* offset      */ 0);
+
+        // 6) Fold back to strict [d_model, -1] and concat
+        deq_slice = normalize(ctx, deq_slice, d_model);
         if (!cur) {
-            cur = deq;
+            cur = deq_slice;
         } else {
-            cur = ggml_concat(ctx, cur, deq, 1);
+            cur = ggml_concat(ctx, cur, deq_slice, 1);
             cur = normalize(ctx, cur, d_model);
         }
     }
