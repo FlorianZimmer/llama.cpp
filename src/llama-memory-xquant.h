@@ -23,6 +23,8 @@ class llama_memory_xquant : public llama_memory_i {
 
     ~llama_memory_xquant() override = default;
 
+    int64_t get_d_model() const;
+
     struct xq_block {
         ggml_type            type;
         int64_t              ne0;

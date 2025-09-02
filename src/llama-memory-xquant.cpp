@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <algorithm>
 
 struct xq_svd_header {
     char     magic[6];
@@ -12,6 +13,10 @@ struct xq_svd_header {
     uint32_t n_layer;
     uint32_t d_model;
 };
+
+int64_t llama_memory_xquant::get_d_model() const {
+    return model.hparams.n_embd;
+}
 
 bool llama_memory_xquant::load_svd(const std::string & path, const llama_model & model) {
     std::ifstream fin(path, std::ios::binary);
@@ -142,17 +147,30 @@ bool llama_memory_xquant_context::apply() {
 static uint32_t count_tokens_for_layer(const llama_memory_xquant &                                     mem,
                                        const std::vector<llama_memory_xquant_context::pending_write> & pending,
                                        int32_t                                                         il) {
-    uint32_t n = 0;
+    uint32_t     n       = 0;
+    const auto   d_model = mem.get_d_model();
+
     if (mem.layer_data.size() > (size_t) il) {
         for (const auto & blk : mem.layer_data[il]) {
             n += (uint32_t) blk.ne1;
         }
     }
+
     for (const auto & pw : pending) {
-        if (pw.il == il) {
-            n += (uint32_t) pw.n_tokens;
+        if (pw.il != il) {
+            continue;
         }
+
+        const size_t row_b  = ggml_row_size(pw.q->type, d_model);
+        const size_t bytes  = ggml_nbytes(pw.q);
+        if (row_b == 0 || bytes % row_b != 0) {
+            continue;
+        }
+
+        const size_t tokens_bytes = bytes / row_b;
+        n += (uint32_t) std::min<size_t>((size_t) pw.n_tokens, tokens_bytes);
     }
+
     return n;
 }
 
