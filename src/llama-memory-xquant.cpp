@@ -73,10 +73,15 @@ static ggml_tensor * xq_dequant_concat(ggml_context * ctx, const std::vector<ggm
     ggml_tensor * cur = nullptr;
     for (ggml_tensor * q : qs) {
         ggml_tensor * deq = ggml_cast(ctx, q, GGML_TYPE_F32);
+        // ensure the tensor is 2-D so future concats see matching shapes
+        deq = ggml_reshape_2d(ctx, deq, deq->ne[0], deq->ne[1]);
         if (!cur) {
             cur = deq;
         } else {
             cur = ggml_concat(ctx, cur, deq, 1);
+            // ggml_concat may promote the tensor to 4-D; fold back to 2-D to
+            // avoid dimension mismatches on subsequent concatenations
+            cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
         }
     }
     return cur;
