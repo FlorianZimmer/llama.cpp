@@ -69,15 +69,19 @@ ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor
         x_cur = ggml_cont(ctx, x_cur);
     }
 
+    const int64_t n_tokens = x_cur->ne[1];
+
     ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
-    LLAMA_LOG_DEBUG("xq_quantize: qtype=%d ne=(%lld,%lld,%lld,%lld) nbytes=%zu\n",
+    LLAMA_LOG_DEBUG("xq_quantize: qtype=%d ne=(%lld,%lld,%lld,%lld) nbytes=%zu tokens=%lld\n",
                     (int) q->type,
                     (long long) q->ne[0],
                     (long long) q->ne[1],
                     (long long) q->ne[2],
                     (long long) q->ne[3],
-                    ggml_nbytes(q));
-    pending.push_back({ il, q });
+                    ggml_nbytes(q),
+                    (long long) n_tokens);
+    LLAMA_LOG_DEBUG("xq write: il=%d n_tokens=%lld\n", il, (long long) n_tokens);
+    pending.push_back({ il, q, n_tokens });
     return q;
 }
 
@@ -96,21 +100,26 @@ bool llama_memory_xquant_context::apply() {
         }
 
         llama_memory_xquant::xq_block blk{};
-        blk.type     = pw.q->type;
-        blk.ne0      = d_model;
-        size_t bytes = ggml_nbytes(pw.q);
-        size_t row_b = ggml_row_size(blk.type, d_model);
-        LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                        __func__,
-                        (int) blk.type,
-                        (long long) d_model,
-                        bytes,
-                        row_b,
-                        bytes % row_b);
-        GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
-        blk.ne1 = bytes / row_b;
+        blk.type = pw.q->type;
+        blk.ne0  = d_model;
+        blk.ne1  = pw.n_tokens;  // authoritative token count
+
+        const size_t bytes = ggml_nbytes(pw.q);
         blk.data.resize(bytes);
         ggml_backend_tensor_get(pw.q, blk.data.data(), 0, bytes);
+
+        const size_t row_b = ggml_row_size(blk.type, d_model);
+        if (row_b == 0 || bytes % row_b != 0 || (bytes / row_b) != (size_t) blk.ne1) {
+            LLAMA_LOG_DEBUG(
+                "xq apply: qtype=%d d_model=%lld bytes=%zu row_b=%zu tokens(write)=%lld tokens(bytes?)=%zu\n",
+                (int) blk.type,
+                (long long) d_model,
+                bytes,
+                row_b,
+                (long long) blk.ne1,
+                row_b ? bytes / row_b : (size_t) -1);
+        }
+
         mem.layer_data[pw.il].push_back(std::move(blk));
     }
     pending = std::move(remaining);
@@ -122,24 +131,13 @@ uint32_t llama_memory_xquant_context::get_n_kv() const {
         return 0;
     }
 
-    const int64_t d_model = mem.model.hparams.n_embd;
-    uint32_t      n       = 0;
+    uint32_t n = 0;
     for (const auto & blk : mem.layer_data[0]) {
         n += blk.ne1;
     }
     for (const auto & pw : pending) {
         if (pw.il == 0) {
-            size_t bytes = ggml_nbytes(pw.q);
-            size_t row_b = ggml_row_size(pw.q->type, d_model);
-            LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                            __func__,
-                            (int) pw.q->type,
-                            (long long) d_model,
-                            bytes,
-                            row_b,
-                            bytes % row_b);
-            GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
-            n += bytes / row_b;
+            n += (uint32_t) pw.n_tokens;
         }
     }
     return n;
@@ -164,20 +162,28 @@ static ggml_tensor * xq_dequant_concat(ggml_context *                           
     ggml_tensor * cur = nullptr;
 
     // 1) dequantize pre-existing blocks
+    static int dbg_cached = 0;
     for (const auto & blk : qs) {
-        size_t row_b = ggml_row_size(blk.type, d_model);
-        size_t bytes = blk.data.size();
-        LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                        __func__,
-                        (int) blk.type,
-                        (long long) d_model,
-                        bytes,
-                        row_b,
-                        bytes % row_b);
-        GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
-        int64_t tokens = bytes / row_b;
+        const size_t bytes = blk.data.size();
+        const size_t row_b = ggml_row_size(blk.type, d_model);
+        if (row_b == 0 || bytes % row_b != 0 || (bytes / row_b) != (size_t) blk.ne1) {
+            LLAMA_LOG_DEBUG(
+                "xq dequant cached: qtype=%d d_model=%lld bytes=%zu row_b=%zu tokens(stored)=%lld tokens(bytes?)=%zu\n",
+                (int) blk.type,
+                (long long) d_model,
+                bytes,
+                row_b,
+                (long long) blk.ne1,
+                row_b ? bytes / row_b : (size_t) -1);
+        } else if (dbg_cached < 8) {
+            LLAMA_LOG_DEBUG("xq dequant cached: qtype=%d d_model=%lld tokens=%lld\n",
+                            (int) blk.type,
+                            (long long) d_model,
+                            (long long) blk.ne1);
+            ++dbg_cached;
+        }
 
-        ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, d_model, tokens);
+        ggml_tensor * qt = ggml_new_tensor_2d(ctx, blk.type, d_model, blk.ne1);
         memcpy(qt->data, blk.data.data(), bytes);
         ggml_tensor * deq = ggml_cast(ctx, qt, GGML_TYPE_F32);
         deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
@@ -193,16 +199,6 @@ static ggml_tensor * xq_dequant_concat(ggml_context *                           
         if (pw.il != il) {
             continue;
         }
-        size_t bytes = ggml_nbytes(pw.q);
-        size_t row_b = ggml_row_size(pw.q->type, d_model);
-        LLAMA_LOG_DEBUG("%s: type=%d d_model=%lld bytes=%zu row_b=%zu (bytes%%row_b=%zu)\n",
-                        __func__,
-                        (int) pw.q->type,
-                        (long long) d_model,
-                        bytes,
-                        row_b,
-                        bytes % row_b);
-        GGML_ASSERT(row_b > 0 && bytes % row_b == 0);
 
         ggml_tensor * deq = ggml_cast(ctx, pw.q, GGML_TYPE_F32);
         deq               = normalize_to_dm_by_elements(ctx, deq, d_model);
