@@ -51,6 +51,12 @@ ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor
     if (mem.layer_data.size() <= (size_t) il) {
         mem.layer_data.resize(il + 1);
     }
+    // `x_cur` may arrive with tokens as the leading dimension during prefill.
+    // Ensure the cached representation is always [n_embd, n_tokens] so that
+    // concatenation across time steps works reliably.
+    if (x_cur->ne[0] != mem.model.hparams.n_embd) {
+        x_cur = ggml_cont(ctx, ggml_transpose(ctx, x_cur));
+    }
     ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
     mem.layer_data[il].push_back(q);
     return q;
