@@ -168,15 +168,14 @@ static uint32_t count_tokens_for_layer(const llama_memory_xquant &              
         if (pw.il != il) {
             continue;
         }
-
-        const size_t row_b = ggml_row_size(pw.q->type, d_model);
-        const size_t bytes = ggml_nbytes(pw.q);
-        if (row_b == 0 || bytes % row_b != 0) {
+        int64_t elems = ggml_nelements(pw.q);
+        elems -= elems % d_model;
+        if (elems == 0) {
             continue;
         }
 
-        const size_t tokens_bytes = bytes / row_b;
-        n += (uint32_t) std::min<size_t>((size_t) pw.n_tokens, tokens_bytes);
+        const uint32_t tokens = (uint32_t) (elems / d_model);
+        n += std::min<uint32_t>(tokens, pw.n_tokens);
     }
 
     return n;
