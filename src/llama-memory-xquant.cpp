@@ -48,10 +48,21 @@ bool llama_memory_xquant::load_svd(const std::string & path, const llama_model &
 }
 
 ggml_tensor * llama_memory_xquant_context::write(ggml_context * ctx, ggml_tensor * x_cur, int32_t il) {
+    if (mem.layer_data.size() <= static_cast<size_t>(il)) {
+        mem.layer_data.resize(il + 1);
+    }
+    // `x_cur` may arrive with tokens as the leading dimension during prefill.
+    // Ensure the cached representation is always [n_embd, n_tokens] so that
+    // concatenation across time steps works reliably.
+    if (x_cur->ne[0] != mem.model.hparams.n_embd) {
+        x_cur = ggml_cont(ctx, ggml_transpose(ctx, x_cur));
+    }
+
     ggml_tensor * q = llama_xq_quantize(ctx, x_cur, 4);
-    pending.push_back({il, q});
+    pending.push_back({ il, q });
     return q;
 }
+
 
 bool llama_memory_xquant_context::apply() {
     for (const auto & pw : pending) {
