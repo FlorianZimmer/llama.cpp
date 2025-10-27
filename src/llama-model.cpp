@@ -10,6 +10,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-xquant.h"
 
 #include "ggml-cpp.h"
 
@@ -6618,6 +6619,9 @@ struct llm_build_llama : public llm_graph_context {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+            if (cparams.xquant) {
+                res->add_xquant_tap(il, cur);
+            }
 
             // self-attention
             {
@@ -6789,6 +6793,9 @@ struct llm_build_llama_iswa : public llm_graph_context {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+            if (cparams.xquant) {
+                res->add_xquant_tap(il, cur);
+            }
 
             // self-attention
             {
@@ -19636,6 +19643,17 @@ struct llm_build_apertus : public llm_graph_context {
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    const bool xquant_enabled = cparams.xquant || cparams.xquant_cl || cparams.xq_gqa_svd;
+    if (xquant_enabled) {
+        if (cparams.xquant_cl) {
+            res = new llama_memory_xquant_cl(*this, cparams);
+        } else {
+            res = new llama_memory_xquant(*this, cparams);
+        }
+        LLAMA_ASSERT(res != nullptr);
+        return res;
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the

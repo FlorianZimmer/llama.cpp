@@ -181,6 +181,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     llama_model * model = new llama_model(params);
+    model->model_path = path_model;
 
     // create list of devices to use with this model
     if (params.devices) {
@@ -414,4 +415,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

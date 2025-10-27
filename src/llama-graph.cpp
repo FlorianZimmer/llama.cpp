@@ -484,6 +484,7 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
 
     params = {};
+    xq_taps.clear();
 
     inputs.clear();
 
@@ -545,6 +546,16 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+}
+
+void llm_graph_result::add_xquant_tap(int32_t layer, ggml_tensor * tensor) {
+    if (!tensor) {
+        return;
+    }
+    xquant_tap tap;
+    tap.layer  = layer;
+    tap.tensor = tensor;
+    xq_taps.push_back(tap);
 }
 
 //

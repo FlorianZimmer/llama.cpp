@@ -404,6 +404,7 @@ struct llama_model {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+    std::string model_path;
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

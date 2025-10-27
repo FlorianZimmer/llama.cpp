@@ -473,6 +473,11 @@ public:
 
     virtual ~llm_graph_result() = default;
 
+    struct xquant_tap {
+        int32_t     layer = -1;
+        ggml_tensor * tensor = nullptr;
+    };
+
     ggml_tensor * get_tokens()      const { return t_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
@@ -498,6 +503,9 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    void add_xquant_tap(int32_t layer, ggml_tensor * tensor);
+    const std::vector<xquant_tap> & get_xquant_taps() const { return xq_taps; }
+
     // important graph nodes
     ggml_tensor * t_tokens      = nullptr;
     ggml_tensor * t_logits      = nullptr;
@@ -520,6 +528,8 @@ private:
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph
     llm_graph_params params;
+
+    std::vector<xquant_tap> xq_taps;
 
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;

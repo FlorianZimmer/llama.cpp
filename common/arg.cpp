@@ -1450,6 +1450,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    const bool xquant_enabled = params.xquant || params.xquant_cl || params.xq_gqa_svd;
+    if (xquant_enabled && params.kv_unified) {
+        throw std::invalid_argument("error: --xquant/--xquant-cl cannot be combined with --kv-unified");
+    }
+
     return true;
 }
 
@@ -2625,6 +2630,87 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--xquant"},
+        "enable XQuant memory backend (disables the KV cache)",
+        [](common_params & params) {
+            params.xquant = true;
+        }
+    ).set_env("LLAMA_XQUANT"));
+    add_opt(common_arg(
+        {"--xquant-cl"},
+        "enable XQuant cross-layer deltas (implies --xquant)",
+        [](common_params & params) {
+            params.xquant_cl = true;
+            params.xquant = true;
+        }
+    ).set_env("LLAMA_XQ_CL"));
+    add_opt(common_arg(
+        {"--xq-bits"}, "N",
+        "set XQuant bit-width (allowed: 8, 4, 3, 2; default: 4)",
+        [](common_params & params, int value) {
+            switch (value) {
+                case 8:
+                case 4:
+                case 3:
+                case 2:
+                    params.xq_bits = value;
+                    break;
+                default:
+                    throw std::invalid_argument("invalid value for --xq-bits (expected 8, 4, 3, or 2)");
+            }
+        }
+    ).set_env("LLAMA_XQ_BITS"));
+    add_opt(common_arg(
+        {"--xq-group"}, "N",
+        string_format("set XQuant group size (default: %d)", params.xq_group),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value for --xq-group (expected positive integer)");
+            }
+            params.xq_group = value;
+        }
+    ).set_env("LLAMA_XQ_GROUP"));
+    add_opt(common_arg(
+        {"--xq-base-layers"}, "N",
+        string_format("number of early layers forced to 4-bit (default: %d)", params.xq_base_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --xq-base-layers (expected non-negative integer)");
+            }
+            params.xq_base_layers = value;
+        }
+    ).set_env("LLAMA_XQ_BASE_LAYERS"));
+    add_opt(common_arg(
+        {"--xq-gqa-svd"},
+        "enable XQuant latent caching (GQA + SVD rematerialization)",
+        [](common_params & params) {
+            params.xq_gqa_svd = true;
+            params.xquant = true;
+        }
+    ).set_env("LLAMA_XQ_GQA_SVD"));
+    add_opt(common_arg(
+        {"--xq-svd-rank"}, "auto|N",
+        "target rank for XQuant SVD factors (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.xq_svd_rank = -1;
+                return;
+            }
+            int parsed = std::stoi(value);
+            if (parsed <= 0) {
+                throw std::invalid_argument("invalid value for --xq-svd-rank (expected positive integer or 'auto')");
+            }
+            params.xq_svd_rank = parsed;
+        }
+    ).set_env("LLAMA_XQ_SVD_RANK"));
+    add_opt(common_arg(
+        {"--xq-svd-path"}, "PATH",
+        "path to directory or file containing XQuant SVD factors",
+        [](common_params & params, const std::string & value) {
+            params.xq_svd_path = value;
+        }
+    ).set_env("LLAMA_XQ_SVD_PATH"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

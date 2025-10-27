@@ -1188,6 +1188,16 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    const bool xquant_enabled = params.xquant || params.xquant_cl || params.xq_gqa_svd;
+    cparams.xquant          = xquant_enabled;
+    cparams.xquant_cl       = params.xquant_cl;
+    cparams.xq_gqa_svd      = params.xq_gqa_svd;
+    cparams.xq_bits         = params.xq_bits;
+    cparams.xq_group_size   = params.xq_group;
+    cparams.xq_base_layers  = params.xq_base_layers;
+    cparams.xq_svd_rank     = params.xq_svd_rank;
+    cparams.xq_svd_path     = params.xq_svd_path.empty() ? nullptr : params.xq_svd_path.c_str();
+
     return cparams;
 }
 

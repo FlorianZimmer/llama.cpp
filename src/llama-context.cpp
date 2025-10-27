@@ -102,6 +102,14 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.xquant     = params.xquant;
+    cparams.xquant_cl  = params.xquant_cl;
+    cparams.xq_gqa_svd = params.xq_gqa_svd;
+    cparams.xq_bits        = params.xq_bits;
+    cparams.xq_group_size  = params.xq_group_size;
+    cparams.xq_base_layers = params.xq_base_layers;
+    cparams.xq_svd_rank    = params.xq_svd_rank;
+    cparams.xq_svd_path    = params.xq_svd_path ? params.xq_svd_path : "";
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -122,6 +130,13 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.xquant) {
+        LLAMA_LOG_INFO("%s: xquant       = true (bits=%u, group=%u, base_layers=%u)\n",
+                __func__, cparams.xq_bits, cparams.xq_group_size, cparams.xq_base_layers);
+        LLAMA_LOG_INFO("%s: xquant_cl    = %s, xq_gqa_svd = %s, xq_svd_rank = %d\n",
+                __func__, cparams.xquant_cl ? "true" : "false", cparams.xq_gqa_svd ? "true" : "false", cparams.xq_svd_rank);
+        LLAMA_LOG_INFO("%s: xq_svd_path  = %s\n", __func__, cparams.xq_svd_path.empty() ? "(not set)" : cparams.xq_svd_path.c_str());
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -786,6 +801,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (mctx) {
+        mctx->after_graph(res);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2283,6 +2302,11 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.xq_bits                     =*/ 4,
+        /*.xq_group_size               =*/ 128,
+        /*.xq_base_layers              =*/ 3,
+        /*.xq_svd_rank                 =*/ -1,
+        /*.xq_svd_path                 =*/ nullptr,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -2295,6 +2319,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.xquant                      =*/ false,
+        /*.xquant_cl                   =*/ false,
+        /*.xq_gqa_svd                  =*/ false,
     };
 
     return result;

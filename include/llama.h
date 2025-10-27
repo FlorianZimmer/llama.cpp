@@ -323,6 +323,11 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
+        uint32_t xq_bits;          // XQuant bit-width
+        uint32_t xq_group_size;    // XQuant group size
+        uint32_t xq_base_layers;   // number of early layers forced to 4-bit
+        int32_t  xq_svd_rank;      // SVD rank (-1 = auto)
+        const char * xq_svd_path;  // optional path to SVD blobs
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
@@ -347,6 +352,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool xquant;      // enable XQuant memory backend
+        bool xquant_cl;   // enable cross-layer deltas
+        bool xq_gqa_svd;  // enable latent caching for GQA
     };
 
     // model quantization parameters

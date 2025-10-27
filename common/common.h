@@ -399,6 +399,15 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    bool     xquant           = false; // enable XQuant memory backend
+    bool     xquant_cl        = false; // enable cross-layer deltas
+    bool     xq_gqa_svd       = false; // enable latent caching for GQA
+    int32_t  xq_bits          = 4;     // default quantization bits
+    int32_t  xq_group         = 128;   // quantization group size
+    int32_t  xq_base_layers   = 3;     // early layers pinned to 4-bit
+    int32_t  xq_svd_rank      = -1;    // -1 indicates auto
+    std::string xq_svd_path   = "";    // optional path for SVD blobs
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

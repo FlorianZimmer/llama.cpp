@@ -7,6 +7,7 @@
 #include <functional>
 
 struct llama_ubatch;
+class  llm_graph_result;
 
 class llama_batch_allocr;
 
@@ -59,6 +60,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // called after the ggml graph for the current ubatch has been evaluated
+    virtual void after_graph(const llm_graph_result * res) {
+        GGML_UNUSED(res);
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -117,6 +123,7 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
