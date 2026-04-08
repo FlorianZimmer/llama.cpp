@@ -10,6 +10,9 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+// experimental memory that stores post-norm X and rematerializes K/V
+#include "llama-memory-xquant.h"
+#include "llama-memory-xquant-wrap.h"
 
 #include "ggml-cpp.h"
 
@@ -24,6 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib> // std::getenv, std::atoi
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -149,6 +153,21 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
 
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
+
+// ---- XQuant: shared env parsing (accept 1/true/on/yes) ----
+namespace {
+static bool xq_env_enabled() {
+    const char *s = std::getenv("LLAMA_XQUANT");
+    if (!s || !*s) return false;
+    unsigned char c = static_cast<unsigned char>(*s);
+    if (std::isdigit(c)) return std::atoi(s) != 0;
+    std::string v(s);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char ch){ return std::tolower(ch); });
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+} // namespace
+
 
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
@@ -6052,6 +6071,14 @@ struct llm_build_llama : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
 
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
+
             // self-attention
             {
                 // rope freq factors for llama3; may return nullptr for llama2 and other models
@@ -6213,6 +6240,14 @@ struct llm_build_llama_iswa : public llm_graph_context {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
 
             // self-attention
             {
@@ -15165,6 +15200,14 @@ struct llm_build_granite : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
 
+            // XQuant: capture post-norm X for this layer (prefill only; deferred via post-run cb)
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    // note: registering here keeps graph unchanged; data movement happens post-run
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
+
             // self-attention
             cur = build_attention_layer(
                 cur, inp_pos, inp_attn,
@@ -15376,6 +15419,13 @@ struct llm_build_granite_hybrid : public llm_graph_context_mamba {
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+            
+            // XQuant: capture post-norm X (prefill). For recurrent layers this no-ops.
+            if (auto * u = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                if (u->xquant_enabled()) {
+                    u->xq_capture_X_defer(res, cur, il);
+                }
+            }
 
             if (hparams.is_recurrent(il)) {
                 // ssm layer //
@@ -18233,11 +18283,12 @@ struct llm_build_smallthinker : public llm_graph_context{
 };
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
-    llama_memory_i * res;
+    // XQuant: enable only if env explicitly true; wrapper is added below.
+    const bool xq_on = xq_env_enabled();
+
+    llama_memory_i * res = nullptr;
 
     switch (arch) {
-        // Models that need specific instantiation should be handled in the
-        // switch statement
         case LLM_ARCH_BERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
@@ -18335,7 +18386,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.swa_type);
                     }
                 }
+            } break;
+    }
+
+    // --- Optional XQuant wrapper (no graph changes; KV-backend will use it) ---
+    // For recurrent-only architectures we skip; for unified/hybrid caches it's safe to wrap.
+    if (xq_on && res) {
+        // Transfer ownership of the base memory to the wrapper.
+        llama_memory_ptr base(res);
+
+        // If requested, drop baseline KV buffers before wrapping to reclaim RAM.
+        // We do this right before attaching the wrapper to avoid early nullptr derefs during construction.
+        auto xq_env_nobase = []() -> bool {
+            if (const char *s = std::getenv("LLAMA_XQ_NOBASE")) {
+                if (*s == '0') return false;
+                if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
+                std::string v(s);
+                std::transform(v.begin(), v.end(), v.begin(),
+                               [](unsigned char c){ return std::tolower(c); });
+                return (v == "1" || v == "true" || v == "on" || v == "yes");
             }
+            return false;
+        };
+
+        if (xq_env_nobase()) {
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(base.get())) {
+                kv->drop_baseline_kv();
+                LLAMA_LOG_INFO("[xquant] baseline KV dropped prior to wrap attach (LLAMA_XQ_NOBASE=1)\n");
+            }
+        }
+
+        // n_ctx here is "tokens per stream" after any padding/unification above.
+        // It’s OK to pass cparams.n_ctx as the wrapper’s capacity.
+        llama_memory_ptr wrapped = llama_memory_make_xquant_wrap(
+            this, std::move(base), /*n_ctx_tokens=*/(int32_t)cparams.n_ctx);
+        LLAMA_LOG_INFO("[xquant] wrapper attached: n_ctx=%d\n", (int)cparams.n_ctx);
+        return wrapped.release();
     }
 
     return res;

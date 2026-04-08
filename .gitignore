@@ -148,3 +148,11 @@ poetry.toml
 /run-vim.sh
 /run-chat.sh
 .ccache/
+
+
+CMakeUserPresets.json
+results
+ppl.raw
+xquant-mvp*
+
+cheatsheet.txt

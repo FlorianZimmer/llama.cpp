@@ -210,6 +210,15 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
+if (NOT GGML_BACKEND_DL)
+  if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-xquant.cpp)
+    llama_build_and_test(test-xquant-wrap.cpp)
+    set_tests_properties(test-xquant PROPERTIES       LABELS "quant")
+    set_tests_properties(test-xquant-wrap PROPERTIES  LABELS "quant")
+  endif()
+endif()
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)

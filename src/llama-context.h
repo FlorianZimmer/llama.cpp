@@ -205,7 +205,9 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
-    llm_graph_cb graph_get_cb() const;
+    // XQuant: need access to the active memory ctx + graph result to register capture hooks
+    llm_graph_cb graph_get_cb(const llama_memory_context_i * mctx,
+                              llm_graph_result * res) const;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

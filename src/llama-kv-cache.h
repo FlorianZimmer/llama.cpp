@@ -137,6 +137,10 @@ public:
 
     bool get_has_shift() const;
 
+    // XQuant: drop baseline FP16 KV buffers after wrapper attach
+    // Safe to call multiple times; becomes a no-op after the first drop.
+    void drop_baseline_kv();
+
     //
     // graph_build API
     //
@@ -188,6 +192,9 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
+    // XQuant: allow the context to peek model internals safely from this TU only
+    friend class llama_kv_cache_context; // XQuant
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -243,6 +250,9 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // XQuant: when true, we do not allocate or use the baseline FP16 KV
+    bool no_base_kv_ = false;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -262,7 +272,7 @@ private:
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
                   llama_context * lctx) const;
-
+              
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -341,7 +351,55 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    //
+    // XQuant: feature query + safe accessors that remain *behind* the KV
+    //
+    // These never escape the KV context API and have no effect on graph topology.
+    //
+    ggml_tensor * get_attn_wk(int32_t il) const; // XQuant
+    ggml_tensor * get_attn_wv(int32_t il) const; // XQuant
+
+    bool xquant_enabled() const;                 // XQuant
+    bool no_base_kv() const;                     // XQuant: run without baseline FP16 KV
+    llama_memory_i * get_memory() const;         // XQuant
+
+    // Prefill: capture post-norm X rows *after* the graph runs
+    void xq_capture_X_defer(llm_graph_result * res, ggml_tensor * X_norm, int32_t il) const; // XQuant
+
+    // Decode: prefer XQuant rematerialized K/V (fallback to baseline transparently)
+    ggml_tensor * get_k_xq(ggml_context * ctx, int32_t il,
+                           ggml_tensor * k_cur, ggml_tensor * k_idxs) const; // XQuant
+    ggml_tensor * get_v_xq(ggml_context * ctx, int32_t il,
+                           ggml_tensor * v_cur, ggml_tensor * v_idxs) const; // XQuant
+    struct xq_kv_pair { ggml_tensor *K=nullptr; ggml_tensor *V=nullptr; bool ok=false; }; // XQuant
+    xq_kv_pair get_kv_xq(ggml_context * ctx, int32_t il,
+                         ggml_tensor * k_cur, ggml_tensor * v_cur,
+                         ggml_tensor * k_idxs, ggml_tensor * v_idxs) const;
+
 private:
+    // XQuant: cached iota tensors per-graph to avoid per-layer allocations
+    // These are tied to the lifetime of the current ggml_context (graph). When ctx changes,
+    // we rebuild them lazily on first use.
+    mutable ggml_context * xq_iota_ctx = nullptr; // XQuant
+    mutable ggml_tensor  * xq_iota_i64 = nullptr; // XQuant
+    mutable ggml_tensor  * xq_iota_i32 = nullptr; // XQuant
+    mutable int64_t        xq_iota_cap = 0;       // XQuant
+
+    mutable ggml_context * xq_last_ctx = nullptr;
+    mutable int32_t        xq_last_il  = -1;
+    mutable xq_kv_pair     xq_last_kv;
+
+    // Return a view of length n into a cached [0..cap-1] iota tensor in the given ctx. // XQuant
+    ggml_tensor * xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const; // XQuant
+    ggml_tensor * xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const; // XQuant
+
+    // Return a slice starting at offset "off" of length "n" from the cached iota. // XQuant
+    ggml_tensor * xq_get_iota_i64_slice(ggml_context * ctx, int64_t off, int64_t n) const; // XQuant
+    ggml_tensor * xq_get_iota_i32_slice(ggml_context * ctx, int64_t off, int64_t n) const; // XQuant
+
+    // Track the last overlaid end position per layer so we only remat the delta. // XQuant
+    mutable std::vector<uint32_t> xq_last_overlay_t1; // XQuant
+    
     llama_memory_status status;
 
     llama_kv_cache * kv;

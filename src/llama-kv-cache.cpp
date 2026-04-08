@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-memory-xquant-wrap.h" // XQuant
 
 #include <algorithm>
 #include <cassert>
@@ -11,6 +12,17 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <atomic>   // XQuant
+#include <memory>   // XQuant
+#include <vector>   // XQuant
+#include <cctype>   // XQuant
+#include <cstdlib>   // getenv, atoi
+#include <string>
+
+bool llama_kv_cache_context::no_base_kv() const {
+    // Single source of truth: flag captured once in the KV at construction
+    return kv && kv->no_base_kv_;
+}
 
 //
 // llama_kv_cache
@@ -31,6 +43,30 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type    swa_type) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+
+    // --- XQuant "no-base" flag (env) ---------------------------------------
+    // Read NOBASE once (env) and keep as a member for the lifetime of this KV
+    if (const char *s = std::getenv("LLAMA_XQ_NOBASE")) {
+        if (*s) {
+            if (std::isdigit(static_cast<unsigned char>(*s))) {
+                no_base_kv_ = std::atoi(s) != 0;
+            } else {
+                std::string v(s);
+                std::transform(v.begin(), v.end(), v.begin(),
+                               [](unsigned char c){ return std::tolower(c); });
+                no_base_kv_ = (v == "1" || v == "true" || v == "on" || v == "yes");
+            }
+        }
+    }
+
+    // If 'no-base' was requested via env but the XQuant runtime is not active yet,
+    // allocate baseline KV now and drop it immediately after the wrapper attaches.
+    // (Prevents nullptr derefs during construction.)
+    if (no_base_kv_ && !llama_xquant_runtime_active()) {
+        LLAMA_LOG_WARN("[xquant] LLAMA_XQ_NOBASE set before XQuant is active; "
+                       "allocating baseline KV and will drop after wrap attaches\n");
+        no_base_kv_ = false;
+    }
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -125,21 +161,26 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-        ggml_tensor * k;
-        ggml_tensor * v;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
 
-        k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
-        v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+        // When XQuant runs fully materialized (no-base), don't allocate persistent KV.
+        if (!no_base_kv_) {
+            k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+            v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+        }
 
-        ggml_format_name(k, "cache_k_l%d", il);
-        ggml_format_name(v, "cache_v_l%d", il);
+        if (k) ggml_format_name(k, "cache_k_l%d", il);
+        if (v) ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
-            v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
+            if (k) k_stream.push_back(ggml_view_2d(ctx, k,
+                                n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
+            if (v) v_stream.push_back(ggml_view_2d(ctx, v,
+                                n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
         }
 
         map_layer_ids[il] = layers.size();
@@ -177,7 +218,11 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        size_t bufsz = ggml_backend_buffer_get_size(buf);
+        if (bufsz > 0) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buft_name(buft), bufsz/1024.0/1024.0);
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         bufs.emplace_back(buf);
@@ -186,6 +231,12 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+
+        // XQuant visibility: show if baseline KV is allocated
+        const double kv_mib = (memory_size_k + memory_size_v)/1024.0/1024.0;
+        LLAMA_LOG_INFO("[xquant] baseline KV: %s (%.2f MiB total; K %.2f MiB, V %.2f MiB)\n",
+            kv_mib > 0.0 ? "ALLOCATED" : "NOT ALLOCATED",
+            kv_mib, memory_size_k/1024.0/1024.0, memory_size_v/1024.0/1024.0);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
@@ -660,6 +711,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
                 return updated;
             }
+            // XQuant: flush any staged post-run work (e.g., host reads of X_norm)
+            if (res) {
+                res->run_post_cbs();
+            }
 
             updated = true;
         }
@@ -1035,6 +1090,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     auto * k = layers[ikv].k;
 
+    // XQuant no-base: skip baseline KV writes; keep dependency so k_cur is computed
+    if (no_base_kv_) {
+        ggml_tensor * dep = ggml_sum(ctx, k_cur);
+        // scalar result is fine; caller doesn't use the value, only its side-effects
+        return ggml_scale(ctx, dep, 0.0f);
+    }
+
     const int64_t n_embd_k_gqa = k->ne[0];
     const int64_t n_tokens = k_cur->ne[2];
 
@@ -1064,6 +1126,13 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+
+    // XQuant no-base: skip baseline KV writes; keep dependency so v_cur is computed
+    if (no_base_kv_) {
+        ggml_tensor * dep = ggml_sum(ctx, v_cur);
+        // scalar result is fine; caller doesn't use the value, only its side-effects
+        return ggml_scale(ctx, dep, 0.0f);
+    }
 
     const int64_t n_embd_v_gqa = v_cur->ne[0]*v_cur->ne[1];
     const int64_t n_tokens     = v_cur->ne[2];
@@ -1148,6 +1217,14 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
+    // If this input tensor isn't part of the allocated graph,
+    // the scheduler won't attach a buffer to it. In that case,
+    // it's unused and we must not touch it.
+    if (dst->buffer == nullptr) {
+        LLAMA_LOG_INFO("[xquant] idxs: skip set (unallocated input)\n");
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
@@ -1168,6 +1245,14 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
+    // If this input tensor isn't part of the allocated graph,
+    // the scheduler won't attach a buffer to it. In that case,
+    // it's unused and we must not touch it.
+    if (dst->buffer == nullptr) {
+        LLAMA_LOG_INFO("[xquant] idxs: skip set (unallocated input)\n");
+        return;
+    }
+    
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
@@ -1322,7 +1407,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        if (layer.k) size_k_bytes += ggml_nbytes(layer.k);
     }
 
     return size_k_bytes;
@@ -1332,7 +1417,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += ggml_nbytes(layer.v);
+        if (layer.v) size_v_bytes += ggml_nbytes(layer.v);
     }
 
     return size_v_bytes;
@@ -2054,4 +2139,695 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 uint32_t llama_kv_cache::get_padding(const llama_cparams & cparams) {
     // the FA kernels require padding to avoid extra runtime boundary checks
     return cparams.flash_attn ? 256u : 32u;
+}
+
+// ---------------------------------------------------------------------------
+// XQuant: configuration
+// ---------------------------------------------------------------------------
+
+static bool xq_env_enabled() {
+    if (const char *s = std::getenv("LLAMA_XQUANT")) {
+        if (*s == '1') return true;
+        std::string v(s);
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        return v == "true" || v == "on" || v == "yes";
+    }
+    return false;
+}
+
+// ========= XQuant: KV-backed helpers (no graph churn) =========
+namespace {
+static std::atomic<bool> g_xq_log_enabled_once{false};
+static std::atomic<bool> g_xq_gate_log_once{false};
+static std::atomic<bool> g_xq_log_w_once{false};
+}
+
+// Parse a feature flag like LLAMA_XQ_OVERLAY_V; true unless explicitly 0/off/false
+static bool xq_env_overlay_v_enabled() {
+    const char *s = std::getenv("LLAMA_XQ_OVERLAY_V");
+    if (!s || !*s) return true; // default ON
+    if (std::isdigit(static_cast<unsigned char>(*s))) return std::atoi(s) != 0;
+    std::string v(s);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return std::tolower(c); });
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+
+// Expanded element indices for the transposed V layout:
+// idx[j*T_delta + i] = j*kv_size + (t0 + i), length = d*T_delta
+static ggml_tensor * xq_build_v_elem_idxs(ggml_context * ctx,
+                                          int64_t t0, int64_t T_delta,
+                                          int64_t d,  int64_t kv_size) {
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, d * T_delta);
+    if (ggml_backend_buffer_is_host(idx->buffer)) {
+        auto * p = (int64_t *) idx->data;
+        for (int64_t j = 0; j < d; ++j) {
+            const int64_t base = j * kv_size;
+            for (int64_t i = 0; i < T_delta; ++i) {
+                p[j * T_delta + i] = base + (t0 + i);
+            }
+        }
+    } else {
+        std::vector<int64_t> tmp((size_t)(d * T_delta));
+        for (int64_t j = 0; j < d; ++j) {
+            const int64_t base = j * kv_size;
+            for (int64_t i = 0; i < T_delta; ++i) {
+                tmp[(size_t)(j * T_delta + i)] = base + (t0 + i);
+            }
+        }
+        ggml_backend_tensor_set(idx, tmp.data(), 0, tmp.size()*sizeof(int64_t));
+    }
+    return idx;
+}
+
+bool llama_kv_cache_context::xquant_enabled() const {
+    // Require BOTH: env enabled AND the XQuant wrapper is actually present.
+    const bool env_on  = xq_env_enabled();
+    // IMPORTANT: detect wrapper presence process-wide, not via this KV pointer.
+    const bool wrap_on = llama_xquant_runtime_active();
+    const bool on = env_on && wrap_on;
+    return on;
+}
+
+llama_memory_i * llama_kv_cache_context::get_memory() const {
+    // unified KV itself is a llama_memory_i
+    return static_cast<llama_memory_i *>(kv);
+}
+
+ggml_tensor * llama_kv_cache_context::get_attn_wk(int32_t il) const {
+    // expose Wk when the arch is not fused QKV; otherwise nullptr
+    // keep all model detail *inside* KV TU
+    // note: relies on internal model layout; safe here (llama-impl.h included)
+    const auto & mdl = kv->model;
+    GGML_UNUSED(mdl.arch); // future: arch-specific fallbacks
+    const auto & layers = mdl.layers;
+    if (il < 0 || il >= (int) layers.size()) return nullptr;
+    const auto & L = layers[il];
+    ggml_tensor * wk = nullptr;
+    // Heuristic: if fused QKV exists (pointer non-null), prefer baseline path
+    // (i.e., do not expose wk/wv). Otherwise expose L.wk if present.
+    const bool has_fused_qkv = (L.wqkv != nullptr);
+    if (!has_fused_qkv) {
+        wk = L.wk; // may be nullptr on some arches; that is fine
+    }
+    if (!g_xq_log_w_once.exchange(true)) {
+        if (wk) LLAMA_LOG_DEBUG("[xquant] wk/wv detected; remat active\n");
+        else    LLAMA_LOG_DEBUG("[xquant] wk/wv not exposed; baseline KV\n");
+    }
+    return wk;
+}
+
+ggml_tensor * llama_kv_cache_context::get_attn_wv(int32_t il) const {
+    const auto & mdl = kv->model;
+    const auto & layers = mdl.layers;
+    if (il < 0 || il >= (int) layers.size()) return nullptr;
+    const auto & L = layers[il];
+    ggml_tensor * wv = nullptr;
+    const bool has_fused_qkv = (L.wqkv != nullptr);
+    if (!has_fused_qkv) {
+        wv = L.wv; // may be nullptr; that’s okay
+    }
+    return wv;
+}
+
+void llama_kv_cache_context::xq_capture_X_defer(llm_graph_result * res,
+                                                        ggml_tensor * X_norm, int32_t il) const {
+    // MVP: single stream, standard RoPE; stage to host then append into XQuant store
+    if (!xquant_enabled()) return;
+    if (!res || !X_norm)   return;
+    // W exposure check (fused QKV, unsupported arch => baseline)
+    if (!get_attn_wk(il) || !get_attn_wv(il)) return;
+
+    ggml_context * ctx = res->get_ctx();
+    ggml_tensor  * t   = X_norm;
+    // cast/contiguous F16 [d, T]
+    if (t->type != GGML_TYPE_F16) {
+        t = ggml_cast(ctx, t, GGML_TYPE_F16);
+    }
+    if (!ggml_is_contiguous(t)) {
+        t = ggml_cont(ctx, t);
+    }
+
+    const int32_t d = (int32_t) t->ne[0];
+    const int32_t T = (int32_t) t->ne[1];
+
+    auto * mem = get_memory(); // NOTE: if get_memory() is non-const, make it const or const_cast here.
+
+    // Only capture during prefill: decode micro-steps (T==1) don't need X capture.
+    if (T <= 1) {
+        LLAMA_LOG_INFO("[xquant] capture X: skip (T=%d)\n", T);
+        return;
+    }
+
+    // Allocate the staging buffer *inside* the callback to avoid peak RSS spikes.
+    res->register_post_run([mem, il, t, d, T]() {
+        // If optimizer pruned this tensor from the current graph, it won't have a buffer.
+        if (t->buffer == nullptr) {
+            LLAMA_LOG_INFO("[xquant] capture X: skip post-cb (unallocated tensor)\n");
+            return;
+        }
+        std::vector<uint16_t> host((size_t) d * (size_t) T);
+        ggml_backend_tensor_get(t, host.data(), 0, (size_t) d*T*sizeof(uint16_t));
+        (void) llama_xquant_wrap_append_prefill_rows(mem, il, host.data(), T, d, /*is_fp16=*/true);
+    });
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_xq(ggml_context * ctx, int32_t il,
+                                                       ggml_tensor * k_cur, ggml_tensor * k_idxs) const {
+    GGML_UNUSED(k_idxs);
+    // XQuant: rematerialize + overlay K for the *delta* of past rows only
+    const bool no_base = no_base_kv();
+    // Guard rails first, then fall back cleanly to baseline.
+    if (!xquant_enabled())                       return get_k(ctx, il);
+    // Only allow overlay fallback short-circuits when baseline KV exists
+    if (!get_supports_set_rows() && !no_base)    return get_k(ctx, il);
+
+    // Detect exposed wk/wv; if fused QKV, stay baseline (DEBUG logged in helper).
+    ggml_tensor * Wk = get_attn_wk(il);
+    ggml_tensor * Wv = get_attn_wv(il);
+    if ((!Wk || !Wv) && !no_base)                return get_k(ctx, il);
+
+    // MVP: single stream – overlay past rows [0 .. head())
+    const uint32_t T_past = sinfos[i_cur].head();
+    if (T_past == 0) {
+        // Baseline path can return the full-view KV as usual.
+        if (!no_base) return get_k(ctx, il);
+
+        // XQuant no-base: pad present-only K to match graph mask length n_kv.
+        const int64_t ne0_d  = kv->hparams.n_embd_head_k;   // per-head dim
+        const int64_t ne1_h  = kv->hparams.n_head_kv();     // KV heads
+        const int64_t n_kv_r = (int64_t) get_n_kv();        // mask/graph KV length
+
+        // k_cur: [d_k, n_head_kv, 1] -> [d_k*n_head_kv, 1]
+        ggml_tensor * k_src2 = ggml_reshape_2d(ctx, k_cur, ne0_d*ne1_h, 1);
+
+        // destination: [d*h, n_kv], zero-initialized
+        ggml_tensor * k_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0_d*ne1_h, n_kv_r);
+        ggml_tensor * k_zero = ggml_scale(ctx, k_dst2, 0.0f);
+
+        // place the single present column at index 0
+        ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, /*fill=*/1);
+        ggml_tensor * k_set2 = ggml_set_rows(ctx, k_zero, k_src2, idx);
+
+        // shape back to baseline 4D: [d_k, n_head_kv, n_kv, n_stream=1]
+        ggml_tensor * k_out3 = ggml_reshape_3d(ctx, k_set2, ne0_d, ne1_h, n_kv_r);
+        return ggml_reshape_4d(ctx, k_out3, ne0_d, ne1_h, n_kv_r, 1);
+    }
+
+    // Ensure we have a slot for this layer index
+    if (xq_last_overlay_t1.size() <= (size_t) il) {
+        xq_last_overlay_t1.resize((size_t) il + 1u, 0u);
+    }
+    uint32_t & t0_ref = xq_last_overlay_t1[(size_t) il];
+    // if sequence restarted, reset
+    if (t0_ref > T_past) t0_ref = 0;
+    const uint32_t t0       = t0_ref;
+    const uint32_t t0_remat = no_base ? 0u : t0;     // <-- full remat in no-base
+    const uint32_t T_delta  = T_past - t0;
+
+    if (!no_base && t0 >= T_past) {
+        // nothing to overlay; baseline path keeps existing K
+        return get_k(ctx, il);
+    }
+    
+    // 1) Rematerialize pre-RoPE rows:
+    //    - no-base: full [0, T_past)
+    //    - baseline: delta [t0, T_past)
+    auto R = llama_xquant_wrap_remat_kv(
+        get_memory(),
+        ctx, il,
+        /*t0=*/ (int32_t) t0_remat,
+        /*t1=*/ (int32_t) T_past, Wk, Wv);
+    if (!R.ok || !R.K) {
+        // In baseline we can fall back; in no-base we must not touch freed KV.
+        if (!no_base) return get_k(ctx, il);
+        LLAMA_LOG_ERROR("[xquant] K remat failed in no-base; returning current step only\n");
+        return k_cur;
+    }
+
+    // Fast path when we want zero persistent KV usage:
+    // Return fully-materialized K for **past + present**, then pad to graph n_kv
+    // and shape to the baseline 4D layout to match the KQ mask exactly.
+    if (no_base) {
+        // Past+present fully materialized, but attention/mask expect time = get_n_kv()
+        const uint32_t T_past = sinfos[i_cur].head();
+        const int64_t  ne0_d  = kv->hparams.n_embd_head_k;   // per-head dim
+        const int64_t  ne1_h  = kv->hparams.n_head_kv();     // kv heads
+        const int64_t  T_all  = (int64_t) T_past + 1;        // past + current
+        const int64_t  n_kv_r = (int64_t) get_n_kv();        // mask/graph size
+        const int64_t  fill   = std::min(T_all, n_kv_r);
+
+        // R.K : [T_past, d_model] -> [ne0_d, ne1_h, T_past]
+        ggml_tensor * k_p2 = ggml_reshape_2d(ctx, R.K, ne0_d*ne1_h, (int64_t) T_past);
+        ggml_tensor * k_p3 = ggml_reshape_3d(ctx, k_p2, ne0_d, ne1_h, (int64_t) T_past);
+
+        // RoPE (NEOX only here)
+        const int rope_type = kv->hparams.rope_type;
+        const bool layer_uses_rope =
+            kv->hparams.rope_finetuned &&
+            (kv->hparams.n_no_rope_layer_step == 0 ||
+             ((il + 1) % kv->hparams.n_no_rope_layer_step) != 0);
+        ggml_tensor * pos = xq_get_iota_i32_slice(ctx, 0, (int64_t) T_past);
+        ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX && layer_uses_rope)
+          ? ggml_rope_ext(ctx, k_p3, pos, /*factors*/ nullptr,
+                          kv->hparams.n_rot, rope_type,
+                          kv->model.hparams.n_ctx_train,
+                          kv->model.hparams.rope_freq_base_train,
+                          kv->model.hparams.rope_freq_scale_train,
+                          /*yarn*/0.0f, 1.0f, 0.0f, 0.0f)
+          : k_p3;
+
+        // Append current step: [ne0_d, ne1_h, 1]
+        ggml_tensor * k_cur2 = ggml_reshape_2d(ctx, k_cur, ne0_d*ne1_h, 1);
+        ggml_tensor * k_cur3 = ggml_reshape_3d(ctx, k_cur2, ne0_d, ne1_h, 1);
+        ggml_tensor * k_all3 = ggml_concat(ctx, k_rope3d, k_cur3, /*axis=*/2); // [ne0_d, ne1_h, T_all]
+
+        // Pad/trim to n_kv_r and return 4D [ne0_d, ne1_h, n_kv_r, 1]
+        ggml_tensor * k_src2 = ggml_reshape_2d(ctx, k_all3, ne0_d*ne1_h, T_all);
+        ggml_tensor * k_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0_d*ne1_h, n_kv_r);
+        ggml_tensor * k_zero = ggml_scale(ctx, k_dst2, 0.0f);                 // zero-init
+        ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, fill);           // [0..fill-1]
+        ggml_tensor * k_set2 = ggml_set_rows(ctx, k_zero, k_src2, idx);       // write first "fill" cols
+        ggml_tensor * k_out3 = ggml_reshape_3d(ctx, k_set2, ne0_d, ne1_h, n_kv_r);
+        return ggml_reshape_4d(ctx, k_out3, ne0_d, ne1_h, n_kv_r, 1);
+    }
+
+    // 2) Shape & apply RoPE to K using existing ggml primitive
+    //    Baseline K view consumed by attention: [n_embd_head_k, n_head_kv, n_kv, ns]
+    //    R.K is pre-RoPE row-major [T_past, d_out].
+    ggml_tensor * k_full = get_k(ctx, il);
+    const int64_t n_embd_head_k = k_full->ne[0];
+    const int64_t n_head_kv     = k_full->ne[1];
+
+    const int64_t d_expected    = n_embd_head_k * n_head_kv;
+    if (R.K->ne[1] != d_expected) {
+        LLAMA_LOG_ERROR("[xquant][dbg] get_k_xq: remat d=%lld but expected %lld "
+                        "(ne0=%lld ne1=%lld; head_k=%lld head_kv=%lld). "
+                        "Falling back to baseline shaping for this layer.\n",
+                        (long long)R.K->ne[1], (long long)d_expected,
+                        (long long)k_full->ne[0], (long long)k_full->ne[1],
+                        (long long)n_embd_head_k, (long long)n_head_kv);
+        if (!no_base) return get_k(ctx, il);
+        // no-base: we cannot crash; return present-only padded to mask length
+        const int64_t  n_kv_r  = (int64_t) get_n_kv();
+        ggml_tensor * k_src2 = ggml_reshape_2d(ctx, k_cur, n_embd_head_k*n_head_kv, 1);
+        ggml_tensor * k_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_head_k*n_head_kv, n_kv_r);
+        ggml_tensor * k_zero = ggml_scale(ctx, k_dst2, 0.0f);
+        ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, 1);
+        ggml_tensor * k_set2 = ggml_set_rows(ctx, k_zero, k_src2, idx);
+        ggml_tensor * k_out3 = ggml_reshape_3d(ctx, k_set2, n_embd_head_k, n_head_kv, n_kv_r);
+        return ggml_reshape_4d(ctx, k_out3, n_embd_head_k, n_head_kv, n_kv_r, 1);
+    }
+
+    // Reshape R.K (delta) -> [n_embd_head_k, n_head_kv, T_delta]
+    ggml_tensor * k_pre2d = ggml_reshape_2d(ctx, R.K, d_expected, (int64_t) T_delta);
+    ggml_tensor * k_pre3d = ggml_reshape_3d(ctx, k_pre2d,
+                                            n_embd_head_k, n_head_kv, (int64_t) T_delta);
+
+    // Only standard NEOX RoPE supported here; advanced variants fall back.
+    const int rope_type = kv->hparams.rope_type;
+
+    // Per-arch rope enablement:
+    //  - Granite: rotate only if rope_finetuned
+    //  - ISWA: skip rotation on periodic "no-rope" layers
+    const bool granite_uses_rope = kv->hparams.rope_finetuned;
+    const bool iswa_uses_rope = (kv->hparams.n_no_rope_layer_step == 0) ||
+                                (((il + 1) % kv->hparams.n_no_rope_layer_step) != 0);
+    const bool layer_uses_rope = granite_uses_rope && iswa_uses_rope;
+
+    if (rope_type != LLAMA_ROPE_TYPE_NEOX && rope_type != LLAMA_ROPE_TYPE_NONE) {
+        // advanced RoPE (Yarn / M-RoPE) -> baseline
+        return get_k(ctx, il);
+    }
+
+    // Indices / positions [t0..T_past-1] used for both RoPE and set_rows overlay
+    ggml_tensor * past_idxs = xq_get_iota_i32_slice(ctx, (int64_t) t0, (int64_t) T_delta);
+
+    // Pull defaults from model hparams (Yarn/M-RoPE are handled by fallback).
+    const int32_t n_rot            = kv->hparams.n_rot;
+    const int32_t n_ctx_orig_yarn  = kv->model.hparams.n_ctx_train;
+    const float   rope_freq_base   = kv->model.hparams.rope_freq_base_train;
+    const float   rope_freq_scale  = kv->model.hparams.rope_freq_scale_train;
+    const float   yarn_ext_factor  = 0.0f;
+    const float   yarn_attn_factor = 1.0f;
+    const float   yarn_beta_fast   = 0.0f;
+    const float   yarn_beta_slow   = 0.0f;
+
+    ggml_tensor * k_rope3d = (rope_type == LLAMA_ROPE_TYPE_NEOX && layer_uses_rope)
+        ? ggml_rope_ext(ctx, k_pre3d, past_idxs, /*factors*/ nullptr,
+                        n_rot, rope_type, n_ctx_orig_yarn,
+                        rope_freq_base, rope_freq_scale,
+                        yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow)
+        : k_pre3d; // LLAMA_ROPE_TYPE_NONE or rope disabled on this layer
+
+    // Back to [n_embd_head_k, T_delta] to mirror cpy_k() semantics
+    ggml_tensor * k_past2d = ggml_reshape_2d(ctx, k_rope3d, n_embd_head_k, (int64_t) T_delta);
+
+    // 3) Overlay the *past* rows into the baseline K view consumed by attention.
+    // Flatten K view to the same 2-D semantics as in cpy_k():
+    ggml_tensor * k_view2d = k_full;
+    if (k_view2d->ne[2] > 1) {
+        k_view2d = ggml_reshape_2d(ctx, k_view2d, k_view2d->ne[0], k_view2d->ne[1]*k_view2d->ne[2]);
+    }
+
+    // Index range [t0 .. T_past-1]
+    ggml_tensor * k_set = ggml_set_rows(ctx, k_view2d, k_past2d, past_idxs);
+    t0_ref = T_past; // remember overlay end
+
+    // Shape-correct return with a no-op dependency so k_set is executed:
+    // dep = sum(k_set) * 0  (scalar) ;  return k_full + dep  (broadcasts)
+    ggml_tensor * dep = ggml_sum  (ctx, k_set);
+    dep               = ggml_scale(ctx, dep, 0.0f);
+    return ggml_add(ctx, k_full, dep);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_xq(ggml_context * ctx, int32_t il,
+                                                       ggml_tensor * v_cur, ggml_tensor * v_idxs) const {
+    // keep v_cur/v_idxs; we may use them
+    if (!xquant_enabled())                        return get_v(ctx, il);
+    const bool no_base = no_base_kv();
+    // Only allow bisect/feature guards to short-circuit when baseline KV exists
+    if (!xq_env_overlay_v_enabled() && !no_base)  return get_v(ctx, il); // allow bisecting V overlay
+    if (!get_supports_set_rows() && !no_base)     return get_v(ctx, il);
+    ggml_tensor * Wk = get_attn_wk(il);
+    ggml_tensor * Wv = get_attn_wv(il);
+    if ((!Wk || !Wv) && !no_base)                 return get_v(ctx, il);
+    const uint32_t T_past = sinfos[i_cur].head(); // MVP: single-stream => [0, head)
+    if (T_past == 0) {
+        if (!no_base) return get_v(ctx, il);
+
+        // XQuant no-base: pad present-only V to match graph mask length n_kv.
+        // Keep the CPU/non-flash transposed V layout (faster downstream).
+        const bool     v_trans = true;
+        const int64_t ne0_dv   = kv->hparams.n_embd_head_v;   // per-head V dim
+        const int64_t ne1_h    = kv->hparams.n_head_kv();     // KV heads
+        const int64_t d_expect = ne0_dv * ne1_h;              // expected V width
+        const int64_t  d       = ne0_dv * ne1_h;
+        const int64_t  n_kv_r  = (int64_t) get_n_kv();
+
+        // v_cur: [d_v, n_head_kv, 1] -> [d, 1]
+        ggml_tensor * v_src2 = ggml_reshape_2d(ctx, v_cur, d, 1);
+
+        if (!v_trans) {
+            // Non-transposed path (kept for completeness)
+            ggml_tensor * v_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst2, 0.0f);
+            ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, /*fill=*/1);
+            ggml_tensor * v_set2 = ggml_set_rows(ctx, v_zero, v_src2, idx);
+            ggml_tensor * v_out3 = ggml_reshape_3d(ctx, v_set2, ne0_dv, ne1_h, n_kv_r);
+            return ggml_reshape_4d(ctx, v_out3, ne0_dv, ne1_h, n_kv_r, 1);
+        } else {
+            // Transposed V: lay out as [n_kv, heads, d_v, 1] via a 1×(d*n_kv) staging
+            ggml_tensor * v_src1 = ggml_reshape_2d(ctx, v_src2, /*rows=*/1, /*cols=*/d);
+            ggml_tensor * v_dst1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, /*rows=*/1, /*cols=*/d * n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst1, 0.0f);
+            ggml_tensor * idx_e  = xq_build_v_elem_idxs(ctx, /*t0=*/0, /*T_delta=*/1, /*d=*/d, /*n_kv=*/n_kv_r);
+            ggml_tensor * v_set1 = ggml_set_rows(ctx, v_zero, v_src1, idx_e);
+            ggml_tensor * v_2d   = ggml_reshape_2d(ctx, v_set1, ne0_dv, ne1_h * n_kv_r);
+            return ggml_reshape_4d(ctx, v_2d, ne0_dv, ne1_h, n_kv_r, 1);
+        }
+    }
+
+    // one-time log guards
+    static std::atomic<bool> g_v_no_base_once{false};
+    static std::atomic<bool> g_v_iswa_once{false};
+    static std::atomic<bool> g_v_overlay_once{false};
+
+    // Ensure we have a slot for this layer index
+    if (xq_last_overlay_t1.size() <= (size_t) il) {
+        xq_last_overlay_t1.resize((size_t) il + 1, /*init*/0);
+    }
+    uint32_t & t0_ref = xq_last_overlay_t1[(size_t) il];
+    const uint32_t t0       = t0_ref;
+    const uint32_t t0_remat = no_base ? 0u : t0;       // full remat in no-base
+    const uint32_t T_delta  = T_past - t0;
+    if (!no_base && T_delta == 0)                      return get_v(ctx, il);
+
+    // Rematerialize:
+    //  - no-base: full [0, T_past)
+    //  - baseline: delta [t0, T_past)
+    auto R = llama_xquant_wrap_remat_kv(get_memory(), ctx, il,
+                                        /*t0=*/(int32_t)t0_remat,
+                                        /*t1=*/(int32_t)T_past, Wk, Wv);
+
+    if (!R.ok || !R.V) {
+        // In baseline we can fall back; in no-base we must not touch freed KV.
+        if (!no_base) return get_v(ctx, il);
+        LLAMA_LOG_ERROR("[xquant] V remat failed in no-base; returning current step only\n");
+        return v_cur;
+    }
+
+    // --- NEW: sanity-check remat width matches attention's expected V width ---
+    {
+        const int64_t ne0_dv   = kv->hparams.n_embd_head_v;   // per-head V dim
+        const int64_t ne1_h    = kv->hparams.n_head_kv();     // KV heads
+        const int64_t d_expect = ne0_dv * ne1_h;              // expected V width
+        if (R.V->ne[1] != d_expect) {
+            LLAMA_LOG_ERROR("[xquant][dbg] get_v_xq: remat d=%lld but expected %lld "
+                            "(d_v=%lld n_head_kv=%lld) — falling back.\n",
+                            (long long)R.V->ne[1], (long long)d_expect,
+                            (long long)ne0_dv, (long long)ne1_h);
+            if (!no_base) {
+                return get_v(ctx, il);
+            }
+            // no-base: pad present-only V (v_cur) to n_kv so mask matches, then shape to 4D
+            const int64_t n_kv_r = (int64_t) get_n_kv();
+            ggml_tensor * v_src2 = ggml_reshape_2d(ctx, v_cur, d_expect, 1);              // [d,1]
+            ggml_tensor * v_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_expect, n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst2, 0.0f);
+            ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, 1);
+            ggml_tensor * v_set2 = ggml_set_rows(ctx, v_zero, v_src2, idx);               // fill t=0
+            ggml_tensor * v_3d   = ggml_reshape_3d(ctx, v_set2, ne0_dv, ne1_h, n_kv_r);
+            return ggml_reshape_4d(ctx, v_3d, ne0_dv, ne1_h, n_kv_r, 1);                  // [d_v,h,kv,1]
+        }
+    }
+
+    // Fast path 0: "no-base" runtime -> return **past + present**, then pad to graph n_kv
+    // and shape to baseline 4D V layout (transposed or not) to match mask length.
+    if (no_base) {
+        // Return V shaped to the graph's n_kv so it matches the mask
+        const uint32_t T_past = sinfos[i_cur].head();
+        if (!g_v_no_base_once.exchange(true)) {
+            LLAMA_LOG_INFO("[xquant] V no-base path: returning [past+present] with n_kv padding (no baseline KV)\n");
+        }
+        const bool     v_trans = true; // CPU/non-flash uses transposed V layout
+        const int64_t  ne0_dv  = kv->hparams.n_embd_head_v;
+        const int64_t  ne1_h   = kv->hparams.n_head_kv();
+        const int64_t  d       = ne0_dv * ne1_h;
+        const int64_t  T_all   = (int64_t) T_past + 1;
+        const int64_t  n_kv_r  = (int64_t) get_n_kv();
+        const int64_t  fill    = std::min(T_all, n_kv_r);
+
+        // R.V : [T_past, d_v] -> [d_v, T_past], then append current
+        ggml_tensor * v_p2   = ggml_transpose(ctx, R.V);                    // [d_v, T_past]
+        ggml_tensor * v_cur2 = ggml_reshape_2d(ctx, v_cur, d, 1);           // [d_v, 1]
+        ggml_tensor * v_all2 = ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1);  // [d_v, T_all]
+
+        if (!v_trans) {
+            // non-transposed: build [d_v, n_kv_r] and fill first "fill" columns
+            ggml_tensor * v_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst2, 0.0f);
+            ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, fill);
+            ggml_tensor * v_set2 = ggml_set_rows(ctx, v_zero, v_all2, idx);
+            ggml_tensor * v_3d   = ggml_reshape_3d(ctx, v_set2, ne0_dv, ne1_h, n_kv_r);
+            return ggml_reshape_4d(ctx, v_3d, ne0_dv, ne1_h, n_kv_r, 1);
+        } else {
+            // transposed: flatten to [1, d*n_kv_r] and scatter elements
+            ggml_tensor * v_src1 = ggml_reshape_2d(ctx, v_all2, 1, d * T_all);
+            ggml_tensor * v_dst1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 1, d * n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst1, 0.0f);
+            ggml_tensor * idx_e  = xq_build_v_elem_idxs(ctx, /*t0=*/0, /*T_delta=*/fill, d, n_kv_r);
+            ggml_tensor * v_set1 = ggml_set_rows(ctx, v_zero, v_src1, idx_e);      // write first "fill" time steps
+            // reshape back to [kv, h, d_v, 1]
+            ggml_tensor * v_2d   = ggml_reshape_2d(ctx, v_set1, ne0_dv, ne1_h * n_kv_r);
+            ggml_tensor * v_4d   = ggml_reshape_4d(ctx, v_2d, ne0_dv, ne1_h, n_kv_r, 1);
+            return ggml_permute(ctx, v_4d, 2, 1, 0, 3); // [kv, h, d_v, 1]
+        }
+    }
+
+    // Fast path 1: ISWA available – keep **past-only** to match mask length.
+#if defined(LLAMA_XQ_HAVE_ISWA_CONCAT)
+    if (v_idxs && v_cur) {
+        const uint32_t T_head2 = sinfos[i_cur].head();
+        const uint32_t n_tps2  = (sinfos[i_cur].n_stream() == 0 || ubatches.empty())
+                               ? 0u : (uint32_t) (ubatches[i_cur].n_tokens / sinfos[i_cur].n_stream());
+        const uint32_t T_prev2 = T_head2 > n_tps2 ? (T_head2 - n_tps2) : 0u;
+        const int64_t  n_kv_cap2 = (int64_t) kv->get_size();
+        if (!g_v_iswa_once.exchange(true)) {
+            LAMA_LOG_INFO("[xquant] V ISWA path: past+present padded to KV capacity (no baseline write)\n");
+        }
+        // Same shaping as no-base block above, but we keep baseline allocated; we just don't write to it.
+        // Prefer using known CPU layout (transposed) for speed; adjust if you run non-transposed V.
+        const bool     v_trans = true;
+        const int64_t  ne0_dv  = kv->hparams.n_embd_head_v;
+        const int64_t  ne1_h   = kv->hparams.n_head_kv();
+        const int64_t  d_expected = ne0_dv * ne1_h;
+        if (R.V && R.V->ne[1] != d_expected) {
+            LLAMA_LOG_ERROR("[xquant][dbg] get_v_xq: remat d=%lld but expected %lld "
+                            "(d_v=%lld n_head_kv=%lld). Falling back (or padding present-only).\n",
+                            (long long)R.V->ne[1], (long long)d_expected,
+                            (long long)ne0_dv, (long long)ne1_h);
+            if (!no_base) return get_v(ctx, il);
+            // no-base fallback: present-only padded to mask length (transposed layout)
+            const int64_t n_kv_r = (int64_t) get_n_kv();
+            ggml_tensor * v_src2 = ggml_reshape_2d(ctx, v_cur, d_expected, 1);
+            ggml_tensor * v_dst2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_expected, n_kv_r);
+            ggml_tensor * v_zero = ggml_scale(ctx, v_dst2, 0.0f);
+            ggml_tensor * idx    = xq_get_iota_i64_slice(ctx, 0, 1);
+            ggml_tensor * v_set2 = ggml_set_rows(ctx, v_zero, v_src2, idx);
+            ggml_tensor * v_3d   = ggml_reshape_3d(ctx, v_set2, ne0_dv, ne1_h, n_kv_r);
+            return ggml_reshape_4d(ctx, v_3d, ne0_dv, ne1_h, n_kv_r, 1);
+        }
+        ggml_tensor * v_p2 = ggml_transpose(ctx, R.V); // [d_v, T_head2]
+        if (T_prev2 < T_head2) {
+            v_p2 = ggml_view_2d(ctx, v_p2, v_p2->ne[0], (int64_t) T_prev2, v_p2->nb[1], 0);
+        }
+        ggml_tensor * v_cur2  = ggml_reshape_2d(ctx, v_cur, ne0_dv*ne1_h, (int64_t) n_tps2);
+        ggml_tensor * v_all2  = (T_prev2 > 0) ? ggml_concat(ctx, v_p2, v_cur2, /*axis=*/1) : v_cur2;
+        const int64_t T_all2  = (int64_t) T_prev2 + (int64_t) n_tps2;
+        if (n_kv_cap2 > T_all2) {
+            v_all2 = ggml_pad(ctx, v_all2, 0, (int32_t) (n_kv_cap2 - T_all2), 0, 0);
+        }
+        if (!v_trans) {
+            ggml_tensor * v_all3 = ggml_reshape_3d(ctx, v_all2, ne0_dv, ne1_h, n_kv_cap2);
+            return ggml_reshape_4d(ctx, v_all3, ne0_dv, ne1_h, n_kv_cap2, 1);
+        } else {
+            ggml_tensor * v_all3T = ggml_permute(ctx,
+                ggml_reshape_4d(ctx, ggml_reshape_2d(ctx, v_all2, ne0_dv, ne1_h * n_kv_cap2),
+                                          ne0_dv, ne1_h, n_kv_cap2, 1),
+                2, 1, 0, 3); // -> [kv, h, d_v, 1]
+            return v_all3T;
+        }
+    }
+#endif
+
+    // Baseline view (final 4D layout expected by attention)
+    ggml_tensor * v_full  = get_v(ctx, il);
+
+    // Overlay (set_rows) path – write delta into baseline V
+    if (!g_v_overlay_once.exchange(true)) {
+        LLAMA_LOG_INFO("[xquant] V overlay path: set_rows delta into baseline buffer\n");
+    }
+
+    // (overlay path below expects delta-shaped R.V)
+    // Heuristic used in attention path: nb[1] > nb[2] => transposed V layout
+    const bool v_trans = v_full->nb[1] > v_full->nb[2];
+
+    // Dimensions:
+    // non-transposed v_full: [n_embd_head_v, n_head_kv, n_kv, ns]
+    // transposed   v_full:   [n_kv, n_head_kv, n_embd_head_v, ns]
+    const int64_t ne0 = v_full->ne[0];
+    const int64_t ne1 = v_full->ne[1];
+    const int64_t ne2 = v_full->ne[2];
+    const int64_t ne3 = v_full->ne[3];
+    const int64_t d       = v_trans ? (ne1 * ne2) : (ne0 * ne1); // n_embd_v_gqa
+    const int64_t kv_size = v_trans ? ne0 : (ne2 * ne3);         // time positions
+
+    // Overlay (set_rows) delta into baseline V
+    if (!g_v_overlay_once.exchange(true)) {
+        LLAMA_LOG_INFO("[xquant] V overlay path: set_rows delta into baseline buffer\n");
+    }
+
+    ggml_tensor * v_set = nullptr;
+    if (!v_trans) {
+        // Non-transposed: rows are tokens -> [d, kv_size] with compact token indices
+        ggml_tensor * v_dst2d = ggml_reshape_2d(ctx, v_full, d, kv_size);
+        // R.V is [T_delta, d] -> transpose to [d, T_delta]
+        ggml_tensor * v_src2d = ggml_transpose(ctx, R.V);
+        ggml_tensor * idx_tok = xq_get_iota_i64_slice(ctx, (int64_t) t0, (int64_t) T_delta);
+        v_set = ggml_set_rows(ctx, v_dst2d, v_src2d, idx_tok);
+    } else {
+        // Transposed: flatten to [1, d*kv_size] and expand per-element indices
+        ggml_tensor * v_dst1x = ggml_reshape_2d(ctx, v_full, 1, d * kv_size);
+        ggml_tensor * v_srcTd = ggml_transpose(ctx, R.V);                 // [d, T_delta]
+        ggml_tensor * v_src1x = ggml_reshape_2d(ctx, v_srcTd, 1, d * (int64_t) T_delta);
+        ggml_tensor * idx_elem = xq_build_v_elem_idxs(ctx, (int64_t) t0, (int64_t) T_delta, d, kv_size);
+        v_set = ggml_set_rows(ctx, v_dst1x, v_src1x, idx_elem);
+    }
+
+    t0_ref = T_past; // remember overlay end
+
+    // Keep dependency so overlay isn't DCE'ed
+    ggml_tensor * dep = ggml_sum(ctx, v_set);
+    dep               = ggml_scale(ctx, dep, 0.0f);
+    return ggml_add(ctx, v_full, dep);
+}
+
+// XQuant: cached iota helpers (per-graph ggml_context)
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i64_view(ggml_context * ctx, int64_t n) const {
+    // ensure capacity at least current n_kv (past length) and requested n
+    const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
+    if (xq_iota_ctx != ctx || xq_iota_i64 == nullptr || xq_iota_cap < need) {
+        xq_iota_ctx = ctx;
+        xq_iota_cap = need;
+        xq_iota_i64 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, xq_iota_cap);
+        if (ggml_backend_buffer_is_host(xq_iota_i64->buffer)) {
+            auto * data = (int64_t *) xq_iota_i64->data;
+            for (int64_t i = 0; i < xq_iota_cap; ++i) data[i] = i;
+        } else {
+            std::vector<int64_t> tmp((size_t) xq_iota_cap);
+            for (int64_t i = 0; i < xq_iota_cap; ++i) tmp[(size_t)i] = i;
+            ggml_backend_tensor_set(xq_iota_i64, tmp.data(), 0, sizeof(int64_t) * (size_t) xq_iota_cap);
+        }
+    }
+    // return a view of the first n elements
+    return ggml_view_1d(ctx, xq_iota_i64, n, /*offset bytes*/ 0);
+}
+
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i64_slice(ggml_context * ctx, int64_t off, int64_t n) const {
+    (void) xq_get_iota_i64_view(ctx, off + n); // ensure capacity
+    return ggml_view_1d(ctx, xq_iota_i64, n, (size_t)off * sizeof(int64_t));
+}
+
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i32_view(ggml_context * ctx, int64_t n) const {
+    const int64_t need = n > (int64_t) get_n_kv() ? n : (int64_t) get_n_kv();
+    if (xq_iota_ctx != ctx || xq_iota_i32 == nullptr || xq_iota_cap < need) {
+        xq_iota_ctx = ctx;
+        xq_iota_cap = need;
+        xq_iota_i32 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, xq_iota_cap);
+        if (ggml_backend_buffer_is_host(xq_iota_i32->buffer)) {
+            auto * data = (int32_t *) xq_iota_i32->data;
+            for (int64_t i = 0; i < xq_iota_cap; ++i) data[i] = (int32_t) i;
+        } else {
+            std::vector<int32_t> tmp((size_t) xq_iota_cap);
+            for (int64_t i = 0; i < xq_iota_cap; ++i) tmp[(size_t)i] = (int32_t) i;
+            ggml_backend_tensor_set(xq_iota_i32, tmp.data(), 0, sizeof(int32_t) * (size_t) xq_iota_cap);
+        }
+    }
+    return ggml_view_1d(ctx, xq_iota_i32, n, /*offset bytes*/ 0);
+}
+
+ggml_tensor * llama_kv_cache_context::xq_get_iota_i32_slice(ggml_context * ctx, int64_t off, int64_t n) const {
+    (void) xq_get_iota_i32_view(ctx, off + n); // ensure capacity
+    return ggml_view_1d(ctx, xq_iota_i32, n, (size_t)off * sizeof(int32_t));
+}
+
+// ---- XQuant: free baseline KV buffers after wrapper attaches ----
+void llama_kv_cache::drop_baseline_kv() {
+    if (no_base_kv_) {
+        // already dropped
+        return;
+    }
+
+    // Null out tensor handles and per-stream views
+    for (auto & L : layers) {
+        L.k = nullptr;
+        L.v = nullptr;
+        L.k_stream.clear();
+        L.v_stream.clear();
+    }
+
+    // Release backend buffers and contexts to reclaim memory
+    for (auto & buf : bufs) {
+        buf.reset();
+    }
+    bufs.clear();
+
+    for (auto & ctx : ctxs) {
+        ctx.reset();
+    }
+    ctxs.clear();
+
+    no_base_kv_ = true;
+    LLAMA_LOG_INFO("[xquant] dropped baseline FP16 KV buffers (no-base mode active)\n");
 }
