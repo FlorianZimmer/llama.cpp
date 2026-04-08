@@ -12,9 +12,12 @@ LLM inference in C/C++
 
 ## Fork note
 
-This repository is a personal fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The default `master` branch is kept as a clean upstream-oriented baseline, while experimental work is isolated in dedicated branches and documented separately when it is worth preserving.
+This repository is a personal fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), maintained as an upstream-oriented baseline with a small number of documented research branches.
 
-The XQuant prototype in this fork is currently on hold. See [docs/experiments/xquant.md](docs/experiments/xquant.md).
+- `master`: clean fork baseline plus minimal fork-specific documentation
+- `research/xquant-on-hold`: experimental XQuant KV rematerialization prototype preserved as a research snapshot
+
+The XQuant prototype is currently on hold. See [docs/experiments/xquant.md](docs/experiments/xquant.md).
 
 ## Recent API changes
 
