@@ -373,6 +373,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool mtp_only;    // [EXPERIMENTAL][INTERNAL] allocate memory only for appended MTP/NextN layers
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -628,6 +629,12 @@ extern "C" {
     // Returns true if the model contains a decoder that requires llama_decode() call
     LLAMA_API bool llama_model_has_decoder(const struct llama_model * model);
 
+    // Returns true if the checkpoint exposes native NextN/MTP tensors
+    LLAMA_API bool llama_model_supports_mtp(const struct llama_model * model);
+
+    // Returns the number of verified native NextN/MTP prediction layers in the checkpoint
+    LLAMA_API int32_t llama_model_mtp_depth_max(const struct llama_model * model);
+
     // For encoder-decoder models, this function returns id of the token that must be provided
     // to the decoder to start generating output sequence. For other models, it returns -1.
     LLAMA_API llama_token llama_model_decoder_start_token(const struct llama_model * model);
@@ -779,6 +786,9 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Check if the memory supports removing a non-empty suffix from a live sequence via llama_memory_seq_rm()
+    LLAMA_API bool llama_memory_can_seq_rm_partial(llama_memory_t mem);
 
     //
     // State / sessions
@@ -960,6 +970,34 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Process a batch of tokens using the native NextN/MTP proposal path.
+    // Requires the context to have a memory and the loaded checkpoint to expose MTP tensors.
+    // This is intended for speculative proposal generation, not normal verifier decoding.
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
+    // Enable or disable capturing per-output hidden states for native MTP synchronization.
+    // When enabled, llama_decode() keeps the normalized decoder hidden states for each output token
+    // so a lightweight MTP proposer can be updated without re-running the full base model.
+    LLAMA_API void llama_set_mtp_output(struct llama_context * ctx, bool enabled);
+
+    // Provide the hidden state input for the next llama_decode_mtp() call.
+    // The hidden vector must match llama_model_n_embd_out(model).
+    LLAMA_API void llama_set_mtp_input_hidden(
+            struct llama_context * ctx,
+                   const float   * hidden,
+                          size_t    n_embd);
+
+    // Batched variant of llama_set_mtp_input_hidden().
+    // hidden must contain n_tokens contiguous hidden vectors of size llama_model_n_embd_out(model).
+    LLAMA_API void llama_set_mtp_input_hiddens(
+            struct llama_context * ctx,
+                   const float   * hidden,
+                          size_t    n_tokens,
+                          size_t    n_embd);
+
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1004,6 +1042,17 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Native MTP hidden state for the ith output token from the last llama_decode() call.
+    // Negative indices can be used to access outputs in reverse order, -1 is the last output.
+    // Returns NULL if MTP output capture is disabled or the index is invalid.
+    LLAMA_API float * llama_get_mtp_hidden_ith(struct llama_context * ctx, int32_t i);
+
+    // Copy native MTP hidden states for the selected output tokens from the last llama_decode() call.
+    // idxs use the same indexing rules as llama_get_mtp_hidden_ith().
+    // dst must have space for n_idxs * llama_n_embd_out(model) floats.
+    // Returns false if MTP output capture is disabled or any index is invalid.
+    LLAMA_API bool llama_get_mtp_hiddens(struct llama_context * ctx, const int32_t * idxs, size_t n_idxs, float * dst);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1524,10 +1573,22 @@ extern "C" {
         double t_load_ms;   // time needed for loading the model
         double t_p_eval_ms; // time needed for processing the prompt
         double t_eval_ms;   // time needed for generating tokens
+        double t_mtp_eval_ms;       // total time spent in llama_decode_mtp()
+        double t_mtp_reserve_ms;    // time spent in sched_reserve() for MTP
+        double t_mtp_prepare_ms;    // time spent preparing memory state for MTP
+        double t_mtp_output_ms;     // time spent reserving/copying MTP outputs
+        double t_mtp_graph_build_ms;// time spent building MTP graphs
+        double t_mtp_graph_alloc_ms;// time spent allocating MTP graphs
+        double t_mtp_set_inputs_ms; // time spent setting MTP graph inputs
+        double t_mtp_compute_ms;    // time spent computing MTP graphs
 
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+        int32_t n_mtp_eval;         // number of llama_decode_mtp() calls
+        int32_t n_mtp_tokens;       // number of tokens processed by llama_decode_mtp()
+        int32_t n_mtp_reused;       // number of times an MTP graph had been reused
+        int32_t n_mtp_graph_builds; // number of MTP graph builds
     };
 
     struct llama_perf_sampler_data {

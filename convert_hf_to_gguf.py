@@ -5269,13 +5269,67 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+class _Qwen35MTPMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        nextn_layers = self.hparams.get("num_nextn_predict_layers")
+        if nextn_layers is None:
+            nextn_layers = self.hparams.get("mtp_num_hidden_layers", 0)
+            if nextn_layers:
+                self.hparams["num_nextn_predict_layers"] = nextn_layers
+
+        if nextn_layers:
+            self.block_count = self.hparams["num_hidden_layers"] + nextn_layers
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        if (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("mtp."):
+            nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
+            if nextn_layers == 0:
+                return
+
+            base_layer = self.hparams["num_hidden_layers"]
+
+            if ".layers." in name:
+                assert bid is not None
+                name = name.replace(f"mtp.layers.{bid}", f"model.layers.{bid + base_layer}", 1)
+            else:
+                remapper = {
+                    "mtp.fc": "model.layers.{bid}.eh_proj",
+                    "mtp.pre_fc_norm_embedding": "model.layers.{bid}.enorm",
+                    "mtp.pre_fc_norm_hidden": "model.layers.{bid}.hnorm",
+                    "mtp.norm": "model.layers.{bid}.shared_head.norm",
+                    "mtp.embed_tokens": "model.layers.{bid}.embed_tokens",
+                    "mtp.shared_head.head": "model.layers.{bid}.shared_head.head",
+                    "mtp.shared_head.norm": "model.layers.{bid}.shared_head.norm",
+                }
+                tensor_path = Path(name)
+                if tensor_path.stem not in remapper:
+                    raise ValueError(f"unexpected Qwen 3.5 MTP tensor: {name}")
+
+                new_name = remapper[tensor_path.stem] + tensor_path.suffix
+
+                for bid in range(base_layer, self.block_count):
+                    yield from super().modify_tensors(data_torch, new_name.format(bid=bid), bid)
+                return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
-class Qwen3_5TextModel(_LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen35MTPMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
+class Qwen3_5MoeTextModel(_Qwen35MTPMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 

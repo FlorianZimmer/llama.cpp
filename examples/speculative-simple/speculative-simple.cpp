@@ -27,8 +27,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.speculative.mparams_dft.path.empty()) {
-        LOG_ERR("%s: --model-draft is required\n", __func__);
+    const bool use_native_mtp = params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+
+    if (params.speculative.mparams_dft.path.empty() && !use_native_mtp) {
+        LOG_ERR("%s: --model-draft is required unless --spec-type mtp is used\n", __func__);
         return 1;
     }
 
@@ -52,7 +54,7 @@ int main(int argc, char ** argv) {
     llama_model_ptr model_dft;
 
     // TODO: simplify this logic
-    {
+    if (!params.speculative.mparams_dft.path.empty()) {
         const auto & params_spec = params.speculative;
 
         auto params_dft = params;
@@ -137,8 +139,13 @@ int main(int argc, char ** argv) {
     const auto & params_spec = params.speculative;
 
     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
+    common_speculative_verifier verifier(ctx_tgt, 0);
 
-    common_speculative_begin(spec, prompt_tgt);
+    llama_tokens prompt_spec = prompt_tgt;
+    if (params_spec.type == COMMON_SPECULATIVE_TYPE_MTP) {
+        prompt_spec.push_back(id_last);
+    }
+    common_speculative_begin(spec, prompt_spec);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
@@ -147,6 +154,10 @@ int main(int argc, char ** argv) {
     const auto t_dec_start = ggml_time_us();
 
     while (true) {
+        if (params.n_predict >= 0 && n_predict >= params.n_predict) {
+            break;
+        }
+
         // optionally, generate draft tokens that can be appended to the target batch
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -154,7 +165,7 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
-        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+        llama_tokens draft = common_speculative_draft(spec, params_spec, ctx_tgt, 0, prompt_tgt, id_last);
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -169,13 +180,19 @@ int main(int argc, char ** argv) {
                 draft.clear();
             }
 
+            if (!draft.empty() && !verifier.begin(n_past, id_last)) {
+                return 1;
+            }
+
             for (size_t i = 0; i < draft.size(); ++i) {
                 common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
             }
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_decode(ctx_tgt, batch_tgt);
+            if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                return 1;
+            }
         }
 
         // sample from the full target batch and return the accepted tokens based on the target sampler
@@ -185,16 +202,50 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
-        const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        const auto ids_all = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
 
-        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids_all).c_str());
 
-        GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+        GGML_ASSERT(ids_all.size() > 0); // there will always be at least one accepted token
 
-        n_past    += ids.size() - 1;
+        size_t n_keep = ids_all.size();
+        if (params.n_predict >= 0) {
+            const int remaining = params.n_predict - n_predict;
+            GGML_ASSERT(remaining > 0);
+            n_keep = std::min(n_keep, (size_t) remaining);
+        }
+
+        for (size_t i = 0; i < n_keep; ++i) {
+            if (llama_vocab_is_eog(vocab, ids_all[i])) {
+                n_keep = i + 1;
+                break;
+            }
+        }
+
+        GGML_ASSERT(n_keep > 0);
+
+        llama_tokens ids(ids_all.begin(), ids_all.begin() + n_keep);
+
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
+
+        std::vector<int> accepted_idxs(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            accepted_idxs[i] = (int) i;
+        }
+
+        common_speculative_accept_tokens(spec, ctx_tgt, ids, accepted_idxs);
+
+        if (draft.empty()) {
+            n_past += ids.size() - 1;
+        } else {
+            if (!verifier.finish(draft.size(), ids, n_past)) {
+                return 1;
+            }
+        }
+
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
+        common_speculative_accept(spec, ids.size() - 1);
 
         // process the accepted tokens and update contexts
         //
@@ -222,13 +273,7 @@ int main(int argc, char ** argv) {
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
-        {
-            LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
-
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
-        }
-
-        if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+        if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
             break;
         }
     }

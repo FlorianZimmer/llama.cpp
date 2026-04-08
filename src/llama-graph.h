@@ -31,6 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -117,6 +118,21 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+class llm_graph_input_mtp_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_hidden(int64_t n_hidden, const float * hidden) : n_hidden(n_hidden), hidden(hidden) {}
+    virtual ~llm_graph_input_mtp_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * mtp_hidden = nullptr; // F32 [n_hidden, n_batch]
+
+    const int64_t n_hidden = 0;
+    const float * hidden = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -543,6 +559,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const float                  * mtp_hidden_input = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -641,6 +658,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_mtp_logits()  const { return t_mtp_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
 
@@ -666,9 +684,10 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_inp_tokens    = nullptr;
+    ggml_tensor * t_inp_embd      = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_mtp_logits  = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
@@ -713,6 +732,7 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    const llm_graph_type gtype;
 
     const int64_t n_embd;
     const int64_t n_layer;
@@ -751,6 +771,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const float                  * mtp_hidden_input;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -860,6 +881,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_mtp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

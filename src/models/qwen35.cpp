@@ -5,6 +5,7 @@
 llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int     n_transformer_layers = n_layer - hparams.nextn_predict_layers;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -15,6 +16,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * inpL;
 
     inpL = build_inp_embd(model.tok_embd);
+    ggml_tensor * inpE = inpL;
 
     cb(inpL, "model.input_embed", -1);
 
@@ -23,54 +25,95 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * inpSA = inpL;
+    auto build_transformer_layer = [&](ggml_tensor * layer_inp, int il, bool use_out_ids) -> ggml_tensor * {
+        ggml_tensor * inpSA = layer_inp;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = build_norm(layer_inp, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
 
-        // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recurrent(il)) {
-            // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
-            // Full attention layer
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (use_out_ids && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
-        // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
-        // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
-
-        // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // Dense FFN layer - without residual connection
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // Input for next layer
-        inpL = cur;
+        return cur;
+    };
+
+    const bool mtp_hidden_fast_path = gtype == LLM_GRAPH_TYPE_MTP && mtp_hidden_input != nullptr;
+
+    if (mtp_hidden_fast_path) {
+        inpL = build_inp_mtp_hidden();
+    } else {
+        for (int il = 0; il < n_transformer_layers; ++il) {
+            inpL = build_transformer_layer(inpL, il, il == n_transformer_layers - 1);
+        }
     }
     cur = inpL;
+
+    if (gtype == LLM_GRAPH_TYPE_MTP) {
+        GGML_ASSERT(hparams.nextn_predict_layers > 0 && "Qwen 3.5 MTP graph requires NextN layers");
+
+        const int il = n_transformer_layers;
+        ggml_tensor * mtp_embd = inpE;
+
+        ggml_tensor * embd_norm = build_norm(mtp_embd, model.layers[il].nextn.enorm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * hidden_norm = build_norm(cur, model.layers[il].nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+        cb(embd_norm, "mtp_embd_norm", il);
+        cb(hidden_norm, "mtp_hidden_norm", il);
+
+        ggml_build_forward_expand(gf, embd_norm);
+        ggml_build_forward_expand(gf, hidden_norm);
+
+        ggml_tensor * mtp_input = ggml_concat(ctx0, embd_norm, hidden_norm, 0);
+        cb(mtp_input, "mtp_input", il);
+
+        cur = build_lora_mm(model.layers[il].nextn.eh_proj, mtp_input);
+        cb(cur, "mtp_eh_proj", il);
+
+        cur = build_transformer_layer(cur, il, inp_out_ids != nullptr);
+
+        ggml_tensor * mtp_head_norm = model.layers[il].nextn.shared_head_norm != nullptr
+            ? model.layers[il].nextn.shared_head_norm
+            : model.output_norm;
+        ggml_tensor * mtp_head = model.layers[il].nextn.shared_head_head != nullptr
+            ? model.layers[il].nextn.shared_head_head
+            : model.output;
+
+        cur = build_norm(cur, mtp_head_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "mtp_result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(mtp_head, cur);
+        cb(cur, "mtp_result_output", -1);
+        res->t_mtp_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

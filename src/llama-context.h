@@ -74,6 +74,8 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    float * get_mtp_hidden_ith(int32_t i);
+    bool    get_mtp_hiddens(const int32_t * idxs, size_t n_idxs, float * dst);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -104,6 +106,9 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_mtp_output(bool enabled);
+    void set_mtp_input_hidden(const float * hidden, size_t n_embd);
+    void set_mtp_input_hiddens(const float * hidden, size_t n_tokens, size_t n_embd);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -128,6 +133,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_mtp(const llama_batch & batch_inp);
 
     //
     // state save/load
@@ -230,7 +236,7 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -267,6 +273,9 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // hidden states of decoder outputs captured for native MTP synchronization
+    buffer_view<float> mtp_hidden = {nullptr, 0};
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
@@ -342,18 +351,36 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    bool mtp_output_enabled = false;
+
+    // input hidden state for the next llama_decode_mtp() call
+    std::vector<float> mtp_input_hidden;
 
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;
     mutable int64_t t_eval_us   = 0;
+    mutable int64_t t_mtp_eval_us        = 0;
+    mutable int64_t t_mtp_reserve_us     = 0;
+    mutable int64_t t_mtp_prepare_us     = 0;
+    mutable int64_t t_mtp_output_us      = 0;
+    mutable int64_t t_mtp_graph_build_us = 0;
+    mutable int64_t t_mtp_graph_alloc_us = 0;
+    mutable int64_t t_mtp_set_inputs_us  = 0;
+    mutable int64_t t_mtp_compute_us     = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
+    mutable int32_t n_mtp_eval         = 0; // number of MTP decode calls
+    mutable int32_t n_mtp_tokens       = 0; // number of tokens processed by MTP decode
+    mutable int32_t n_mtp_reused       = 0; // number of times an MTP graph was reused
+    mutable int32_t n_mtp_graph_builds = 0; // number of MTP graph builds
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    bool mtp_only = false;
 };

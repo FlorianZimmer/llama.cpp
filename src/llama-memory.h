@@ -20,6 +20,9 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // allocate memory only for appended MTP/NextN layers when supported
+    bool mtp_only;
 };
 
 enum llama_memory_status {
@@ -92,6 +95,7 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+    virtual bool get_can_seq_rm_partial() const = 0;
 
     //
     // ops

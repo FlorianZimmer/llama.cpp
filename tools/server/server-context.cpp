@@ -18,7 +18,6 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
-
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -57,6 +56,7 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     common_speculative * spec = nullptr;
+    std::unique_ptr<common_speculative_verifier> spec_verifier;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -72,6 +72,7 @@ struct server_slot {
     int32_t n_decoded   = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
+    int32_t i_batch_last = -1;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -179,6 +180,7 @@ struct server_slot {
 
         drafted.clear();
         i_batch_dft.clear();
+        i_batch_last = -1;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -444,6 +446,7 @@ struct server_slot {
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
         other.i_batch     = i_batch;
+        other.i_batch_last = i_batch_last;
 
         other.t_start_process_prompt    = t_start_process_prompt;
         other.t_prompt_processing       = t_prompt_processing;
@@ -562,6 +565,7 @@ private:
     llama_batch batch {};
 
     llama_model_ptr model_dft;
+    llama_context * ctx_mtp_shared = nullptr;
 
     bool add_bos_token = true;
 
@@ -600,6 +604,11 @@ private:
         for (server_slot & slot : slots) {
             common_speculative_free(slot.spec);
             slot.spec = nullptr;
+        }
+
+        if (ctx_mtp_shared) {
+            llama_free(ctx_mtp_shared);
+            ctx_mtp_shared = nullptr;
         }
 
         llama_batch_free(batch);
@@ -772,6 +781,19 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        const bool use_shared_mtp =
+            can_spec &&
+            params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP &&
+            params_base.n_parallel > 1 &&
+            mctx == nullptr;
+
+        if (use_shared_mtp) {
+            ctx_mtp_shared = common_speculative_init_mtp_context(params_base.speculative, ctx, params_base.n_parallel);
+            if (ctx_mtp_shared == nullptr) {
+                SRV_WRN("%s", "failed to initialize shared native MTP draft context, falling back to per-slot contexts\n");
+            }
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot slot;
@@ -785,8 +807,13 @@ private:
 
             // try speculative decoding
             if (can_spec) {
-                slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                if (ctx_mtp_shared) {
+                    slot.spec = common_speculative_init_shared_mtp(params_base.speculative, slot.ctx, ctx_mtp_shared, slot.id);
+                } else {
+                    slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                }
                 if (slot.spec) {
+                    slot.spec_verifier = std::make_unique<common_speculative_verifier>(slot.ctx, slot.id);
                     if (mctx) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                         return false;
@@ -2079,6 +2106,14 @@ private:
 
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
+        bool batch_has_fullstate_spec = false;
+
+        auto uses_fullstate_spec = [](server_slot & slot) {
+            return slot.state == SLOT_STATE_GENERATING &&
+                slot.can_speculate() &&
+                slot.spec_verifier &&
+                !llama_memory_can_seq_rm_partial(llama_get_memory(slot.ctx));
+        };
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -2094,7 +2129,10 @@ private:
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
+                batch_has_fullstate_spec = uses_fullstate_spec(slot);
             } else if (!slot_batched->can_batch_with(slot)) {
+                continue;
+            } else if (batch_has_fullstate_spec != uses_fullstate_spec(slot)) {
                 continue;
             }
 
@@ -2112,25 +2150,32 @@ private:
 
                 const auto & params_spec = slot.task->params.speculative;
 
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, ctx, slot.id, cached_text_tokens, slot.sampled);
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
                 }
 
-                // add the sampled token to the batch
-                slot.i_batch_dft.push_back(batch.n_tokens);
-                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-                slot.prompt.tokens.push_back(slot.sampled);
-
                 if (slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-                    // fallback to normal decoding
-                    slot.i_batch = slot.i_batch_dft[0];
-                    slot.drafted.clear();
-                    slot.i_batch_dft.clear();
+                    slot.i_batch = batch.n_tokens;
+                    common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                    slot.prompt.tokens.push_back(slot.sampled);
                 } else {
+                    // The server keeps slot.sampled outside slot.prompt.tokens, so the verifier's
+                    // base position must account for the sampled token that will be prepended to
+                    // the speculative target batch.
+                    if (!slot.spec_verifier->begin(slot.prompt.tokens.pos_next() + 1, slot.sampled)) {
+                        slot.release();
+                        continue;
+                    }
+
+                    // add the sampled token to the batch
+                    slot.i_batch_dft.push_back(batch.n_tokens);
+                    common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                    slot.prompt.tokens.push_back(slot.sampled);
+
                     // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
 
@@ -2166,6 +2211,14 @@ private:
         if (params_base.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
                 if (!slot.is_processing()) {
+                    continue;
+                }
+
+                // Hybrid/recurrent speculative verifier rollback snapshots the full
+                // target context for the current decode batch. Do not mix prompt
+                // work into that batch, because the later verifier restore/replay
+                // only rebuilds the speculative sequences.
+                if (batch_has_fullstate_spec) {
                     continue;
                 }
 
@@ -2738,6 +2791,34 @@ private:
                 batch.logits   + i,
             };
 
+            std::vector<uint8_t> speculative_full_state;
+            size_t speculative_full_state_size = 0;
+            bool capture_speculative_full_state = false;
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || slot.i_batch_dft.empty() || !slot.spec_verifier) {
+                    continue;
+                }
+                if (slot.i_batch_dft.front() < i || slot.i_batch_dft.front() >= i + n_tokens) {
+                    continue;
+                }
+                if (slot.spec_verifier->uses_full_state()) {
+                    capture_speculative_full_state = true;
+                    break;
+                }
+            }
+            if (capture_speculative_full_state) {
+                speculative_full_state_size = llama_state_get_size(ctx);
+                speculative_full_state.resize(speculative_full_state_size);
+                if (speculative_full_state_size > 0) {
+                    const size_t n_state = llama_state_get_data(ctx, speculative_full_state.data(), speculative_full_state_size);
+                    if (n_state != speculative_full_state_size) {
+                        SRV_ERR("failed to snapshot shared speculative target state (%zu != %zu)\n", n_state, speculative_full_state_size);
+                        speculative_full_state.clear();
+                        speculative_full_state_size = 0;
+                    }
+                }
+            }
+
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
@@ -2867,8 +2948,10 @@ private:
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                common_speculative_accept_tokens(slot.spec, ctx, llama_tokens{ id }, std::vector<int>{ tok_idx });
 
                 slot.i_batch = -1;
+                slot.i_batch_last = tok_idx;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
@@ -2906,29 +2989,167 @@ private:
             }
 
             // speculative decoding - main model sample and accept
+            std::vector<server_slot *> speculative_slots_batch;
+            std::vector<llama_tokens> speculative_ids_batch;
+            std::vector<std::vector<int>> speculative_idxs_batch;
+            std::vector<size_t> speculative_n_draft_batch;
+            speculative_slots_batch.reserve(slots.size());
+            speculative_ids_batch.reserve(slots.size());
+            speculative_idxs_batch.reserve(slots.size());
+            speculative_n_draft_batch.reserve(slots.size());
+
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || slot.i_batch_dft.empty()) {
                     continue;
                 }
 
+                if (slot.i_batch_dft.front() < i || slot.i_batch_dft.back() >= i + n_tokens) {
+                    continue;
+                }
+
                 const size_t n_draft = slot.drafted.size();
+                std::vector<int> idxs_local(slot.i_batch_dft.size());
+                for (size_t j = 0; j < slot.i_batch_dft.size(); ++j) {
+                    idxs_local[j] = slot.i_batch_dft[j] - i;
+                }
 
                 // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                llama_tokens ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, idxs_local, slot.drafted);
+                std::vector<int> accepted_idxs(idxs_local.begin(), idxs_local.begin() + ids.size());
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
-                const int64_t t_current = ggml_time_us();
+                size_t n_accept_draft = ids.empty() ? 0 : ids.size() - 1;
 
-                slot.n_decoded += ids.size();
-
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                // Clamp the committed speculative batch to the remaining request budget
+                // before verifier replay and output emission. Otherwise the final verified
+                // token in the batch can be dropped after it has already been counted.
+                slot.has_budget(params_base);
+                if (slot.n_remaining > 0 && (size_t) slot.n_remaining < ids.size()) {
+                    ids.resize(slot.n_remaining);
+                    accepted_idxs.resize(slot.n_remaining);
+                }
+                n_accept_draft = std::min(n_accept_draft, ids.size());
+                if (ids.empty()) {
+                    continue;
+                }
 
                 // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
+                slot.n_draft_accepted += n_accept_draft;
+
+                speculative_slots_batch.push_back(&slot);
+                speculative_ids_batch.push_back(std::move(ids));
+                speculative_idxs_batch.push_back(std::move(accepted_idxs));
+                speculative_n_draft_batch.push_back(n_draft);
+            }
+
+            if (speculative_slots_batch.size() > 1) {
+                std::vector<size_t> order(speculative_slots_batch.size());
+                for (size_t i = 0; i < order.size(); ++i) {
+                    order[i] = i;
+                }
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return speculative_idxs_batch[a].front() < speculative_idxs_batch[b].front();
+                });
+
+                auto reorder_by_order = [&](auto & vec) {
+                    using value_type = typename std::decay_t<decltype(vec)>::value_type;
+                    std::vector<value_type> reordered;
+                    reordered.reserve(vec.size());
+                    for (size_t idx : order) {
+                        reordered.push_back(std::move(vec[idx]));
+                    }
+                    vec = std::move(reordered);
+                };
+
+                reorder_by_order(speculative_slots_batch);
+                reorder_by_order(speculative_ids_batch);
+                reorder_by_order(speculative_idxs_batch);
+                reorder_by_order(speculative_n_draft_batch);
+            }
+
+            if (!speculative_slots_batch.empty()) {
+                std::vector<common_speculative *> speculative_specs_batch;
+                speculative_specs_batch.reserve(speculative_slots_batch.size());
+                for (auto * slot : speculative_slots_batch) {
+                    speculative_specs_batch.push_back(slot->spec);
+                }
+
+                common_speculative_accept_tokens_batch(speculative_specs_batch, ctx, speculative_ids_batch, speculative_idxs_batch);
+            }
+
+            bool use_batched_verifier_finish = speculative_slots_batch.size() > 1;
+            for (auto * slot : speculative_slots_batch) {
+                if (llama_memory_can_seq_rm_partial(llama_get_memory(slot->ctx))) {
+                    use_batched_verifier_finish = false;
+                    break;
+                }
+            }
+
+            std::vector<int32_t> speculative_n_past_batch(speculative_slots_batch.size(), 0);
+            if (use_batched_verifier_finish) {
+                bool restored = false;
+                if (speculative_full_state_size > 0) {
+                    llama_memory_clear(llama_get_memory(ctx), true);
+                    const size_t n_state = llama_state_set_data(ctx, speculative_full_state.data(), speculative_full_state_size);
+                    restored = (n_state == speculative_full_state_size);
+                    if (!restored) {
+                        SRV_ERR("failed to restore shared speculative target state (%zu != %zu)\n", n_state, speculative_full_state_size);
+                    }
+                } else {
+                    restored = true;
+                    for (auto * slot : speculative_slots_batch) {
+                        if (!slot->spec_verifier->restore_snapshot()) {
+                            restored = false;
+                            break;
+                        }
+                    }
+                }
+                if (!restored) {
+                    for (auto * slot : speculative_slots_batch) {
+                        slot->release();
+                    }
+                    continue;
+                }
+
+                llama_batch batch_replay_all = llama_batch_init(std::max<int32_t>(1, (int32_t) llama_n_batch(ctx)), 0, 1);
+                common_batch_clear(batch_replay_all);
+
+                for (size_t is = 0; is < speculative_slots_batch.size(); ++is) {
+                    auto & slot = *speculative_slots_batch[is];
+                    auto & ids = speculative_ids_batch[is];
+
+                    speculative_n_past_batch[is] = slot.spec_verifier->n_past_after(ids);
+                    slot.spec_verifier->append_replay(ids, batch_replay_all);
+                }
+
+                if (batch_replay_all.n_tokens > 0 && llama_decode(ctx, batch_replay_all) != 0) {
+                    llama_batch_free(batch_replay_all);
+                    for (auto * slot : speculative_slots_batch) {
+                        slot->release();
+                    }
+                    continue;
+                }
+
+                llama_batch_free(batch_replay_all);
+            }
+
+            for (size_t is = 0; is < speculative_slots_batch.size(); ++is) {
+                auto & slot = *speculative_slots_batch[is];
+                auto & ids = speculative_ids_batch[is];
+                auto & accepted_idxs = speculative_idxs_batch[is];
+                const size_t n_draft = speculative_n_draft_batch[is];
+
+                int32_t n_past = 0;
+                if (use_batched_verifier_finish) {
+                    n_past = speculative_n_past_batch[is];
+                } else if (!slot.spec_verifier->finish(n_draft, ids, n_past)) {
+                    slot.release();
+                    continue;
+                }
 
                 // inform the speculative decoding about the number of accepted tokens
-                common_speculative_accept(slot.spec, ids.size() - 1);
+                common_speculative_accept(slot.spec, std::min<size_t>(n_draft, ids.size() - 1));
 
                 // rollback to the state before sampling the draft tokens
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
@@ -2936,10 +3157,22 @@ private:
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
+                slot.i_batch_last = accepted_idxs.back();
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                GGML_ASSERT(slot.prompt.tokens.pos_next() == n_past);
 
+                const int64_t t_current = ggml_time_us();
                 for (size_t i = 0; i < ids.size(); ++i) {
+                    slot.n_decoded += 1;
+
+                    if (slot.n_decoded == 1) {
+                        slot.t_start_generation = t_current;
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                    }
+
+                    slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
                     completion_token_output result;
 
                     result.tok          = ids[i];

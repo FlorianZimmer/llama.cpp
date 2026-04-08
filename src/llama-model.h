@@ -612,6 +612,10 @@ struct llama_model {
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    bool supports_mtp() const;
+    uint32_t mtp_depth_max() const;
+    void validate_mtp() const;
+
 private:
     llama_model_params params;
 
