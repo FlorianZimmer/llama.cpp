@@ -3,7 +3,6 @@
 - Status: On hold
 - Last active: 2025-08-24
 - Main branch: `research/xquant-on-hold`
-- Archived raw history: `archive/xquant-raw-2025-08`
 
 ## Summary
 
@@ -17,6 +16,12 @@ The work was paused before it reached a production-ready or upstreamable state, 
 - Integration work in the KV cache and attention path
 - Focused tests in `tests/test-xquant.cpp` and `tests/test-xquant-wrap.cpp`
 - A Windows evaluation script in `xquant-eval.ps1`
+
+## Key takeaways
+
+- The prototype showed that an XQuant-backed memory path could be integrated behind the KV cache interface instead of requiring a broad rewrite across attention code paths.
+- The most viable direction was to keep the feature gated, preserve baseline behavior when disabled, and concentrate the experimental logic in the memory wrapper and KV access path.
+- The remaining work was not around basic integration alone, but around stability, broader validation, and deciding whether the extra complexity was justified for a maintainable long-term branch.
 
 ## Current caveats
 

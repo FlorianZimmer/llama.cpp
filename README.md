@@ -17,6 +17,8 @@ This repository is a personal fork of [ggml-org/llama.cpp](https://github.com/gg
 - `master`: clean fork baseline plus minimal fork-specific documentation
 - `research/xquant-on-hold`: experimental XQuant KV rematerialization prototype preserved as a research snapshot
 
+Why this fork exists: I used this fork to explore lower-memory inference ideas in `llama.cpp` without turning the default branch into a long-lived experimental branch. The main preserved prototype focuses on XQuant-style KV rematerialization and captures both the implementation direction and the validation work completed before the effort was paused.
+
 The XQuant prototype is currently on hold. See [docs/experiments/xquant.md](docs/experiments/xquant.md).
 
 ## Recent API changes
