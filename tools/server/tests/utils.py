@@ -92,6 +92,7 @@ class ServerProcess:
     enable_ctx_shift: int | None = False
     draft_min: int | None = None
     draft_max: int | None = None
+    spec_type: str | None = None
     no_webui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -218,6 +219,8 @@ class ServerProcess:
             server_args.extend(["--draft-max", self.draft_max])
         if self.draft_min:
             server_args.extend(["--draft-min", self.draft_min])
+        if self.spec_type:
+            server_args.extend(["--spec-type", self.spec_type])
         if self.no_webui:
             server_args.append("--no-webui")
         if self.no_models_autoload:

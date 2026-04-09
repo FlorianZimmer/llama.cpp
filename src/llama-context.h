@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
+#include "llama-mtp.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 
@@ -53,6 +54,10 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+    const llama_mtp_desc & mtp_desc() const;
+    bool mtp_is_enabled() const;
+    int32_t mtp_draft_batch(const llama_seq_id * seq_ids, const llama_token * tokens, const llama_pos * pos, uint32_t n_seq, llama_token * draft, uint32_t n_draft);
+    int32_t mtp_draft(llama_seq_id seq_id, llama_token token, llama_pos pos, llama_token * draft, uint32_t n_draft);
 
     ggml_backend_sched_t get_sched() const;
 
@@ -239,7 +244,10 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                        const float       * mtp_seed   = nullptr,
+                        const llama_token * mtp_tokens = nullptr,
+                          uint32_t          n_mtp      = 0) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -334,6 +342,8 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_mtp_state native_mtp;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

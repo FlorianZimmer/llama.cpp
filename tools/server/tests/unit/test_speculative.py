@@ -110,6 +110,54 @@ def test_with_ctx_shift():
     assert res.body["truncated"] == True
 
 
+def test_mtp_requires_native_model(tmp_path):
+    global server
+    server = ServerPreset.tinyllama2()
+    server.spec_type = "mtp"
+    server.log_path = str(tmp_path / "mtp-unsupported.log")
+
+    with pytest.raises(RuntimeError, match="Server process died"):
+        server.start()
+
+    with open(server.log_path, "r", encoding="utf-8") as f:
+        log_text = f.read()
+
+    assert "native MTP requested but the loaded model does not support it" in log_text
+
+
+def test_request_mtp_requires_native_runtime():
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "speculative.type": "mtp",
+    })
+
+    assert res.status_code == 400
+    assert "Requested speculative.type 'mtp'" in res.body["error"]["message"]
+    assert "only supports 'draft'" in res.body["error"]["message"]
+
+
+def test_request_can_disable_speculation():
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "speculative.type": "none",
+    })
+
+    assert res.status_code == 200
+    assert len(res.body["content"]) > 0
+
+
 @pytest.mark.parametrize("n_slots,n_requests", [
     (1, 2),
     (2, 2),

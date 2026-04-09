@@ -5269,13 +5269,80 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+class _Qwen3_5MTPBase(_LinearAttentionVReorderBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        mtp_layers = self.hparams.get("mtp_num_hidden_layers", 0)
+        self.hparams["num_nextn_predict_layers"] = mtp_layers
+
+        if mtp_layers > 0:
+            self.block_count = self.hparams["num_hidden_layers"] + mtp_layers
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        if (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+    def _modify_mtp_tensors(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
+        if nextn_layers <= 0:
+            return
+
+        base_layer = self.hparams["num_hidden_layers"]
+
+        match = re.match(r"mtp\.layers\.(\d+)\.(.+)", name)
+        if match:
+            mtp_bid = int(match.group(1))
+            if mtp_bid >= nextn_layers:
+                raise ValueError(f"Unexpected Qwen3.5 MTP layer index in tensor: {name}")
+
+            remapped = f"model.layers.{base_layer + mtp_bid}.{match.group(2)}"
+            yield from super().modify_tensors(data_torch, remapped, base_layer + mtp_bid)
+            return
+
+        remapped_shared = {
+            "mtp.fc.weight":                    gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+            "mtp.pre_fc_norm_embedding.weight": gguf.MODEL_TENSOR.NEXTN_ENORM,
+            "mtp.pre_fc_norm_hidden.weight":    gguf.MODEL_TENSOR.NEXTN_HNORM,
+            "mtp.norm.weight":                  gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+            "mtp.embed_tokens.weight":          gguf.MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+            "mtp.shared_head.head.weight":      gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+            "mtp.shared_head.norm.weight":      gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+        }
+
+        if name not in remapped_shared:
+            raise ValueError(f"Unexpected Qwen3.5 MTP tensor: {name}")
+
+        tensor_type = remapped_shared[name]
+        for bid in range(base_layer, self.block_count):
+            yield (self.format_tensor_name(tensor_type, bid, ".weight"), data_torch)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("model.visual.") or name.startswith("visual."):
+            return
+
+        if name.startswith("model.language_model."):
+            name = name.replace("model.language_model.", "model.", 1)
+        elif name.startswith("language_model."):
+            name = name.replace("language_model.", "", 1)
+
+        if name.startswith("mtp."):
+            yield from self._modify_mtp_tensors(data_torch, name)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
-class Qwen3_5TextModel(_LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen3_5MTPBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
+class Qwen3_5MoeTextModel(_Qwen3_5MTPBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 

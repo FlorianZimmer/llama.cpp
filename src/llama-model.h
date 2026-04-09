@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-mtp.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -577,6 +578,8 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+    llama_mtp_desc mtp;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -591,6 +594,8 @@ struct llama_model {
 
     std::string arch_name() const;
     std::string type_name() const;
+    const llama_mtp_desc & mtp_desc() const;
+    bool mtp_is_supported() const;
 
     std::string desc() const;
 

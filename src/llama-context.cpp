@@ -5,8 +5,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
+#include "llama-mtp.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
@@ -215,6 +221,15 @@ llama_context::llama_context(
     if (cparams.n_ctx_seq > hparams.n_ctx_train) {
         LLAMA_LOG_WARN("%s: n_ctx_seq (%u) > n_ctx_train (%u) -- possible training context overflow\n",
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+    }
+
+    native_mtp.desc = model.mtp_desc();
+    native_mtp.reserve(hparams.n_embd);
+
+    LLAMA_LOG_INFO("%s: native_mtp    = %s\n", __func__, native_mtp.enabled() ? "enabled" : "disabled");
+    if (native_mtp.desc.n_predict > 0) {
+        LLAMA_LOG_INFO("%s: native_mtp_layers = %u\n", __func__, native_mtp.desc.n_predict);
+        LLAMA_LOG_INFO("%s: native_mtp_dedicated_embeddings = %s\n", __func__, native_mtp.desc.dedicated_embeddings ? "true" : "false");
     }
 
     if (!hparams.vocab_only) {
@@ -669,6 +684,143 @@ const llama_model & llama_context::get_model() const {
 
 const llama_cparams & llama_context::get_cparams() const {
     return cparams;
+}
+
+const llama_mtp_desc & llama_context::mtp_desc() const {
+    return native_mtp.desc;
+}
+
+bool llama_context::mtp_is_enabled() const {
+    return native_mtp.enabled();
+}
+
+int32_t llama_context::mtp_draft_batch(
+        const llama_seq_id * seq_ids,
+        const llama_token  * tokens,
+        const llama_pos    * pos,
+               uint32_t      n_seq,
+               llama_token * draft,
+               uint32_t      n_draft) {
+    if (!native_mtp.enabled() || seq_ids == nullptr || tokens == nullptr || pos == nullptr || draft == nullptr || n_seq == 0 || n_draft == 0) {
+        return 0;
+    }
+
+    // Finish the verifier decode and seed copy before reusing the scheduler for MTP.
+    synchronize();
+
+    const size_t seed_size = (size_t) model.hparams.n_embd * n_seq;
+    native_mtp.seed_embd.resize(seed_size);
+
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        auto it = native_mtp.seed_by_seq.find(seq_ids[i]);
+        if (it == native_mtp.seed_by_seq.end() || it->second.empty()) {
+            return 0;
+        }
+
+        GGML_ASSERT(it->second.size() == (size_t) model.hparams.n_embd);
+        std::memcpy(
+                native_mtp.seed_embd.data() + (size_t) i * model.hparams.n_embd,
+                it->second.data(),
+                sizeof(float) * model.hparams.n_embd);
+    }
+
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(1, n_seq);
+    std::vector<llama_seq_id> mtp_seq_ids(n_seq);
+    std::vector<bool> seq_id_used(LLAMA_MAX_SEQ, false);
+
+    std::fill(ubatch.seq_idx, ubatch.seq_idx + LLAMA_MAX_SEQ, -1);
+
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        GGML_ASSERT(0 <= seq_ids[i] && seq_ids[i] < LLAMA_MAX_SEQ);
+        seq_id_used[seq_ids[i]] = true;
+    }
+
+    int32_t seq_id_next = LLAMA_MAX_SEQ - 1;
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        while (seq_id_next >= 0 && seq_id_used[seq_id_next]) {
+            --seq_id_next;
+        }
+        if (seq_id_next < 0) {
+            return 0;
+        }
+
+        mtp_seq_ids[i] = seq_id_next;
+        seq_id_used[seq_id_next] = true;
+        --seq_id_next;
+
+        ubatch.token[i] = tokens[i];
+        for (uint32_t j = 0; j < ubatch.n_pos; ++j) {
+            ubatch.pos[i * ubatch.n_pos + j] = pos[i];
+        }
+
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &mtp_seq_ids[i];
+        ubatch.seq_id_unq[i] = mtp_seq_ids[i];
+        ubatch.seq_idx[mtp_seq_ids[i]] = i;
+        ubatch.output[i] = true;
+    }
+
+    const uint32_t n_outputs_save = n_outputs;
+    n_outputs = n_seq;
+
+    auto * res = gf_res_prev.get();
+    const auto gparams = graph_params(
+            gf_res_prev.get(),
+            ubatch,
+            nullptr,
+            LLM_GRAPH_TYPE_MTP,
+            native_mtp.seed_embd.data(),
+            tokens,
+            n_seq);
+
+    ggml_status status;
+    if (graph_reuse_disable || !res->can_reuse(gparams)) {
+        gf_res_prev->reset();
+
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        ggml_cgraph * gf = model.build_graph(gparams);
+        if (gf == nullptr || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            n_outputs = n_outputs_save;
+            return 0;
+        }
+    }
+
+    gf_res_prev->set_inputs(&ubatch);
+
+    status = graph_compute(gf_res_prev->get_gf(), false);
+    n_outputs = n_outputs_save;
+
+    if (status != GGML_STATUS_SUCCESS) {
+        return 0;
+    }
+
+    auto * t_mtp_tokens = gf_res_prev->get_mtp_tokens();
+    if (t_mtp_tokens == nullptr) {
+        return 0;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_tokens);
+    GGML_ASSERT(backend != nullptr);
+
+    ggml_backend_tensor_get_async(backend, t_mtp_tokens, draft, 0, sizeof(*draft) * n_seq);
+    synchronize();
+
+    const uint32_t n_mtp = std::min<uint32_t>(n_draft, native_mtp.desc.n_draft);
+
+    if (auto * mem = get_memory()) {
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            llama_memory_seq_rm(mem, mtp_seq_ids[i], -1, -1);
+        }
+    }
+
+    return n_mtp;
+}
+
+int32_t llama_context::mtp_draft(llama_seq_id seq_id, llama_token token, llama_pos pos, llama_token * draft, uint32_t n_draft) {
+    return mtp_draft_batch(&seq_id, &token, &pos, 1, draft, n_draft);
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {
@@ -1513,6 +1665,28 @@ static void copy_tensor_async_candidates(
     }
 }
 
+static void copy_tensor_async_rows(
+        ggml_tensor * tensor,
+        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+        std::map<llama_seq_id, std::vector<float>> & dst,
+        ggml_backend_sched_t sched) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+    GGML_ASSERT(backend != nullptr);
+
+    const size_t row_size = ggml_nbytes(tensor) / tensor->ne[1];
+    const size_t n_floats = row_size / sizeof(float);
+
+    for (const auto & [seq_id, row] : seq_to_row) {
+        auto & seed = dst[seq_id];
+        seed.resize(n_floats);
+        ggml_backend_tensor_get_async(backend, tensor, seed.data(), row * tensor->nb[1], row_size);
+    }
+}
+
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
@@ -1727,11 +1901,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
-        auto * t_logits = res->get_logits();
-        auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+        auto * t_logits    = res->get_logits();
+        auto * t_embd_raw  = res->get_embd();
+        auto * t_embd_user = cparams.embeddings ? t_embd_raw : nullptr;
 
-        if (t_embd && res->get_embd_pooled()) {
-            t_embd = res->get_embd_pooled();
+        if (t_embd_user && res->get_embd_pooled()) {
+            t_embd_user = res->get_embd_pooled();
         }
 
         // extract logits
@@ -1750,8 +1925,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        if (embd.data && t_embd_user && n_outputs > 0) {
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_user);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -1765,7 +1940,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd_user, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
@@ -1784,7 +1959,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_embd_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd_user, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_RANK:
@@ -1799,7 +1974,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_cls_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd_user, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
@@ -1807,6 +1982,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         GGML_ABORT("unknown pooling type");
                     }
             }
+        }
+
+        if (native_mtp.enabled() && t_embd_raw && n_outputs > 0) {
+            const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
+            copy_tensor_async_rows(t_embd_raw, seq_to_output_row, native_mtp.seed_by_seq, sched.get());
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -2149,7 +2329,10 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                        const float       * mtp_seed,
+                        const llama_token * mtp_tokens,
+                          uint32_t          n_mtp) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2162,6 +2345,9 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.mtp_seed    =*/ mtp_seed,
+        /*.mtp_tokens  =*/ mtp_tokens,
+        /*.n_mtp       =*/ n_mtp,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3289,6 +3475,86 @@ void llama_memory_seq_div(
     mem->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_memory_seq_rm_attn(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return kv_iswa->seq_rm(seq_id, p0, p1);
+    }
+
+    return false;
+}
+
+bool llama_memory_seq_rm_recr(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_recr()->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_recr()->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * recr = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return recr->seq_rm(seq_id, p0, p1);
+    }
+
+    return false;
+}
+
+bool llama_memory_seq_cp_recr(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hybrid->get_mem_recr()->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return true;
+    }
+
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        hybrid_iswa->get_mem_recr()->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return true;
+    }
+
+    if (auto * recr = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return true;
+    }
+
+    return false;
+}
+
 llama_pos llama_memory_seq_pos_min(
         llama_memory_t mem,
           llama_seq_id seq_id) {
@@ -3457,6 +3723,27 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_native_mtp_draft_batch(
+        llama_context * ctx,
+  const llama_seq_id * seq_ids,
+  const llama_token  * tokens,
+  const llama_pos    * pos,
+         uint32_t      n_seq,
+         llama_token * draft,
+         uint32_t      n_draft) {
+    return ctx->mtp_draft_batch(seq_ids, tokens, pos, n_seq, draft, n_draft);
+}
+
+int32_t llama_native_mtp_draft(
+        llama_context * ctx,
+                llama_seq_id seq_id,
+                llama_token  token,
+                llama_pos    pos,
+                llama_token * draft,
+                   uint32_t  n_draft) {
+    return ctx->mtp_draft(seq_id, token, pos, draft, n_draft);
 }
 
 //

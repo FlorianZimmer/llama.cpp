@@ -10,6 +10,18 @@
 
 using json = nlohmann::ordered_json;
 
+static common_speculative_type server_default_speculative_type(const common_params_speculative & params) {
+    if (params.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        return params.type;
+    }
+
+    if (params.has_dft()) {
+        return COMMON_SPECULATIVE_TYPE_DRAFT;
+    }
+
+    return COMMON_SPECULATIVE_TYPE_NONE;
+}
+
 //
 // task_params
 //
@@ -247,6 +259,7 @@ task_params server_task::params_from_json_cmpl(
     task_params defaults;
     defaults.sampling      = params_base.sampling;
     defaults.speculative   = params_base.speculative;
+    defaults.speculative.type = server_default_speculative_type(defaults.speculative);
     defaults.n_keep        = params_base.n_keep;
     defaults.n_predict     = params_base.n_predict;
     defaults.n_cache_reuse = params_base.n_cache_reuse;

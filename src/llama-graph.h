@@ -31,6 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -195,6 +196,44 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+class llm_graph_input_mtp_seed : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_seed(uint32_t n_embd, uint32_t n_mtp, const float * seed) :
+        n_embd(n_embd),
+        n_mtp(n_mtp),
+        seed(seed) {
+    }
+    ~llm_graph_input_mtp_seed() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * t_seed = nullptr; // F32 [n_embd, n_mtp]
+
+    const uint32_t n_embd;
+    uint32_t n_mtp;
+    const float * seed;
+};
+
+class llm_graph_input_mtp_tokens : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_tokens(uint32_t n_mtp, const llama_token * tokens) :
+        n_mtp(n_mtp),
+        tokens(tokens) {
+    }
+    ~llm_graph_input_mtp_tokens() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * t_tokens = nullptr; // I32 [n_mtp]
+
+    uint32_t n_mtp;
+    const llama_token * tokens;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -509,6 +548,10 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const float       * mtp_seed   = nullptr;
+    const llama_token * mtp_tokens = nullptr;
+    uint32_t            n_mtp      = 0;
 };
 
 //
@@ -543,6 +586,9 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const float                  * mtp_seed;
+    const llama_token            * mtp_tokens;
+    uint32_t                       n_mtp;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -608,6 +654,18 @@ struct llm_graph_params {
             return false;
         }
 
+        if (n_mtp != other.n_mtp) {
+            return false;
+        }
+
+        if ((mtp_seed == nullptr) != (other.mtp_seed == nullptr)) {
+            return false;
+        }
+
+        if ((mtp_tokens == nullptr) != (other.mtp_tokens == nullptr)) {
+            return false;
+        }
+
         if (samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
                 return false;
@@ -643,6 +701,8 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_mtp_logits()  const { return t_mtp_logits; }
+    ggml_tensor * get_mtp_tokens()  const { return t_mtp_tokens; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -671,6 +731,8 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_mtp_logits  = nullptr;
+    ggml_tensor * t_mtp_tokens  = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -751,6 +813,9 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const float                  * mtp_seed;
+    const llama_token            * mtp_tokens;
+    const uint32_t                 n_mtp;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -863,6 +928,8 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+    ggml_tensor * build_inp_mtp_seed() const;
+    ggml_tensor * build_inp_mtp_tokens() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

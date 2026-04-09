@@ -26,6 +26,7 @@ add_library(llama
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
+            llama-mtp.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp

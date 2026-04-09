@@ -18,6 +18,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -31,6 +32,23 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static common_speculative_type server_runtime_speculative_type(const common_params_speculative & params) {
+    if (params.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        return params.type;
+    }
+
+    if (params.has_dft()) {
+        return COMMON_SPECULATIVE_TYPE_DRAFT;
+    }
+
+    return COMMON_SPECULATIVE_TYPE_NONE;
+}
+
+static bool server_native_mtp_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_SERVER_MTP_PROFILE") != nullptr;
+    return enabled;
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -48,6 +66,20 @@ enum server_state {
 };
 
 struct server_slot {
+    struct native_mtp_profile_data {
+        int32_t n_draft_calls = 0;
+        int32_t n_snapshot = 0;
+        int32_t n_accept = 0;
+        int32_t n_restore = 0;
+        int32_t n_replay = 0;
+
+        int64_t t_draft_us = 0;
+        int64_t t_snapshot_us = 0;
+        int64_t t_accept_us = 0;
+        int64_t t_restore_us = 0;
+        int64_t t_replay_us = 0;
+    };
+
     int id;
 
     // TODO: change to unique_ptrs for consistency:
@@ -57,6 +89,9 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     common_speculative * spec = nullptr;
+    common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    bool native_mtp = false;
+    int32_t native_mtp_max = 0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -135,7 +170,13 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        if (native_mtp_backup_id >= 0) {
+            llama_memory_seq_rm_recr(llama_get_memory(ctx), native_mtp_backup_id, -1, -1);
+        }
         prompt.tokens.clear();
+        native_mtp_state.clear();
+        native_mtp_state_flags = 0;
+        native_mtp_profile = {};
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -148,6 +189,10 @@ struct server_slot {
 
     llama_token  sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
+    std::vector<uint8_t> native_mtp_state;
+    llama_state_seq_flags native_mtp_state_flags = 0;
+    llama_seq_id native_mtp_backup_id = -1;
+    native_mtp_profile_data native_mtp_profile;
 
     // stats
     size_t n_sent_text = 0; // number of sent text character
@@ -179,6 +224,9 @@ struct server_slot {
 
         drafted.clear();
         i_batch_dft.clear();
+        native_mtp_state.clear();
+        native_mtp_state_flags = 0;
+        native_mtp_profile = {};
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -258,8 +306,71 @@ struct server_slot {
         return state != SLOT_STATE_IDLE;
     }
 
+    common_speculative_type runtime_spec_type() const {
+        if (native_mtp) {
+            return COMMON_SPECULATIVE_TYPE_MTP;
+        }
+
+        if (spec != nullptr) {
+            return spec_type;
+        }
+
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+
+    bool has_spec_runtime(common_speculative_type type) const {
+        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+            return true;
+        }
+
+        return runtime_spec_type() == type;
+    }
+
     bool can_speculate() const {
-        return !!spec;
+        if (task) {
+            return task->params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+                has_spec_runtime(task->params.speculative.type);
+        }
+
+        return runtime_spec_type() != COMMON_SPECULATIVE_TYPE_NONE;
+    }
+
+    bool uses_sidecar_speculation() const {
+        GGML_ASSERT(task);
+
+        return spec != nullptr && task->params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+            has_spec_runtime(task->params.speculative.type);
+    }
+
+    bool uses_native_mtp() const {
+        GGML_ASSERT(task);
+
+        return native_mtp && task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+    }
+
+    bool uses_native_mtp_recurrent_backup() const {
+        return uses_native_mtp() && native_mtp_backup_id >= 0;
+    }
+
+    bool save_native_mtp_state(llama_state_seq_flags flags) {
+        native_mtp_state.clear();
+        native_mtp_state_flags = flags;
+
+        const size_t state_size = llama_state_seq_get_size_ext(ctx, id, flags);
+        if (state_size == 0) {
+            return false;
+        }
+
+        native_mtp_state.resize(state_size);
+        return llama_state_seq_get_data_ext(ctx, native_mtp_state.data(), native_mtp_state.size(), id, flags) == state_size;
+    }
+
+    bool restore_native_mtp_state() {
+        if (native_mtp_state.empty()) {
+            return false;
+        }
+
+        return llama_state_seq_set_data_ext(ctx, native_mtp_state.data(), native_mtp_state.size(), id, native_mtp_state_flags) == native_mtp_state.size();
     }
 
     void add_token(const completion_token_output & token) {
@@ -280,6 +391,10 @@ struct server_slot {
 
         // determine the max draft that fits the current slot state
         int n_draft_max = task->params.speculative.n_max;
+
+        if (uses_native_mtp()) {
+            n_draft_max = std::min(n_draft_max, native_mtp_max);
+        }
 
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -397,6 +512,31 @@ struct server_slot {
                     "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
                     draft_ratio, n_draft_accepted, n_draft_total
             );
+        }
+
+        if (server_native_mtp_profile_enabled() && native_mtp && n_draft_total > 0) {
+            const auto to_ms = [](int64_t us) { return us / 1000.0; };
+            const int64_t t_native_total_us =
+                    native_mtp_profile.t_draft_us +
+                    native_mtp_profile.t_snapshot_us +
+                    native_mtp_profile.t_accept_us +
+                    native_mtp_profile.t_restore_us +
+                    native_mtp_profile.t_replay_us;
+
+            SLT_INF(*this,
+                    "native MTP profile:"
+                    " draft=%8.3f ms (%d calls),"
+                    " snapshot=%8.3f ms (%d saves),"
+                    " accept=%8.3f ms (%d accepts),"
+                    " restore=%8.3f ms (%d restores),"
+                    " replay=%8.3f ms (%d replays),"
+                    " total=%8.3f ms\n",
+                    to_ms(native_mtp_profile.t_draft_us),    native_mtp_profile.n_draft_calls,
+                    to_ms(native_mtp_profile.t_snapshot_us), native_mtp_profile.n_snapshot,
+                    to_ms(native_mtp_profile.t_accept_us),   native_mtp_profile.n_accept,
+                    to_ms(native_mtp_profile.t_restore_us),  native_mtp_profile.n_restore,
+                    to_ms(native_mtp_profile.t_replay_us),   native_mtp_profile.n_replay,
+                    to_ms(t_native_total_us));
         }
 
         common_speculative_print_stats(spec);
@@ -767,8 +907,17 @@ private:
 
         slots.clear();
 
-        const bool can_spec = common_speculative_is_compat(ctx);
-        if (!can_spec) {
+        const bool wants_native_mtp = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+        const common_speculative_type runtime_spec_type = server_runtime_speculative_type(params_base.speculative);
+        const bool can_spec_native = wants_native_mtp && llama_model_has_native_mtp(model);
+        const bool can_spec_sidecar = !wants_native_mtp && common_speculative_is_compat(ctx);
+
+        if (wants_native_mtp && !can_spec_native) {
+            SRV_ERR("%s", "native MTP requested but the loaded model does not support it\n");
+            return false;
+        }
+
+        if (!wants_native_mtp && !can_spec_sidecar) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
@@ -784,9 +933,10 @@ private:
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             // try speculative decoding
-            if (can_spec) {
+            if (can_spec_sidecar) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
+                    slot.spec_type = runtime_spec_type;
                     if (mctx) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                         return false;
@@ -795,6 +945,18 @@ private:
                 } else {
                     SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
                 }
+            } else if (can_spec_native) {
+                if (mctx) {
+                    SRV_ERR("%s\n", "native MTP is not supported with multimodal");
+                    return false;
+                }
+
+                slot.native_mtp = true;
+                slot.native_mtp_max = std::min<int32_t>(1, (int32_t) llama_model_n_native_mtp_predict(model));
+                if (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)) {
+                    slot.native_mtp_backup_id = (llama_seq_id) (llama_n_seq_max(ctx) + i);
+                }
+                SLT_INF(slot, "native MTP context initialized, max draft = %d\n", slot.native_mtp_max);
             }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
@@ -815,6 +977,10 @@ private:
             if (slots_debug) {
                 SRV_WRN("slots debug = %d\n", slots_debug);
             }
+        }
+
+        if (server_native_mtp_profile_enabled()) {
+            SRV_WRN("%s", "native MTP profiling enabled\n");
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -1178,6 +1344,25 @@ private:
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
+        const common_speculative_type requested_spec_type = task.params.speculative.type;
+        const common_speculative_type runtime_spec_type = slot.runtime_spec_type();
+
+        if (requested_spec_type == COMMON_SPECULATIVE_TYPE_COUNT) {
+            send_error(task, "Invalid speculative.type value", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        if (requested_spec_type != COMMON_SPECULATIVE_TYPE_NONE && requested_spec_type != runtime_spec_type) {
+            const std::string err_msg = runtime_spec_type == COMMON_SPECULATIVE_TYPE_NONE
+                ? string_format("Requested speculative.type '%s', but the server slot was initialized without speculative decoding",
+                        common_speculative_type_to_str(requested_spec_type).c_str())
+                : string_format("Requested speculative.type '%s', but the server slot only supports '%s'",
+                        common_speculative_type_to_str(requested_spec_type).c_str(),
+                        common_speculative_type_to_str(runtime_spec_type).c_str());
+            send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // initialize samplers
         if (task.need_sampling()) {
             try {
@@ -1191,11 +1376,14 @@ private:
             const bool need_logits = task.params.sampling.n_probs > 0;
 
             bool backend_sampling = true;
+            const bool use_speculation =
+                requested_spec_type != COMMON_SPECULATIVE_TYPE_NONE &&
+                task.params.speculative.n_max > 0;
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.spec && task.params.speculative.n_max > 0);
+            backend_sampling &= !use_speculation;
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
@@ -2080,6 +2268,69 @@ private:
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
 
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                slot_batched = &slot;
+                break;
+            }
+        }
+
+        std::unordered_map<int, llama_tokens> native_mtp_drafts;
+
+        if (slot_batched != nullptr && !mctx) {
+            std::vector<server_slot *> mtp_slots;
+            std::vector<llama_seq_id> mtp_seq_ids;
+            std::vector<llama_token>  mtp_tokens;
+            std::vector<llama_pos>    mtp_pos;
+
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING) {
+                    continue;
+                }
+                if (!slot_batched->can_batch_with(slot)) {
+                    continue;
+                }
+
+                const int n_draft_max = slot.get_n_draft_max();
+                if (!slot.uses_native_mtp() || n_draft_max <= 0) {
+                    continue;
+                }
+
+                mtp_slots.push_back(&slot);
+                mtp_seq_ids.push_back(slot.id);
+                mtp_tokens.push_back(slot.sampled);
+                mtp_pos.push_back(slot.prompt.tokens.pos_next());
+            }
+
+            if (!mtp_slots.empty()) {
+                llama_tokens mtp_batch_draft(mtp_slots.size());
+
+                common_set_adapter_lora(ctx, slot_batched->lora);
+
+                const int64_t t_mtp_draft_start = ggml_time_us();
+                const int32_t n_mtp = llama_native_mtp_draft_batch(
+                        ctx,
+                        mtp_seq_ids.data(),
+                        mtp_tokens.data(),
+                        mtp_pos.data(),
+                        mtp_slots.size(),
+                        mtp_batch_draft.data(),
+                        1);
+                const int64_t t_mtp_draft_us = ggml_time_us() - t_mtp_draft_start;
+
+                for (auto * mtp_slot : mtp_slots) {
+                    mtp_slot->native_mtp_profile.n_draft_calls += 1;
+                    mtp_slot->native_mtp_profile.t_draft_us += t_mtp_draft_us / (int64_t) mtp_slots.size();
+                }
+
+                if (n_mtp > 0) {
+                    for (size_t i = 0; i < mtp_slots.size(); ++i) {
+                        native_mtp_drafts[mtp_slots[i]->id] = { mtp_batch_draft[i] };
+                    }
+                }
+            }
+        }
+
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
@@ -2092,9 +2343,7 @@ private:
             }
 
             // check if we can batch this slot with the previous one
-            if (!slot_batched) {
-                slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
+            if (slot_batched && !slot_batched->can_batch_with(slot)) {
                 continue;
             }
 
@@ -2108,15 +2357,61 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-
                 const auto & params_spec = slot.task->params.speculative;
 
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                llama_tokens draft;
+                if (slot.uses_native_mtp()) {
+                    auto it_draft = native_mtp_drafts.find(slot.id);
+                    if (it_draft != native_mtp_drafts.end()) {
+                        draft = it_draft->second;
+                    } else {
+                        draft.resize((size_t) std::min(1, n_draft_max));
+
+                        const int64_t t_mtp_draft_start = ggml_time_us();
+                        const int32_t n_mtp = llama_native_mtp_draft(
+                                slot.ctx,
+                                slot.id,
+                                slot.sampled,
+                                slot.prompt.tokens.pos_next(),
+                                draft.data(),
+                                draft.size());
+                        slot.native_mtp_profile.n_draft_calls += 1;
+                        slot.native_mtp_profile.t_draft_us += ggml_time_us() - t_mtp_draft_start;
+
+                        if (n_mtp > 0) {
+                            draft.resize((size_t) n_mtp);
+                        } else {
+                            draft.clear();
+                        }
+                    }
+                } else {
+                    const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                    draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                }
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
+                }
+
+                const bool use_recurrent_backup = slot.uses_native_mtp_recurrent_backup();
+                const llama_state_seq_flags native_mtp_state_flags =
+                    slot.uses_native_mtp() && !use_recurrent_backup && llama_model_is_hybrid(llama_get_model(slot.ctx))
+                        ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+                        : 0;
+
+                if (slot.uses_native_mtp() && !draft.empty()) {
+                    const int64_t t_snapshot_start = ggml_time_us();
+                    const bool saved = use_recurrent_backup
+                            ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.id, slot.native_mtp_backup_id, -1, -1)
+                            : slot.save_native_mtp_state(native_mtp_state_flags);
+                    slot.native_mtp_profile.n_snapshot += 1;
+                    slot.native_mtp_profile.t_snapshot_us += ggml_time_us() - t_snapshot_start;
+
+                    if (!saved) {
+                        SLT_WRN(slot, "%s", "failed to snapshot native MTP state, disabling draft for this step\n");
+                        draft.clear();
+                    }
                 }
 
                 // add the sampled token to the batch
@@ -2724,6 +3019,55 @@ private:
 
         int32_t i_next = 0;
 
+        struct speculative_accept_result {
+            server_slot * slot = nullptr;
+            size_t n_draft = 0;
+            size_t n_prompt_base = 0;
+            bool needs_native_replay = false;
+            llama_tokens drafted;
+            std::vector<llama_token> ids;
+            int64_t t_current = 0;
+        };
+
+        struct native_replay_entry {
+            server_slot * slot = nullptr;
+            size_t n_prompt_base = 0;
+        };
+
+        auto replay_native_mtp_prefix_batch = [&](const std::vector<native_replay_entry> & replay_slots) {
+            size_t n_replay_total = 0;
+            for (const auto & replay_slot : replay_slots) {
+                GGML_ASSERT(replay_slot.slot != nullptr);
+                GGML_ASSERT((size_t) replay_slot.slot->prompt.n_tokens() >= replay_slot.n_prompt_base);
+                n_replay_total += replay_slot.slot->prompt.n_tokens() - replay_slot.n_prompt_base;
+            }
+
+            if (n_replay_total == 0) {
+                return true;
+            }
+
+            llama_batch replay = llama_batch_init((int32_t) n_replay_total, 0, 1);
+            common_batch_clear(replay);
+
+            for (const auto & replay_slot : replay_slots) {
+                auto & slot = *replay_slot.slot;
+                const size_t n_replay = slot.prompt.n_tokens() - replay_slot.n_prompt_base;
+                const llama_pos pos_base = slot.prompt.tokens.pos_next(replay_slot.n_prompt_base);
+
+                for (size_t j = 0; j < n_replay; ++j) {
+                    common_batch_add(replay, slot.prompt.tokens[replay_slot.n_prompt_base + j], pos_base + j, { slot.id }, j + 1 == n_replay);
+                }
+            }
+
+            common_set_adapter_lora(ctx, replay_slots.front().slot->lora);
+            llama_set_embeddings(ctx, false);
+
+            const int ret = llama_decode(ctx, replay);
+            llama_batch_free(replay);
+
+            return ret == 0;
+        };
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -2853,7 +3197,7 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
-                    if (slot.can_speculate()) {
+                    if (slot.uses_sidecar_speculation()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -2906,43 +3250,139 @@ private:
             }
 
             // speculative decoding - main model sample and accept
+            std::vector<speculative_accept_result> speculative_results;
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || slot.i_batch_dft.empty()) {
                     continue;
                 }
 
-                const size_t n_draft = slot.drafted.size();
+                speculative_accept_result result;
+                result.slot      = &slot;
+                result.n_draft   = slot.drafted.size();
+                result.drafted   = slot.drafted;
+                const int64_t t_accept_start = ggml_time_us();
+                result.ids       = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                if (slot.uses_native_mtp()) {
+                    slot.native_mtp_profile.n_accept += 1;
+                    slot.native_mtp_profile.t_accept_us += ggml_time_us() - t_accept_start;
+                }
+                result.t_current = ggml_time_us();
 
-                // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
-                const int64_t t_current = ggml_time_us();
+                speculative_results.push_back(std::move(result));
+            }
 
-                slot.n_decoded += ids.size();
-
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+            bool any_native_replay = false;
+            for (auto & spec_result : speculative_results) {
+                auto & slot = *spec_result.slot;
+                const size_t n_accepted_draft = spec_result.ids.size() - 1;
+                spec_result.n_prompt_base = slot.prompt.n_tokens() - spec_result.n_draft - 1;
+                spec_result.needs_native_replay = slot.uses_native_mtp() && n_accepted_draft < spec_result.n_draft;
+                any_native_replay = any_native_replay || spec_result.needs_native_replay;
 
                 // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
+                slot.n_draft_accepted += spec_result.ids.size() - 1;
 
                 // inform the speculative decoding about the number of accepted tokens
-                common_speculative_accept(slot.spec, ids.size() - 1);
+                if (slot.uses_sidecar_speculation()) {
+                    common_speculative_accept(slot.spec, spec_result.ids.size() - 1);
+                }
 
                 // rollback to the state before sampling the draft tokens
-                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - spec_result.n_draft);
 
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
-                slot.sampled = ids.back(); // last accepted token
+                slot.prompt.tokens.insert({spec_result.ids.begin(), spec_result.ids.end() - 1});
+                slot.sampled = spec_result.ids.back(); // last accepted token
+            }
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+            std::vector<native_replay_entry> native_replay_slots;
+            if (any_native_replay) {
+                for (auto & spec_result : speculative_results) {
+                    if (spec_result.slot == nullptr || !spec_result.slot->uses_native_mtp()) {
+                        continue;
+                    }
 
-                for (size_t i = 0; i < ids.size(); ++i) {
+                    auto & slot = *spec_result.slot;
+                    const bool use_recurrent_backup = slot.uses_native_mtp_recurrent_backup();
+                    const bool has_partial_state = use_recurrent_backup || (slot.native_mtp_state_flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+                    const int64_t t_restore_start = ggml_time_us();
+                    const bool restore_ok =
+                        (!has_partial_state || llama_memory_seq_rm_attn(llama_get_memory(ctx), slot.id, spec_result.n_prompt_base, -1)) &&
+                        (use_recurrent_backup
+                            ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.native_mtp_backup_id, slot.id, -1, -1)
+                            : slot.restore_native_mtp_state());
+                    slot.native_mtp_profile.n_restore += 1;
+                    slot.native_mtp_profile.t_restore_us += ggml_time_us() - t_restore_start;
+
+                    if (!restore_ok) {
+                        send_error(slot, "failed to restore native MTP state", ERROR_TYPE_SERVER);
+                        slot.release();
+                        slot.prompt_clear(false);
+                        spec_result.slot = nullptr;
+                        continue;
+                    }
+
+                    native_replay_slots.push_back(native_replay_entry{ &slot, spec_result.n_prompt_base });
+                }
+            }
+
+            for (auto & spec_result : speculative_results) {
+                if (spec_result.slot == nullptr) {
+                    continue;
+                }
+
+                auto & slot = *spec_result.slot;
+                if (!slot.uses_native_mtp() || !any_native_replay) {
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                }
+
+                slot.native_mtp_state.clear();
+            }
+
+            if (!native_replay_slots.empty()) {
+                const int64_t t_replay_start = ggml_time_us();
+                const bool replay_ok = replay_native_mtp_prefix_batch(native_replay_slots);
+                const int64_t t_replay_us = ggml_time_us() - t_replay_start;
+
+                for (const auto & replay_slot : native_replay_slots) {
+                    replay_slot.slot->native_mtp_profile.n_replay += 1;
+                    replay_slot.slot->native_mtp_profile.t_replay_us += t_replay_us / (int64_t) native_replay_slots.size();
+                }
+
+                if (!replay_ok) {
+                    for (const auto & replay_slot : native_replay_slots) {
+                        auto & slot = *replay_slot.slot;
+                        send_error(slot, "failed to replay native MTP state", ERROR_TYPE_SERVER);
+                        slot.release();
+                        slot.prompt_clear(false);
+                    }
+                }
+            }
+
+            for (auto & spec_result : speculative_results) {
+                if (spec_result.slot == nullptr || !spec_result.slot->is_processing()) {
+                    continue;
+                }
+
+                auto & slot = *spec_result.slot;
+                if (slot.n_decoded == 0) {
+                    slot.t_start_generation = spec_result.t_current;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    metrics.on_prompt_eval(slot);
+                } else {
+                    slot.t_token_generation = std::max<int64_t>(1, spec_result.t_current - slot.t_start_generation) / 1e3;
+                }
+
+                for (size_t j = 0; j < spec_result.ids.size(); ++j) {
+                    slot.n_decoded += 1;
+                    slot.t_token_generation = std::max<int64_t>(1, ggml_time_us() - slot.t_start_generation) / 1e3;
+
                     completion_token_output result;
 
-                    result.tok          = ids[i];
+                    result.tok          = spec_result.ids[j];
                     result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
                     result.prob         = 1.0f; // set later
 
@@ -2958,7 +3398,7 @@ private:
                     }
                 }
 
-                SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+                SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) spec_result.ids.size() - 1, (int) spec_result.n_draft, slot.prompt.n_tokens());
             }
         }
 

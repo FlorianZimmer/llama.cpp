@@ -203,6 +203,36 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_seed::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (t_seed && seed && n_mtp > 0) {
+        ggml_backend_tensor_set(t_seed, seed, 0, (size_t) n_embd*n_mtp*ggml_element_size(t_seed));
+    }
+}
+
+bool llm_graph_input_mtp_seed::can_reuse(const llm_graph_params & params) {
+    seed  = params.mtp_seed;
+    n_mtp = params.n_mtp;
+
+    return t_seed->ne[0] == n_embd && t_seed->ne[1] == params.n_mtp;
+}
+
+void llm_graph_input_mtp_tokens::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (t_tokens && tokens && n_mtp > 0) {
+        ggml_backend_tensor_set(t_tokens, tokens, 0, (size_t) n_mtp*ggml_element_size(t_tokens));
+    }
+}
+
+bool llm_graph_input_mtp_tokens::can_reuse(const llm_graph_params & params) {
+    tokens = params.mtp_tokens;
+    n_mtp  = params.n_mtp;
+
+    return t_tokens->ne[0] == params.n_mtp;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -804,6 +834,8 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_mtp_logits  = nullptr;
+    t_mtp_tokens  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -841,6 +873,12 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_mtp_logits != nullptr) {
+        ggml_set_output(t_mtp_logits);
+    }
+    if (t_mtp_tokens != nullptr) {
+        ggml_set_output(t_mtp_tokens);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -945,6 +983,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_seed         (params.mtp_seed),
+    mtp_tokens       (params.mtp_tokens),
+    n_mtp            (params.n_mtp),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1749,6 +1790,34 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_seed() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_seed>(n_embd, n_mtp, mtp_seed);
+
+    auto & cur = inp->t_seed;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_mtp);
+    ggml_set_input(cur);
+    ggml_set_name(cur, "mtp_seed");
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_tokens() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_tokens>(n_mtp, mtp_tokens);
+
+    auto & cur = inp->t_tokens;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_mtp);
+    ggml_set_input(cur);
+    ggml_set_name(cur, "mtp_tokens");
 
     res->add_input(std::move(inp));
 

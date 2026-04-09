@@ -642,6 +642,12 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Returns true if the model exposes a native multi-token prediction (MTP / NextN) head.
+    LLAMA_API bool llama_model_has_native_mtp(const struct llama_model * model);
+
+    // Returns the model-native MTP predictor layer count from the model metadata.
+    LLAMA_API uint32_t llama_model_n_native_mtp_predict(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -762,6 +768,31 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1,
                        int d);
+
+    // Removes tokens from the attention-only portion of memory when supported.
+    // Returns false if the memory type does not expose a separate attention component.
+    LLAMA_API bool llama_memory_seq_rm_attn(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Removes tokens from the recurrent-only portion of memory when supported.
+    // Returns false if the memory type does not expose a separate recurrent component.
+    LLAMA_API bool llama_memory_seq_rm_recr(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Copies tokens between the recurrent-only portion of memory when supported.
+    // Returns false if the memory type does not expose a separate recurrent component.
+    LLAMA_API bool llama_memory_seq_cp_recr(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
 
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
@@ -960,6 +991,29 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Draft continuation token(s) with the model's native MTP head using the latest verifier hidden state
+    // for the specified sequence and the accepted token at `pos`. Returns the number of drafted tokens.
+    // Current implementation is LM-only and drafts at most one continuation token.
+    LLAMA_API int32_t llama_native_mtp_draft_batch(
+            struct llama_context * ctx,
+              const llama_seq_id * seq_ids,
+              const llama_token  * tokens,
+              const llama_pos    * pos,
+                     uint32_t      n_seq,
+                     llama_token * draft,
+                     uint32_t      n_draft);
+
+    // Draft continuation token(s) with the model's native MTP head using the latest verifier hidden state
+    // for the specified sequence and the accepted token at `pos`. Returns the number of drafted tokens.
+    // Current implementation is LM-only and drafts at most one continuation token.
+    LLAMA_API int32_t llama_native_mtp_draft(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                    llama_token    token,
+                    llama_pos      pos,
+                    llama_token  * draft,
+                       uint32_t    n_draft);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
