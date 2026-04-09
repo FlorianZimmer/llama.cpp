@@ -121,6 +121,37 @@ Observed CUDA range:
 - The known hybrid/recurrent `np > 1` exactness limitation is still real on CUDA. The Rust `np=2` case remained a representative failure and was also slightly slower than baseline.
 - On exact workloads, native MTP is already useful on both CPU and CUDA with this model, but the benefit is workload-dependent and should not be treated as a universal speedup.
 
+## Speedup Backlog
+
+The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
+
+### Priority 1: Backend-resident MTP seed path
+
+- expected gain: roughly `+5%` to `+15%` on good CUDA workloads if implemented cleanly
+- scope: medium to high
+- reason: the native MTP path still copies the verifier hidden row back to host memory and then uploads it again as the MTP seed input
+- current status: explored, but not landed; the first view-based device-copy prototype was not stable enough for `np=1/2`, so the current tree keeps the safer host-backed path
+
+### Priority 2: Adaptive native-MTP backoff on replay-heavy prompts
+
+- expected gain: large on bad prompts, little or no change on good prompts
+- scope: medium
+- reason: once snapshotting was removed, replay became the dominant bad-case overhead on rejection-heavy prompts like the Rust stress case
+- risk: any adaptive policy has to stay understandable and upstream-friendly; it should not silently trade correctness or make the server behavior hard to reason about
+
+### Priority 3: Replay-path reduction
+
+- expected gain: modest on exact/easy prompts, more meaningful on prompts with lower draft acceptance
+- scope: medium to high
+- reason: replay is now the second largest remaining native-MTP overhead on many CUDA runs
+- examples: cheaper replay batching, less redundant verifier work after rejection, or avoiding replay entirely on cases where the state can be proven equivalent
+
+### Priority 4: Small server hot-path cleanup
+
+- expected gain: low
+- scope: small
+- reason: there are still per-step container/setup costs in the server loop, but the current profile says they are not the main bottleneck anymore
+
 ## Raw Logs
 
 Representative logs from the full matrix are under:

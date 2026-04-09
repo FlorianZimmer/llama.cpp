@@ -224,7 +224,7 @@ llama_context::llama_context(
     }
 
     native_mtp.desc = model.mtp_desc();
-    native_mtp.reserve(hparams.n_embd);
+    native_mtp.reserve(hparams.n_embd, hparams.n_pos_per_embd());
 
     LLAMA_LOG_INFO("%s: native_mtp    = %s\n", __func__, native_mtp.enabled() ? "enabled" : "disabled");
     if (native_mtp.desc.n_predict > 0) {
@@ -709,44 +709,51 @@ int32_t llama_context::mtp_draft_batch(
     synchronize();
 
     const size_t seed_size = (size_t) model.hparams.n_embd * n_seq;
-    native_mtp.seed_embd.resize(seed_size);
+    const float * mtp_seed = nullptr;
+
+    if (n_seq == 1) {
+        if (!native_mtp.has_seed(seq_ids[0])) {
+            return 0;
+        }
+        mtp_seed = native_mtp.seed_row(seq_ids[0]);
+    } else {
+        native_mtp.seed_embd.resize(seed_size);
+        mtp_seed = native_mtp.seed_embd.data();
+    }
 
     for (uint32_t i = 0; i < n_seq; ++i) {
-        auto it = native_mtp.seed_by_seq.find(seq_ids[i]);
-        if (it == native_mtp.seed_by_seq.end() || it->second.empty()) {
+        if (!native_mtp.has_seed(seq_ids[i])) {
             return 0;
         }
 
-        GGML_ASSERT(it->second.size() == (size_t) model.hparams.n_embd);
-        std::memcpy(
-                native_mtp.seed_embd.data() + (size_t) i * model.hparams.n_embd,
-                it->second.data(),
-                sizeof(float) * model.hparams.n_embd);
+        if (n_seq > 1) {
+            std::memcpy(
+                    native_mtp.seed_embd.data() + (size_t) i * model.hparams.n_embd,
+                    native_mtp.seed_row(seq_ids[i]),
+                    sizeof(float) * model.hparams.n_embd);
+        }
     }
 
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(1, n_seq);
-    std::vector<llama_seq_id> mtp_seq_ids(n_seq);
-    std::vector<bool> seq_id_used(LLAMA_MAX_SEQ, false);
+    llama_ubatch ubatch = native_mtp.ubatch_reserve(n_seq);
 
-    std::fill(ubatch.seq_idx, ubatch.seq_idx + LLAMA_MAX_SEQ, -1);
+    std::fill(native_mtp.temp_seq_used.begin(), native_mtp.temp_seq_used.end(), 0);
 
     for (uint32_t i = 0; i < n_seq; ++i) {
         GGML_ASSERT(0 <= seq_ids[i] && seq_ids[i] < LLAMA_MAX_SEQ);
-        seq_id_used[seq_ids[i]] = true;
+        native_mtp.temp_seq_used[seq_ids[i]] = 1;
     }
 
     int32_t seq_id_next = LLAMA_MAX_SEQ - 1;
     for (uint32_t i = 0; i < n_seq; ++i) {
-        while (seq_id_next >= 0 && seq_id_used[seq_id_next]) {
+        while (seq_id_next >= 0 && native_mtp.temp_seq_used[seq_id_next]) {
             --seq_id_next;
         }
         if (seq_id_next < 0) {
             return 0;
         }
 
-        mtp_seq_ids[i] = seq_id_next;
-        seq_id_used[seq_id_next] = true;
+        native_mtp.temp_seq_ids[i] = seq_id_next;
+        native_mtp.temp_seq_used[seq_id_next] = 1;
         --seq_id_next;
 
         ubatch.token[i] = tokens[i];
@@ -755,9 +762,9 @@ int32_t llama_context::mtp_draft_batch(
         }
 
         ubatch.n_seq_id[i] = 1;
-        ubatch.seq_id[i] = &mtp_seq_ids[i];
-        ubatch.seq_id_unq[i] = mtp_seq_ids[i];
-        ubatch.seq_idx[mtp_seq_ids[i]] = i;
+        ubatch.seq_id[i] = &native_mtp.temp_seq_ids[i];
+        ubatch.seq_id_unq[i] = native_mtp.temp_seq_ids[i];
+        ubatch.seq_idx[native_mtp.temp_seq_ids[i]] = i;
         ubatch.output[i] = true;
     }
 
@@ -770,7 +777,7 @@ int32_t llama_context::mtp_draft_batch(
             ubatch,
             nullptr,
             LLM_GRAPH_TYPE_MTP,
-            native_mtp.seed_embd.data(),
+            mtp_seed,
             tokens,
             n_seq);
 
@@ -812,7 +819,7 @@ int32_t llama_context::mtp_draft_batch(
 
     if (auto * mem = get_memory()) {
         for (uint32_t i = 0; i < n_seq; ++i) {
-            llama_memory_seq_rm(mem, mtp_seq_ids[i], -1, -1);
+            llama_memory_seq_rm(mem, native_mtp.temp_seq_ids[i], -1, -1);
         }
     }
 
@@ -1668,22 +1675,23 @@ static void copy_tensor_async_candidates(
 static void copy_tensor_async_rows(
         ggml_tensor * tensor,
         const std::map<llama_seq_id, uint32_t> & seq_to_row,
-        std::map<llama_seq_id, std::vector<float>> & dst,
+        llama_mtp_state & dst,
         ggml_backend_sched_t sched) {
-    if (tensor == nullptr) {
+    if (tensor == nullptr || !dst.enabled()) {
         return;
     }
+
+    const size_t row_size = ggml_nbytes(tensor) / tensor->ne[1];
+    GGML_ASSERT(row_size == (size_t) dst.n_embd * sizeof(float));
+
+    dst.next_seed_epoch();
 
     ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
     GGML_ASSERT(backend != nullptr);
 
-    const size_t row_size = ggml_nbytes(tensor) / tensor->ne[1];
-    const size_t n_floats = row_size / sizeof(float);
-
     for (const auto & [seq_id, row] : seq_to_row) {
-        auto & seed = dst[seq_id];
-        seed.resize(n_floats);
-        ggml_backend_tensor_get_async(backend, tensor, seed.data(), row * tensor->nb[1], row_size);
+        ggml_backend_tensor_get_async(backend, tensor, dst.seed_row(seq_id), row * tensor->nb[1], row_size);
+        dst.mark_seed(seq_id);
     }
 }
 
@@ -1986,7 +1994,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (native_mtp.enabled() && t_embd_raw && n_outputs > 0) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
-            copy_tensor_async_rows(t_embd_raw, seq_to_output_row, native_mtp.seed_by_seq, sched.get());
+            copy_tensor_async_rows(t_embd_raw, seq_to_output_row, native_mtp, sched.get());
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
