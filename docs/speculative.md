@@ -26,6 +26,23 @@ Current support is narrow:
 - unsupported models fail fast at startup;
 - v1 currently targets the LM-only path.
 
+Current limitation:
+
+- native `mtp` is validated and exact on the current single-request path (`-np 1`) and on some `-np 2` workloads, but hybrid/recurrent native-MTP models can still diverge from baseline greedy decode under `-np > 1` on near-tie tokens;
+- when that happens, the divergence comes from batch-shape-dependent verifier numerics, not from the draft token itself: verifying `[accepted token] + [draft token]` across multiple live sequences can slightly perturb the verifier logits and change a greedy tie-break;
+- rollback/replay can repair state after a rejected draft, but it cannot retroactively recover a verifier decision that was already made from slightly different logits.
+
+Why this is hard to "fully fix":
+
+- an exact fix would require batch-invariant verifier kernels for the hybrid/recurrent path, or forcing native `mtp` back through a serialized single-token verifier path after each speculative step;
+- the first option is a backend/kernel project, not a local server-side policy change;
+- the second option largely gives up the latency benefit that makes native `mtp` useful in the first place.
+
+Practical guidance:
+
+- if strict greedy equality is required today, prefer `-np 1`;
+- if `-np > 1` is more important than exact reproducibility, native `mtp` can still be useful when the measured speedup on your model and prompts outweighs the residual risk of divergence.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

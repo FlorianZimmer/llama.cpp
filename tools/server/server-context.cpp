@@ -50,6 +50,11 @@ static bool server_native_mtp_profile_enabled() {
     return enabled;
 }
 
+static bool server_native_mtp_trace_enabled() {
+    static const bool enabled = getenv("LLAMA_SERVER_MTP_TRACE") != nullptr;
+    return enabled;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -1396,6 +1401,11 @@ private:
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+            if (server_native_mtp_trace_enabled()) {
+                SLT_INF(slot, "sampler seed: request=%u actual=%u\n",
+                        task.params.sampling.seed,
+                        common_sampler_get_seed(slot.smpl.get()));
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3034,38 +3044,77 @@ private:
             size_t n_prompt_base = 0;
         };
 
+        auto format_tokens = [](const llama_tokens & toks) {
+            std::string out = "[";
+            for (size_t i = 0; i < toks.size(); ++i) {
+                if (i > 0) {
+                    out += ", ";
+                }
+                out += std::to_string(toks[i]);
+            }
+            out += "]";
+            return out;
+        };
+
         auto replay_native_mtp_prefix_batch = [&](const std::vector<native_replay_entry> & replay_slots) {
             size_t n_replay_total = 0;
+            size_t n_replay_max = 0;
             for (const auto & replay_slot : replay_slots) {
                 GGML_ASSERT(replay_slot.slot != nullptr);
                 GGML_ASSERT((size_t) replay_slot.slot->prompt.n_tokens() >= replay_slot.n_prompt_base);
-                n_replay_total += replay_slot.slot->prompt.n_tokens() - replay_slot.n_prompt_base;
+                const size_t n_replay = replay_slot.slot->prompt.n_tokens() - replay_slot.n_prompt_base;
+                n_replay_total += n_replay;
+                n_replay_max = std::max(n_replay_max, n_replay);
             }
 
             if (n_replay_total == 0) {
                 return true;
             }
 
-            llama_batch replay = llama_batch_init((int32_t) n_replay_total, 0, 1);
-            common_batch_clear(replay);
-
-            for (const auto & replay_slot : replay_slots) {
-                auto & slot = *replay_slot.slot;
-                const size_t n_replay = slot.prompt.n_tokens() - replay_slot.n_prompt_base;
-                const llama_pos pos_base = slot.prompt.tokens.pos_next(replay_slot.n_prompt_base);
-
-                for (size_t j = 0; j < n_replay; ++j) {
-                    common_batch_add(replay, slot.prompt.tokens[replay_slot.n_prompt_base + j], pos_base + j, { slot.id }, j + 1 == n_replay);
-                }
-            }
-
+            llama_batch replay = llama_batch_init((int32_t) replay_slots.size(), 0, 1);
             common_set_adapter_lora(ctx, replay_slots.front().slot->lora);
             llama_set_embeddings(ctx, false);
 
-            const int ret = llama_decode(ctx, replay);
-            llama_batch_free(replay);
+            bool ok = true;
+            for (size_t step = 0; step < n_replay_max; ++step) {
+                common_batch_clear(replay);
+                std::string trace_step;
 
-            return ret == 0;
+                for (const auto & replay_slot : replay_slots) {
+                    auto & slot = *replay_slot.slot;
+                    const size_t n_replay = slot.prompt.n_tokens() - replay_slot.n_prompt_base;
+                    if (step >= n_replay) {
+                        continue;
+                    }
+
+                    const llama_pos pos = slot.prompt.tokens.pos_next(replay_slot.n_prompt_base) + (llama_pos) step;
+                    const bool logits = step + 1 == n_replay;
+                    common_batch_add(replay, slot.prompt.tokens[replay_slot.n_prompt_base + step], pos, { slot.id }, logits);
+
+                    if (server_native_mtp_trace_enabled()) {
+                        if (!trace_step.empty()) {
+                            trace_step += " ";
+                        }
+                        trace_step += string_format("slot=%d tok=%d pos=%d logits=%d", slot.id, slot.prompt.tokens[replay_slot.n_prompt_base + step], pos, logits);
+                    }
+                }
+
+                if (replay.n_tokens == 0) {
+                    continue;
+                }
+
+                if (server_native_mtp_trace_enabled()) {
+                    SRV_INF("native MTP replay step=%zu n_tokens=%d %s\n", step, replay.n_tokens, trace_step.c_str());
+                }
+
+                if (llama_decode(ctx, replay) != 0) {
+                    ok = false;
+                    break;
+                }
+            }
+
+            llama_batch_free(replay);
+            return ok;
         };
 
         // process the created batch of tokens
@@ -3281,6 +3330,17 @@ private:
                 spec_result.n_prompt_base = slot.prompt.n_tokens() - spec_result.n_draft - 1;
                 spec_result.needs_native_replay = slot.uses_native_mtp() && n_accepted_draft < spec_result.n_draft;
                 any_native_replay = any_native_replay || spec_result.needs_native_replay;
+
+                if (server_native_mtp_trace_enabled() && slot.uses_native_mtp()) {
+                    SRV_INF("native MTP accept slot=%d drafted=%s accepted=%s sampled=%d n_draft=%zu accepted_draft=%zu replay=%d\n",
+                            slot.id,
+                            format_tokens(spec_result.drafted).c_str(),
+                            format_tokens(spec_result.ids).c_str(),
+                            slot.sampled,
+                            spec_result.n_draft,
+                            n_accepted_draft,
+                            spec_result.needs_native_replay);
+                }
 
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += spec_result.ids.size() - 1;
