@@ -17,6 +17,14 @@ Backend availability on this host:
 
 Those other backends were not built or not available on this Linux machine, so the numbers below only cover the backends that were actually runnable in this environment.
 
+## PR-Ready Summary
+
+Native MTP for Qwen 3.5 is now wired end-to-end in llama.cpp: HF to GGUF conversion, model loading, runtime execution in a single verifier context, server integration, tests, and benchmark coverage. The current implementation is validated on the exact `-np 1` path and on some `-np 2` workloads, with measured speedups on both CPU and CUDA for exact cases.
+
+The main known limitation is still the documented hybrid/recurrent `-np > 1` exactness gap. On near-tie tokens, verifier numerics can change with batch shape across multiple live sequences, so native `mtp` can diverge from baseline greedy decode even when rollback and replay logic restore the correct model state after rejected drafts. That limitation is documented rather than hidden behind an incorrect exactness guarantee.
+
+On this host and model, CPU exact cases landed around `1.20x` to `1.53x`, while CUDA exact cases landed around `1.02x` to `1.23x`. The representative stress case remains CUDA Rust `np=2`, which still demonstrates the known exactness limitation and can also be slightly slower than baseline.
+
 ## Method
 
 Common settings:
