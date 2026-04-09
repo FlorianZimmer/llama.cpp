@@ -700,6 +700,8 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+        } else if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            params_base.speculative.cparams_dft = common_context_params_to_llama(params_base);
         }
 
         std::string & mmproj_path = params_base.mmproj.path;

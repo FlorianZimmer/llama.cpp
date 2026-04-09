@@ -83,6 +83,8 @@ int main(int argc, char ** argv) {
 
         params.speculative.model_dft = model_dft.get();
         params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+    } else if (use_native_mtp) {
+        params.speculative.cparams_dft = common_context_params_to_llama(params);
     }
 
     // Tokenize the prompt
