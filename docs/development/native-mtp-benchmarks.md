@@ -2,6 +2,12 @@
 
 Bench date: 2026-04-10
 
+Status note (2026-04-11):
+
+This branch is kept as historical context.
+The current fork-level native-MTP line is now paused.
+The implementation works, the kept dense `np=1` path remains exact, and the latest dense-only branch recovered a real win on `Qwen3.5-9B q8_0`, but broader dense speedups did not survive across the checked targets and the remaining gap now looks structural rather than local.
+
 This note records the current end-to-end CUDA benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
 
 ## Benchmark Protocol

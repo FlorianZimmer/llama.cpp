@@ -20,6 +20,12 @@ In this mode, llama.cpp keeps a single verifier `llama_context`, samples the fir
 
 This preserves greedy exactness for the first committed token while avoiding a second draft runtime.
 
+Current fork status:
+
+- the dense Qwen 3.5 native-MTP path works functionally under the current `-np 1` contract;
+- the latest dense-only branch found a real `Qwen3.5-9B q8_0` win, but broader dense speedups did not hold up;
+- the work is on hold because the remaining gap now looks structural rather than local.
+
 Current support is narrow:
 
 - only models with native MTP tensors can use it;
@@ -50,6 +56,7 @@ Practical guidance:
 - if strict greedy equality is required today, prefer `-np 1`;
 - if `-np > 1` is more important than exact reproducibility, native `mtp` can still be useful when the measured speedup on your model and prompts outweighs the residual risk of divergence.
 - speedup is model-dependent; some native-MTP models can work functionally but still lose to greedy baseline if the verifier is already very fast and the model only exposes a single predictor layer.
+- if broad speedup across heavier dense models is the goal, expect deeper runtime work before native `mtp` can approach the speculative decode economics of systems such as vLLM or SGLang.
 
 ### n-gram Cache (`ngram-cache`)
 
