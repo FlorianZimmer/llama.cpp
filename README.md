@@ -49,6 +49,7 @@ The XQuant prototype is also on hold, but this fork is no longer just an XQuant 
 Related notes:
 
 - [docs/speculative.md](docs/speculative.md)
+- [docs/experiments/native-mtp.md](docs/experiments/native-mtp.md)
 - [docs/experiments/xquant.md](docs/experiments/xquant.md)
 
 ## Recent API changes
