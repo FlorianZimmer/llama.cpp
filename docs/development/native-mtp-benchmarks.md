@@ -62,7 +62,7 @@ The validation harness for this protocol now supports:
 
 - `--repeat` for repeated scenario runs
 - `--json-out` for machine-readable baseline/current comparisons
-- `--allow-known-np2-divergence` for any `np > 1` stability-only run on this path
+- `--allow-known-np2-divergence` for any `np > 1` stability-only run on this path, including baseline `np=2`
 
 Common settings:
 
@@ -178,6 +178,9 @@ The items below are the remaining upstream-friendly performance ideas worth trac
 - scope: medium
 - reason: once snapshotting was removed, replay became the dominant bad-case overhead on rejection-heavy prompts like the Rust stress case
 - risk: any adaptive policy has to stay understandable and upstream-friendly; it should not silently trade correctness or make the server behavior hard to reason about
+- current status:
+  - tried and dropped
+  - an env-gated prototype regressed the validated Berlin `np=1` CUDA case from about `172.5 tok/s` to about `151.8 tok/s`, so it was not kept even as a parked runtime option
 
 ### Priority 2: Replay-path reduction
 
@@ -185,12 +188,21 @@ The items below are the remaining upstream-friendly performance ideas worth trac
 - scope: medium to high
 - reason: replay is now the second largest remaining native-MTP overhead on many CUDA runs
 - examples: cheaper replay batching, less redundant verifier work after rejection, or avoiding replay entirely on cases where the state can be proven equivalent
+- current status:
+  - partial bookkeeping cleanup landed
+  - replay spans are now captured explicitly and replay scratch storage is reused
+  - no clear exact-case end-to-end CUDA win has been measured yet, but the replay path is simpler and avoids repeated reconstruction from prompt state
 
 ### Priority 3: Small server hot-path cleanup
 
 - expected gain: low
 - scope: small
 - reason: there are still per-step container/setup costs in the server loop, but the current profile says they are not the main bottleneck anymore
+- current status:
+  - partial cleanup landed
+  - micro-timing is now actually gated by `LLAMA_SERVER_MTP_PROFILE`
+  - batched native draft handoff no longer uses an `unordered_map`
+  - exact-case gains have been flat/noisy so far
 
 ## Raw Logs
 

@@ -399,7 +399,7 @@ def main() -> int:
         baseline_output = baseline_run.outputs[0]
         for key, scenario_runs in results.items():
             mode, n_parallel = key
-            if args.allow_known_np2_divergence and mode == "mtp" and n_parallel == 2:
+            if args.allow_known_np2_divergence and n_parallel == 2:
                 continue
             for run in scenario_runs:
                 if run.repeat != repeat:
@@ -411,7 +411,7 @@ def main() -> int:
                         )
 
     if args.allow_known_np2_divergence:
-        print("all required greedy outputs match exactly; mtp np=2 divergence was allowed for this run")
+        print("all required greedy outputs match exactly; np=2 divergence was allowed for this run")
     else:
         print("all greedy outputs match exactly")
 

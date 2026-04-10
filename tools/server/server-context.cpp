@@ -18,7 +18,6 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
-#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -97,6 +96,10 @@ struct server_slot {
     common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
     bool native_mtp = false;
     int32_t native_mtp_max = 0;
+    bool native_mtp_recurrent_backup = false;
+    llama_state_seq_flags native_mtp_snapshot_flags = 0;
+    llama_token native_mtp_batched_draft = LLAMA_TOKEN_NULL;
+    bool native_mtp_batched_draft_ready = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -182,6 +185,8 @@ struct server_slot {
         native_mtp_state.clear();
         native_mtp_state_flags = 0;
         native_mtp_profile = {};
+        native_mtp_batched_draft = LLAMA_TOKEN_NULL;
+        native_mtp_batched_draft_ready = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -198,7 +203,6 @@ struct server_slot {
     llama_state_seq_flags native_mtp_state_flags = 0;
     llama_seq_id native_mtp_backup_id = -1;
     native_mtp_profile_data native_mtp_profile;
-
     // stats
     size_t n_sent_text = 0; // number of sent text character
 
@@ -232,6 +236,8 @@ struct server_slot {
         native_mtp_state.clear();
         native_mtp_state_flags = 0;
         native_mtp_profile = {};
+        native_mtp_batched_draft = LLAMA_TOKEN_NULL;
+        native_mtp_batched_draft_ready = false;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -354,7 +360,7 @@ struct server_slot {
     }
 
     bool uses_native_mtp_recurrent_backup() const {
-        return uses_native_mtp() && native_mtp_backup_id >= 0;
+        return uses_native_mtp() && native_mtp_recurrent_backup && native_mtp_backup_id >= 0;
     }
 
     bool save_native_mtp_state(llama_state_seq_flags flags) {
@@ -600,6 +606,23 @@ struct server_slot {
     }
 };
 
+struct speculative_accept_result {
+    server_slot * slot = nullptr;
+    size_t n_draft = 0;
+    size_t n_prompt_base = 0;
+    bool needs_native_replay = false;
+    llama_tokens drafted;
+    std::vector<llama_token> ids;
+    int64_t t_current = 0;
+};
+
+struct native_replay_entry {
+    server_slot * slot = nullptr;
+    size_t replay_start = 0;
+    size_t replay_n = 0;
+    llama_pos replay_pos = 0;
+};
+
 
 
 //
@@ -720,6 +743,15 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::vector<server_slot *> native_mtp_slots_scratch;
+    std::vector<llama_seq_id> native_mtp_seq_ids_scratch;
+    std::vector<llama_token>  native_mtp_tokens_scratch;
+    std::vector<llama_pos>    native_mtp_pos_scratch;
+    std::vector<llama_token>  native_mtp_batch_draft_scratch;
+    std::vector<speculative_accept_result> native_mtp_results_scratch;
+    std::vector<native_replay_entry> native_mtp_replay_slots_scratch;
+    llama_batch native_mtp_replay_batch {};
+
     server_metrics metrics;
 
     json json_webui_settings = json::object();
@@ -748,6 +780,7 @@ private:
         }
 
         llama_batch_free(batch);
+        llama_batch_free(native_mtp_replay_batch);
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -958,7 +991,12 @@ private:
 
                 slot.native_mtp = true;
                 slot.native_mtp_max = std::min<int32_t>(1, (int32_t) llama_model_n_native_mtp_predict(model));
-                if (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)) {
+                slot.native_mtp_recurrent_backup = llama_model_is_hybrid(model) || llama_model_is_recurrent(model);
+                slot.native_mtp_snapshot_flags =
+                    !slot.native_mtp_recurrent_backup && llama_model_is_hybrid(model)
+                        ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+                        : 0;
+                if (slot.native_mtp_recurrent_backup) {
                     slot.native_mtp_backup_id = (llama_seq_id) (llama_n_seq_max(ctx) + i);
                 }
                 SLT_INF(slot, "native MTP context initialized, max draft = %d\n", slot.native_mtp_max);
@@ -992,8 +1030,19 @@ private:
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx);
+            llama_batch_free(batch);
+            llama_batch_free(native_mtp_replay_batch);
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            native_mtp_replay_batch = llama_batch_init(std::max(1, params_base.n_parallel), 0, 1);
         }
+
+        native_mtp_slots_scratch.reserve(params_base.n_parallel);
+        native_mtp_seq_ids_scratch.reserve(params_base.n_parallel);
+        native_mtp_tokens_scratch.reserve(params_base.n_parallel);
+        native_mtp_pos_scratch.reserve(params_base.n_parallel);
+        native_mtp_batch_draft_scratch.reserve(params_base.n_parallel);
+        native_mtp_results_scratch.reserve(params_base.n_parallel);
+        native_mtp_replay_slots_scratch.reserve(params_base.n_parallel);
 
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
@@ -2285,14 +2334,18 @@ private:
             }
         }
 
-        std::unordered_map<int, llama_tokens> native_mtp_drafts;
+        const bool native_mtp_profile = server_native_mtp_profile_enabled();
+        native_mtp_slots_scratch.clear();
+        native_mtp_seq_ids_scratch.clear();
+        native_mtp_tokens_scratch.clear();
+        native_mtp_pos_scratch.clear();
+
+        for (auto & slot : slots) {
+            slot.native_mtp_batched_draft = LLAMA_TOKEN_NULL;
+            slot.native_mtp_batched_draft_ready = false;
+        }
 
         if (slot_batched != nullptr && !mctx) {
-            std::vector<server_slot *> mtp_slots;
-            std::vector<llama_seq_id> mtp_seq_ids;
-            std::vector<llama_token>  mtp_tokens;
-            std::vector<llama_pos>    mtp_pos;
-
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING) {
                     continue;
@@ -2306,36 +2359,40 @@ private:
                     continue;
                 }
 
-                mtp_slots.push_back(&slot);
-                mtp_seq_ids.push_back(slot.id);
-                mtp_tokens.push_back(slot.sampled);
-                mtp_pos.push_back(slot.prompt.tokens.pos_next());
+                native_mtp_slots_scratch.push_back(&slot);
+                native_mtp_seq_ids_scratch.push_back(slot.id);
+                native_mtp_tokens_scratch.push_back(slot.sampled);
+                native_mtp_pos_scratch.push_back(slot.prompt.tokens.pos_next());
             }
 
-            if (!mtp_slots.empty()) {
-                llama_tokens mtp_batch_draft(mtp_slots.size());
+            if (!native_mtp_slots_scratch.empty()) {
+                native_mtp_batch_draft_scratch.resize(native_mtp_slots_scratch.size());
 
                 common_set_adapter_lora(ctx, slot_batched->lora);
 
-                const int64_t t_mtp_draft_start = ggml_time_us();
+                const int64_t t_mtp_draft_start = native_mtp_profile ? ggml_time_us() : 0;
                 const int32_t n_mtp = llama_native_mtp_draft_batch(
                         ctx,
-                        mtp_seq_ids.data(),
-                        mtp_tokens.data(),
-                        mtp_pos.data(),
-                        mtp_slots.size(),
-                        mtp_batch_draft.data(),
+                        native_mtp_seq_ids_scratch.data(),
+                        native_mtp_tokens_scratch.data(),
+                        native_mtp_pos_scratch.data(),
+                        native_mtp_slots_scratch.size(),
+                        native_mtp_batch_draft_scratch.data(),
                         1);
-                const int64_t t_mtp_draft_us = ggml_time_us() - t_mtp_draft_start;
+                const int64_t t_mtp_draft_us = native_mtp_profile ? ggml_time_us() - t_mtp_draft_start : 0;
 
-                for (auto * mtp_slot : mtp_slots) {
-                    mtp_slot->native_mtp_profile.n_draft_calls += 1;
-                    mtp_slot->native_mtp_profile.t_draft_us += t_mtp_draft_us / (int64_t) mtp_slots.size();
+                if (native_mtp_profile) {
+                    for (auto * mtp_slot : native_mtp_slots_scratch) {
+                        mtp_slot->native_mtp_profile.n_draft_calls += 1;
+                        mtp_slot->native_mtp_profile.t_draft_us += t_mtp_draft_us / (int64_t) native_mtp_slots_scratch.size();
+                    }
                 }
 
                 if (n_mtp > 0) {
-                    for (size_t i = 0; i < mtp_slots.size(); ++i) {
-                        native_mtp_drafts[mtp_slots[i]->id] = { mtp_batch_draft[i] };
+                    for (size_t i = 0; i < native_mtp_slots_scratch.size(); ++i) {
+                        auto & mtp_slot = *native_mtp_slots_scratch[i];
+                        mtp_slot.native_mtp_batched_draft = native_mtp_batch_draft_scratch[i];
+                        mtp_slot.native_mtp_batched_draft_ready = true;
                     }
                 }
             }
@@ -2371,13 +2428,13 @@ private:
 
                 llama_tokens draft;
                 if (slot.uses_native_mtp()) {
-                    auto it_draft = native_mtp_drafts.find(slot.id);
-                    if (it_draft != native_mtp_drafts.end()) {
-                        draft = it_draft->second;
+                    if (slot.native_mtp_batched_draft_ready) {
+                        draft = { slot.native_mtp_batched_draft };
+                        slot.native_mtp_batched_draft_ready = false;
                     } else {
                         draft.resize((size_t) std::min(1, n_draft_max));
 
-                        const int64_t t_mtp_draft_start = ggml_time_us();
+                        const int64_t t_mtp_draft_start = native_mtp_profile ? ggml_time_us() : 0;
                         const int32_t n_mtp = llama_native_mtp_draft(
                                 slot.ctx,
                                 slot.id,
@@ -2385,8 +2442,10 @@ private:
                                 slot.prompt.tokens.pos_next(),
                                 draft.data(),
                                 draft.size());
-                        slot.native_mtp_profile.n_draft_calls += 1;
-                        slot.native_mtp_profile.t_draft_us += ggml_time_us() - t_mtp_draft_start;
+                        if (native_mtp_profile) {
+                            slot.native_mtp_profile.n_draft_calls += 1;
+                            slot.native_mtp_profile.t_draft_us += ggml_time_us() - t_mtp_draft_start;
+                        }
 
                         if (n_mtp > 0) {
                             draft.resize((size_t) n_mtp);
@@ -2405,18 +2464,16 @@ private:
                 }
 
                 const bool use_recurrent_backup = slot.uses_native_mtp_recurrent_backup();
-                const llama_state_seq_flags native_mtp_state_flags =
-                    slot.uses_native_mtp() && !use_recurrent_backup && llama_model_is_hybrid(llama_get_model(slot.ctx))
-                        ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
-                        : 0;
 
                 if (slot.uses_native_mtp() && !draft.empty()) {
-                    const int64_t t_snapshot_start = ggml_time_us();
+                    const int64_t t_snapshot_start = native_mtp_profile ? ggml_time_us() : 0;
                     const bool saved = use_recurrent_backup
                             ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.id, slot.native_mtp_backup_id, -1, -1)
-                            : slot.save_native_mtp_state(native_mtp_state_flags);
-                    slot.native_mtp_profile.n_snapshot += 1;
-                    slot.native_mtp_profile.t_snapshot_us += ggml_time_us() - t_snapshot_start;
+                            : slot.save_native_mtp_state(slot.native_mtp_snapshot_flags);
+                    if (native_mtp_profile) {
+                        slot.native_mtp_profile.n_snapshot += 1;
+                        slot.native_mtp_profile.t_snapshot_us += ggml_time_us() - t_snapshot_start;
+                    }
 
                     if (!saved) {
                         SLT_WRN(slot, "%s", "failed to snapshot native MTP state, disabling draft for this step\n");
@@ -3029,21 +3086,6 @@ private:
 
         int32_t i_next = 0;
 
-        struct speculative_accept_result {
-            server_slot * slot = nullptr;
-            size_t n_draft = 0;
-            size_t n_prompt_base = 0;
-            bool needs_native_replay = false;
-            llama_tokens drafted;
-            std::vector<llama_token> ids;
-            int64_t t_current = 0;
-        };
-
-        struct native_replay_entry {
-            server_slot * slot = nullptr;
-            size_t n_prompt_base = 0;
-        };
-
         auto format_tokens = [](const llama_tokens & toks) {
             std::string out = "[";
             for (size_t i = 0; i < toks.size(); ++i) {
@@ -3061,17 +3103,18 @@ private:
             size_t n_replay_max = 0;
             for (const auto & replay_slot : replay_slots) {
                 GGML_ASSERT(replay_slot.slot != nullptr);
-                GGML_ASSERT((size_t) replay_slot.slot->prompt.n_tokens() >= replay_slot.n_prompt_base);
-                const size_t n_replay = replay_slot.slot->prompt.n_tokens() - replay_slot.n_prompt_base;
-                n_replay_total += n_replay;
-                n_replay_max = std::max(n_replay_max, n_replay);
+                GGML_ASSERT((size_t) replay_slot.slot->prompt.n_tokens() >= replay_slot.replay_start + replay_slot.replay_n);
+                n_replay_total += replay_slot.replay_n;
+                n_replay_max = std::max(n_replay_max, replay_slot.replay_n);
             }
 
             if (n_replay_total == 0) {
                 return true;
             }
 
-            llama_batch replay = llama_batch_init((int32_t) replay_slots.size(), 0, 1);
+            GGML_ASSERT((int32_t) replay_slots.size() <= params_base.n_parallel);
+            llama_batch & replay = native_mtp_replay_batch;
+            common_batch_clear(replay);
             common_set_adapter_lora(ctx, replay_slots.front().slot->lora);
             llama_set_embeddings(ctx, false);
 
@@ -3082,20 +3125,19 @@ private:
 
                 for (const auto & replay_slot : replay_slots) {
                     auto & slot = *replay_slot.slot;
-                    const size_t n_replay = slot.prompt.n_tokens() - replay_slot.n_prompt_base;
-                    if (step >= n_replay) {
+                    if (step >= replay_slot.replay_n) {
                         continue;
                     }
 
-                    const llama_pos pos = slot.prompt.tokens.pos_next(replay_slot.n_prompt_base) + (llama_pos) step;
-                    const bool logits = step + 1 == n_replay;
-                    common_batch_add(replay, slot.prompt.tokens[replay_slot.n_prompt_base + step], pos, { slot.id }, logits);
+                    const llama_pos pos = replay_slot.replay_pos + (llama_pos) step;
+                    const bool logits = step + 1 == replay_slot.replay_n;
+                    common_batch_add(replay, slot.prompt.tokens[replay_slot.replay_start + step], pos, { slot.id }, logits);
 
                     if (server_native_mtp_trace_enabled()) {
                         if (!trace_step.empty()) {
                             trace_step += " ";
                         }
-                        trace_step += string_format("slot=%d tok=%d pos=%d logits=%d", slot.id, slot.prompt.tokens[replay_slot.n_prompt_base + step], pos, logits);
+                        trace_step += string_format("slot=%d tok=%d pos=%d logits=%d", slot.id, slot.prompt.tokens[replay_slot.replay_start + step], pos, logits);
                     }
                 }
 
@@ -3113,7 +3155,6 @@ private:
                 }
             }
 
-            llama_batch_free(replay);
             return ok;
         };
 
@@ -3299,7 +3340,7 @@ private:
             }
 
             // speculative decoding - main model sample and accept
-            std::vector<speculative_accept_result> speculative_results;
+            native_mtp_results_scratch.clear();
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || slot.i_batch_dft.empty()) {
                     continue;
@@ -3309,9 +3350,9 @@ private:
                 result.slot      = &slot;
                 result.n_draft   = slot.drafted.size();
                 result.drafted   = slot.drafted;
-                const int64_t t_accept_start = ggml_time_us();
+                const int64_t t_accept_start = native_mtp_profile ? ggml_time_us() : 0;
                 result.ids       = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
-                if (slot.uses_native_mtp()) {
+                if (native_mtp_profile && slot.uses_native_mtp()) {
                     slot.native_mtp_profile.n_accept += 1;
                     slot.native_mtp_profile.t_accept_us += ggml_time_us() - t_accept_start;
                 }
@@ -3320,11 +3361,11 @@ private:
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
-                speculative_results.push_back(std::move(result));
+                native_mtp_results_scratch.push_back(std::move(result));
             }
 
             bool any_native_replay = false;
-            for (auto & spec_result : speculative_results) {
+            for (auto & spec_result : native_mtp_results_scratch) {
                 auto & slot = *spec_result.slot;
                 const size_t n_accepted_draft = spec_result.ids.size() - 1;
                 spec_result.n_prompt_base = slot.prompt.n_tokens() - spec_result.n_draft - 1;
@@ -3358,9 +3399,9 @@ private:
                 slot.sampled = spec_result.ids.back(); // last accepted token
             }
 
-            std::vector<native_replay_entry> native_replay_slots;
+            native_mtp_replay_slots_scratch.clear();
             if (any_native_replay) {
-                for (auto & spec_result : speculative_results) {
+                for (auto & spec_result : native_mtp_results_scratch) {
                     if (spec_result.slot == nullptr || !spec_result.slot->uses_native_mtp()) {
                         continue;
                     }
@@ -3368,14 +3409,16 @@ private:
                     auto & slot = *spec_result.slot;
                     const bool use_recurrent_backup = slot.uses_native_mtp_recurrent_backup();
                     const bool has_partial_state = use_recurrent_backup || (slot.native_mtp_state_flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
-                    const int64_t t_restore_start = ggml_time_us();
+                    const int64_t t_restore_start = native_mtp_profile ? ggml_time_us() : 0;
                     const bool restore_ok =
                         (!has_partial_state || llama_memory_seq_rm_attn(llama_get_memory(ctx), slot.id, spec_result.n_prompt_base, -1)) &&
                         (use_recurrent_backup
                             ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.native_mtp_backup_id, slot.id, -1, -1)
                             : slot.restore_native_mtp_state());
-                    slot.native_mtp_profile.n_restore += 1;
-                    slot.native_mtp_profile.t_restore_us += ggml_time_us() - t_restore_start;
+                    if (native_mtp_profile) {
+                        slot.native_mtp_profile.n_restore += 1;
+                        slot.native_mtp_profile.t_restore_us += ggml_time_us() - t_restore_start;
+                    }
 
                     if (!restore_ok) {
                         send_error(slot, "failed to restore native MTP state", ERROR_TYPE_SERVER);
@@ -3385,11 +3428,17 @@ private:
                         continue;
                     }
 
-                    native_replay_slots.push_back(native_replay_entry{ &slot, spec_result.n_prompt_base });
+                    const size_t replay_n = slot.prompt.n_tokens() - spec_result.n_prompt_base;
+                    native_mtp_replay_slots_scratch.push_back(native_replay_entry{
+                        &slot,
+                        spec_result.n_prompt_base,
+                        replay_n,
+                        slot.prompt.tokens.pos_next(spec_result.n_prompt_base),
+                    });
                 }
             }
 
-            for (auto & spec_result : speculative_results) {
+            for (auto & spec_result : native_mtp_results_scratch) {
                 if (spec_result.slot == nullptr) {
                     continue;
                 }
@@ -3402,18 +3451,20 @@ private:
                 slot.native_mtp_state.clear();
             }
 
-            if (!native_replay_slots.empty()) {
-                const int64_t t_replay_start = ggml_time_us();
-                const bool replay_ok = replay_native_mtp_prefix_batch(native_replay_slots);
-                const int64_t t_replay_us = ggml_time_us() - t_replay_start;
+            if (!native_mtp_replay_slots_scratch.empty()) {
+                const int64_t t_replay_start = native_mtp_profile ? ggml_time_us() : 0;
+                const bool replay_ok = replay_native_mtp_prefix_batch(native_mtp_replay_slots_scratch);
+                const int64_t t_replay_us = native_mtp_profile ? ggml_time_us() - t_replay_start : 0;
 
-                for (const auto & replay_slot : native_replay_slots) {
-                    replay_slot.slot->native_mtp_profile.n_replay += 1;
-                    replay_slot.slot->native_mtp_profile.t_replay_us += t_replay_us / (int64_t) native_replay_slots.size();
+                if (native_mtp_profile) {
+                    for (const auto & replay_slot : native_mtp_replay_slots_scratch) {
+                        replay_slot.slot->native_mtp_profile.n_replay += 1;
+                        replay_slot.slot->native_mtp_profile.t_replay_us += t_replay_us / (int64_t) native_mtp_replay_slots_scratch.size();
+                    }
                 }
 
                 if (!replay_ok) {
-                    for (const auto & replay_slot : native_replay_slots) {
+                    for (const auto & replay_slot : native_mtp_replay_slots_scratch) {
                         auto & slot = *replay_slot.slot;
                         send_error(slot, "failed to replay native MTP state", ERROR_TYPE_SERVER);
                         slot.release();
@@ -3422,7 +3473,7 @@ private:
                 }
             }
 
-            for (auto & spec_result : speculative_results) {
+            for (auto & spec_result : native_mtp_results_scratch) {
                 if (spec_result.slot == nullptr || !spec_result.slot->is_processing()) {
                     continue;
                 }

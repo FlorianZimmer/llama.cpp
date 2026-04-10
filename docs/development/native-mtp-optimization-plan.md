@@ -2,7 +2,7 @@
 
 Date: 2026-04-10
 
-This note tracks the remaining upstream-friendly native-MTP performance work after the backend-resident seed transport landed. The work here is intentionally benchmark-gated and only applies after the current exact CUDA baseline is stable again.
+This note tracks the remaining upstream-friendly native-MTP performance work after the backend-resident seed transport landed. The work here is intentionally benchmark-gated.
 
 ## Goal
 
@@ -88,6 +88,7 @@ Status:
 
 - landed in `scripts/validate_mtp_cuda.py`
 - landed in `docs/development/native-mtp-benchmarks.md`
+- adjusted so `--allow-known-np2-divergence` skips strict output equality for all `np=2` scenarios, including baseline, on this hybrid/recurrent path
 
 Purpose:
 
@@ -113,6 +114,18 @@ Keep only the subchanges that either:
 
 - simplify the code, or
 - show a repeatable exact-case tok/s gain
+
+Status:
+
+- partially landed in `tools/server/server-context.cpp`
+- kept:
+  - `LLAMA_SERVER_MTP_PROFILE` now gates the micro-timing calls themselves, not just printing
+  - batched native draft handoff no longer uses `std::unordered_map<int, llama_tokens>`
+  - scratch vectors and replay batch storage are reused across iterations
+  - recurrent-backup and snapshot flags are cached per slot
+- measured result:
+  - stable and simpler
+  - no repeatable exact-case CUDA tok/s gain so far beyond noise
 
 ### Step 3: Conservative adaptive native-MTP backoff
 
@@ -144,6 +157,12 @@ Default-on rule:
 - only keep default-on if the `np=1` exact cases show a repeatable end-to-end gain, or if the `np>1` cases show a clear throughput gain without destabilizing output
 - otherwise park behind an env or drop
 
+Status:
+
+- tried and dropped
+- an env-gated prototype (`LLAMA_SERVER_MTP_ADAPTIVE`) materially slowed the Berlin exact CUDA case instead of improving it
+- current conclusion: adaptive backoff is not worth keeping in-tree until there is a clearer exact-case benefit
+
 ### Step 4: Replay-path cleanup
 
 Scope: medium
@@ -164,6 +183,17 @@ Keep this only if it:
 
 - stays exact, and
 - either improves end-to-end tok/s or materially simplifies later work
+
+Status:
+
+- partially landed in `tools/server/server-context.cpp`
+- kept:
+  - replay spans are captured explicitly at accept/rollback time
+  - replay batching now consumes those precomputed spans instead of reconstructing from prompt state every replay step
+  - speculative/replay scratch vectors are reused across iterations
+- measured result:
+  - stable on Berlin `np=1`, Moon `np=1`, and Rust stress stability runs
+  - no clear end-to-end CUDA win yet, but the code is simpler and cheaper to profile/debug than the previous replay bookkeeping
 
 ### Step 5: Narrow packed replay fast path
 
@@ -221,4 +251,11 @@ Do not claim success from:
 
 ## Current Blocker
 
-There is no longer a blocking exactness prerequisite for `np > 1`. Repeated Berlin `np=2` validation showed the same near-tie divergence pattern already documented for Rust on this hybrid/recurrent native-MTP CUDA path. That means `np > 1` should be treated as a best-effort stability/performance mode rather than a strict exactness contract unless future batch-invariant backend work changes that.
+There is no blocking correctness issue for continuing server-side optimization. The current state is:
+
+- `np=1`: still the strict exactness target for Berlin and Moon
+- `np>1`: stability-only on this hybrid/recurrent CUDA path
+- adaptive backoff: parked
+- replay cleanup: landed, but not yet a measured throughput win
+
+The next worthwhile step is only the optional packed replay fast path, and it should be attempted only if it can stay obviously exact-equivalent with a full fallback.
