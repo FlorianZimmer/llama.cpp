@@ -605,6 +605,7 @@ struct llm_graph_params {
     uint64_t                       mtp_seed_generation = 0;
     const llama_token            * mtp_tokens = nullptr;
     uint32_t                       n_mtp = 0;
+    bool                           output_tokens = false;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -674,6 +675,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (output_tokens != other.output_tokens) {
+            return false;
+        }
+
         if (mtp_seed_mode != other.mtp_seed_mode) {
             return false;
         }
@@ -740,6 +745,7 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_mtp_logits()  const { return t_mtp_logits; }
     ggml_tensor * get_mtp_tokens()  const { return t_mtp_tokens; }
+    ggml_tensor * get_output_tokens() const { return t_output_tokens; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -770,6 +776,7 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_mtp_logits  = nullptr;
     ggml_tensor * t_mtp_tokens  = nullptr;
+    ggml_tensor * t_output_tokens = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -856,6 +863,7 @@ struct llm_graph_context {
     const uint64_t                 mtp_seed_generation;
     const llama_token            * mtp_tokens;
     const uint32_t                 n_mtp;
+    const bool                     output_tokens;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

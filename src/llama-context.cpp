@@ -1072,6 +1072,23 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     }
 }
 
+llama_token llama_context::get_output_token_ith(int32_t idx) {
+    output_reorder();
+
+    if (!output_tokens.has_data()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    try {
+        const int64_t row = output_resolve_row(idx);
+        GGML_ASSERT(row < (int64_t) output_tokens.size);
+        return output_tokens.data[row];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid output token id %d, reason: %s\n", __func__, idx, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
     output_reorder();
 
@@ -1258,6 +1275,12 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_output_tokens(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    want_output_tokens = value;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2138,6 +2161,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             capture_mtp_seed_rows(t_embd_raw, seq_to_output_row, native_mtp, sched.get());
         }
 
+        if (output_tokens.has_data()) {
+            if (auto * t_output_tokens = res->get_output_tokens()) {
+                ggml_backend_t backend_tokens = ggml_backend_sched_get_tensor_backend(sched.get(), t_output_tokens);
+                GGML_ASSERT(backend_tokens != nullptr);
+                ggml_backend_tensor_get_async(
+                        backend_tokens,
+                        t_output_tokens,
+                        output_tokens.data + n_outputs_prev,
+                        0,
+                        sizeof(llama_token) * n_outputs);
+            } else {
+                std::fill_n(output_tokens.data + n_outputs_prev, n_outputs, LLAMA_TOKEN_NULL);
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2239,6 +2277,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
+    output_tokens.size = want_output_tokens ? n_outputs_max : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2255,7 +2294,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + backend_float_count) * sizeof(float) +
-        (                          backend_token_count) * sizeof(llama_token);
+        (output_tokens.size + backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2298,6 +2337,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
+
+    output_tokens = output_tokens.size > 0 ? buffer_view<llama_token>{(llama_token *) (base + offset), output_tokens.size} : buffer_view<llama_token>{nullptr, 0};
+    offset += output_tokens.size * sizeof(llama_token);
+
+    if (output_tokens.has_data()) {
+        std::fill_n(output_tokens.data, output_tokens.size, LLAMA_TOKEN_NULL);
+    }
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2503,6 +2549,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_seed_generation =*/ mtp_seed_generation,
         /*.mtp_tokens  =*/ mtp_tokens,
         /*.n_mtp       =*/ n_mtp,
+        /*.output_tokens =*/ want_output_tokens,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3424,6 +3471,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
 
+void llama_set_output_tokens(llama_context * ctx, bool output_tokens) {
+    ctx->set_output_tokens(output_tokens);
+}
+
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -3474,6 +3525,12 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+llama_token llama_get_output_token_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_output_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

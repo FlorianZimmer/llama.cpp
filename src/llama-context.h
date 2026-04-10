@@ -86,6 +86,7 @@ struct llama_context {
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
+    llama_token   get_output_token_ith(int32_t idx);
 
     float * get_sampled_logits_ith(int32_t idx);
     size_t  get_sampled_logits_count(int32_t idx);
@@ -109,6 +110,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_output_tokens(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -301,6 +303,8 @@ private:
     };
 
     sampling_info sampling;
+    buffer_view<llama_token> output_tokens = {nullptr, 0};
+    bool want_output_tokens = false;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

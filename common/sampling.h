@@ -43,6 +43,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
 
 // if accept_grammar is true, the token is accepted both by the sampling chain and the grammar
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar);
+void                    common_sampler_accept_n(struct common_sampler * gsmpl, const llama_tokens & tokens, bool accept_grammar);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
@@ -84,6 +85,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// true when direct argmax token outputs are guaranteed to match the current common sampler path
+bool common_sampler_can_accept_precomputed(const struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

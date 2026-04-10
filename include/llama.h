@@ -1038,6 +1038,10 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // Set whether the context should emit per-output argmax token ids alongside logits.
+    // This is a generic opt-in helper for consumers that can safely use direct greedy tokens.
+    LLAMA_API void llama_set_output_tokens(struct llama_context * ctx, bool output_tokens);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
@@ -1059,6 +1063,9 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Return the optional per-output argmax token id, or LLAMA_TOKEN_NULL when unavailable.
+    LLAMA_API llama_token llama_get_output_token_ith(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

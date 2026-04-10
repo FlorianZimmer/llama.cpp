@@ -55,6 +55,10 @@ static bool server_native_mtp_trace_enabled() {
     return enabled;
 }
 
+static bool server_native_mtp_can_use_output_fast_path(const common_sampler * smpl, bool native_mtp) {
+    return native_mtp && smpl != nullptr && common_sampler_can_accept_precomputed(smpl);
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -3117,6 +3121,20 @@ private:
             return ok;
         };
 
+        bool use_output_tokens = false;
+        for (const auto & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            if (server_native_mtp_can_use_output_fast_path(slot.smpl.get(), slot.uses_native_mtp())) {
+                use_output_tokens = true;
+                break;
+            }
+        }
+
+        llama_set_output_tokens(ctx, use_output_tokens);
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3310,7 +3328,32 @@ private:
                 result.n_draft   = slot.drafted.size();
                 result.drafted   = slot.drafted;
                 const int64_t t_accept_start = ggml_time_us();
-                result.ids       = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                if (server_native_mtp_can_use_output_fast_path(slot.smpl.get(), slot.uses_native_mtp())) {
+                    result.ids.reserve(slot.i_batch_dft.size());
+
+                    bool fast_accept_ok = true;
+                    for (size_t i = 0; i < slot.i_batch_dft.size(); ++i) {
+                        const llama_token id = llama_get_output_token_ith(ctx, slot.i_batch_dft[i]);
+                        if (id == LLAMA_TOKEN_NULL) {
+                            fast_accept_ok = false;
+                            break;
+                        }
+
+                        result.ids.push_back(id);
+
+                        if (i < slot.drafted.size() && slot.drafted[i] != id) {
+                            break;
+                        }
+                    }
+
+                    if (fast_accept_ok) {
+                        common_sampler_accept_n(slot.smpl.get(), result.ids, true);
+                    } else {
+                        result.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                    }
+                } else {
+                    result.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                }
                 if (slot.uses_native_mtp()) {
                     slot.native_mtp_profile.n_accept += 1;
                     slot.native_mtp_profile.t_accept_us += ggml_time_us() - t_accept_start;

@@ -852,6 +852,7 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_mtp_logits  = nullptr;
     t_mtp_tokens  = nullptr;
+    t_output_tokens = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -895,6 +896,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_mtp_tokens != nullptr) {
         ggml_set_output(t_mtp_tokens);
+    }
+    if (t_output_tokens != nullptr) {
+        ggml_set_output(t_output_tokens);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -1005,6 +1009,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_seed_generation(params.mtp_seed_generation),
     mtp_tokens       (params.mtp_tokens),
     n_mtp            (params.n_mtp),
+    output_tokens    (params.output_tokens),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2812,7 +2817,17 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    if (!res->t_logits) {
+        return;
+    }
+
+    if (output_tokens) {
+        res->t_output_tokens = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(res->t_output_tokens, "output_tokens");
+        ggml_build_forward_expand(gf, res->t_output_tokens);
+    }
+
+    if (samplers.empty()) {
         return;
     }
 

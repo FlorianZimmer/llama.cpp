@@ -450,6 +450,12 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+void common_sampler_accept_n(struct common_sampler * gsmpl, const llama_tokens & tokens, bool accept_grammar) {
+    for (const llama_token token : tokens) {
+        common_sampler_accept(gsmpl, token, accept_grammar);
+    }
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -642,6 +648,37 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+bool common_sampler_can_accept_precomputed(const struct common_sampler * gsmpl) {
+    if (gsmpl == nullptr) {
+        return false;
+    }
+
+    const auto & params = gsmpl->params;
+
+    // Keep this predicate deliberately strict. It is only valid when direct argmax over verifier
+    // logits is equivalent to the common sampler pipeline.
+    return
+        params.temp <= 0.0f &&
+        params.mirostat == 0 &&
+        params.grammar.empty() &&
+        !params.grammar_lazy &&
+        params.grammar_triggers.empty() &&
+        !params.has_logit_bias() &&
+        params.reasoning_budget_tokens < 0 &&
+        params.reasoning_budget_start.empty() &&
+        params.reasoning_budget_end.empty() &&
+        params.reasoning_budget_forced.empty() &&
+        params.penalty_repeat == 1.0f &&
+        params.penalty_freq == 0.0f &&
+        params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f &&
+        params.top_n_sigma < 0.0f &&
+        params.xtc_probability == 0.0f &&
+        params.typ_p == 1.0f &&
+        params.adaptive_target < 0.0f &&
+        params.n_probs == 0;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
