@@ -1,5 +1,36 @@
 # Native MTP Benchmarks
 
+## Benchmark Protocol
+
+The native-MTP optimization path should be benchmark-gated by end-to-end tok/s, not by internal phase timing alone.
+
+Required gate for any kept optimization:
+
+- compare against greedy baseline on the same model and case
+- compare against the immediately previous native-MTP step
+- require exact `np=1` output match to greedy baseline
+- treat `np>1` on hybrid/recurrent native-MTP as stability-only, not strict exactness
+- ignore sub-1% movement unless it repeats consistently
+
+Current dense-CUDA primary gate:
+
+- model: `/mnt/models/GGUF/Qwen3.5-9B-MTP-UD-Q4_K_XL.gguf`
+- case: `primary`
+- prompt: `Write one short sentence about Berlin.`
+- seed: `42`
+- `n_predict=12`
+- `-np 1`
+- `draft-max=1`
+- `threads=4`
+- `threads-batch=4`
+
+Supporting CUDA gates:
+
+- `good`: Moon exact/stable case
+- `bad`: Rust replay-heavy stability case
+
+The authoritative harness for this protocol is [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py), which now supports repeated runs, structured JSON output, optional profile parsing, and relaxed `np>1` validation for the documented hybrid/recurrent limitation.
+
 Bench date: 2026-04-09
 
 Model:
