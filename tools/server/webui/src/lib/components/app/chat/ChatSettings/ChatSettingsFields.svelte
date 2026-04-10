@@ -1,15 +1,17 @@
 <script lang="ts">
-	import { RotateCcw } from '@lucide/svelte';
+	import { RotateCcw, FlaskConical } from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import { Input } from '$lib/components/ui/input';
 	import Label from '$lib/components/ui/label/label.svelte';
 	import * as Select from '$lib/components/ui/select';
 	import { Textarea } from '$lib/components/ui/textarea';
-	import { SETTING_CONFIG_DEFAULT, SETTING_CONFIG_INFO } from '$lib/constants/settings-config';
-	import { supportsVision } from '$lib/stores/server.svelte';
-	import { getParameterInfo, resetParameterToServerDefault } from '$lib/stores/settings.svelte';
-	import { ParameterSyncService } from '$lib/services/parameter-sync';
-	import ParameterSourceIndicator from './ParameterSourceIndicator.svelte';
+	import { SETTING_CONFIG_INFO, SETTINGS_KEYS } from '$lib/constants';
+	import { SettingsFieldType } from '$lib/enums/settings';
+	import { settingsStore } from '$lib/stores/settings.svelte';
+	import { serverStore } from '$lib/stores/server.svelte';
+	import { modelsStore, selectedModelName } from '$lib/stores/models.svelte';
+	import { normalizeFloatingPoint } from '$lib/utils/precision';
+	import { ChatSettingsParameterSourceIndicator } from '$lib/components/app';
 	import type { Component } from 'svelte';
 
 	interface Props {
@@ -21,45 +23,50 @@
 
 	let { fields, localConfig, onConfigChange, onThemeChange }: Props = $props();
 
-	// Helper function to get parameter source info for syncable parameters
-	function getParameterSourceInfo(key: string) {
-		if (!ParameterSyncService.canSyncParameter(key)) {
-			return null;
+	// server sampling defaults for placeholders
+	let sp = $derived.by(() => {
+		if (serverStore.isRouterMode) {
+			const m = selectedModelName();
+			if (m) {
+				const p = modelsStore.getModelProps(m);
+				return (p?.default_generation_settings?.params ?? {}) as Record<string, unknown>;
+			}
 		}
-
-		return getParameterInfo(key);
-	}
+		return (serverStore.defaultParams ?? {}) as Record<string, unknown>;
+	});
 </script>
 
 {#each fields as field (field.key)}
 	<div class="space-y-2">
-		{#if field.type === 'input'}
-			{@const paramInfo = getParameterSourceInfo(field.key)}
+		{#if field.type === SettingsFieldType.INPUT}
 			{@const currentValue = String(localConfig[field.key] ?? '')}
-			{@const propsDefault = paramInfo?.serverDefault}
+			{@const serverDefault = sp[field.key]}
 			{@const isCustomRealTime = (() => {
-				if (!paramInfo || propsDefault === undefined) return false;
+				if (serverDefault == null) return false;
+				if (currentValue === '') return false;
 
-				// Apply same rounding logic for real-time comparison
-				const inputValue = currentValue;
-				const numericInput = parseFloat(inputValue);
+				const numericInput = parseFloat(currentValue);
 				const normalizedInput = !isNaN(numericInput)
 					? Math.round(numericInput * 1000000) / 1000000
-					: inputValue;
+					: currentValue;
 				const normalizedDefault =
-					typeof propsDefault === 'number'
-						? Math.round(propsDefault * 1000000) / 1000000
-						: propsDefault;
+					typeof serverDefault === 'number'
+						? Math.round(serverDefault * 1000000) / 1000000
+						: serverDefault;
 
 				return normalizedInput !== normalizedDefault;
 			})()}
 
 			<div class="flex items-center gap-2">
-				<Label for={field.key} class="text-sm font-medium">
+				<Label for={field.key} class="flex items-center gap-1.5 text-sm font-medium">
 					{field.label}
+
+					{#if field.isExperimental}
+						<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
+					{/if}
 				</Label>
 				{#if isCustomRealTime}
-					<ParameterSourceIndicator />
+					<ChatSettingsParameterSourceIndicator />
 				{/if}
 			</div>
 
@@ -71,17 +78,17 @@
 						// Update local config immediately for real-time badge feedback
 						onConfigChange(field.key, e.currentTarget.value);
 					}}
-					placeholder={`Default: ${SETTING_CONFIG_DEFAULT[field.key] ?? 'none'}`}
+					placeholder={sp[field.key] != null
+						? `Default: ${normalizeFloatingPoint(sp[field.key])}`
+						: ''}
 					class="w-full {isCustomRealTime ? 'pr-8' : ''}"
 				/>
 				{#if isCustomRealTime}
 					<button
 						type="button"
 						onclick={() => {
-							resetParameterToServerDefault(field.key);
-							// Trigger UI update by calling onConfigChange with the default value
-							const defaultValue = propsDefault ?? SETTING_CONFIG_DEFAULT[field.key];
-							onConfigChange(field.key, String(defaultValue));
+							settingsStore.resetParameterToServerDefault(field.key);
+							onConfigChange(field.key, '');
 						}}
 						class="absolute top-1/2 right-2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded transition-colors hover:bg-muted"
 						aria-label="Reset to default"
@@ -93,47 +100,68 @@
 			</div>
 			{#if field.help || SETTING_CONFIG_INFO[field.key]}
 				<p class="mt-1 text-xs text-muted-foreground">
-					{field.help || SETTING_CONFIG_INFO[field.key]}
+					{@html field.help || SETTING_CONFIG_INFO[field.key]}
 				</p>
 			{/if}
-		{:else if field.type === 'textarea'}
-			<Label for={field.key} class="block text-sm font-medium">
+		{:else if field.type === SettingsFieldType.TEXTAREA}
+			<Label for={field.key} class="block flex items-center gap-1.5 text-sm font-medium">
 				{field.label}
+
+				{#if field.isExperimental}
+					<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
+				{/if}
 			</Label>
 
 			<Textarea
 				id={field.key}
 				value={String(localConfig[field.key] ?? '')}
 				onchange={(e) => onConfigChange(field.key, e.currentTarget.value)}
-				placeholder={`Default: ${SETTING_CONFIG_DEFAULT[field.key] ?? 'none'}`}
-				class="min-h-[100px] w-full md:max-w-2xl"
+				placeholder=""
+				class="min-h-[10rem] w-full md:max-w-2xl"
 			/>
+
 			{#if field.help || SETTING_CONFIG_INFO[field.key]}
 				<p class="mt-1 text-xs text-muted-foreground">
 					{field.help || SETTING_CONFIG_INFO[field.key]}
 				</p>
 			{/if}
-		{:else if field.type === 'select'}
+
+			{#if field.key === SETTINGS_KEYS.SYSTEM_MESSAGE}
+				<div class="mt-3 flex items-center gap-2">
+					<Checkbox
+						id="showSystemMessage"
+						checked={Boolean(localConfig.showSystemMessage ?? true)}
+						onCheckedChange={(checked) => onConfigChange('showSystemMessage', Boolean(checked))}
+					/>
+
+					<Label for="showSystemMessage" class="cursor-pointer text-sm font-normal">
+						Show system message in conversations
+					</Label>
+				</div>
+			{/if}
+		{:else if field.type === SettingsFieldType.SELECT}
 			{@const selectedOption = field.options?.find(
 				(opt: { value: string; label: string; icon?: Component }) =>
 					opt.value === localConfig[field.key]
 			)}
-			{@const paramInfo = getParameterSourceInfo(field.key)}
 			{@const currentValue = localConfig[field.key]}
-			{@const propsDefault = paramInfo?.serverDefault}
+			{@const serverDefault = sp[field.key]}
 			{@const isCustomRealTime = (() => {
-				if (!paramInfo || propsDefault === undefined) return false;
-
-				// For select fields, do direct comparison (no rounding needed)
-				return currentValue !== propsDefault;
+				if (serverDefault == null) return false;
+				if (currentValue === '' || currentValue === undefined) return false;
+				return currentValue !== serverDefault;
 			})()}
 
 			<div class="flex items-center gap-2">
-				<Label for={field.key} class="text-sm font-medium">
+				<Label for={field.key} class="flex items-center gap-1.5 text-sm font-medium">
 					{field.label}
+
+					{#if field.isExperimental}
+						<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
+					{/if}
 				</Label>
 				{#if isCustomRealTime}
-					<ParameterSourceIndicator />
+					<ChatSettingsParameterSourceIndicator />
 				{/if}
 			</div>
 
@@ -141,7 +169,7 @@
 				type="single"
 				value={currentValue}
 				onValueChange={(value) => {
-					if (field.key === 'theme' && value && onThemeChange) {
+					if (field.key === SETTINGS_KEYS.THEME && value && onThemeChange) {
 						onThemeChange(value);
 					} else {
 						onConfigChange(field.key, value);
@@ -163,10 +191,8 @@
 						<button
 							type="button"
 							onclick={() => {
-								resetParameterToServerDefault(field.key);
-								// Trigger UI update by calling onConfigChange with the default value
-								const defaultValue = propsDefault ?? SETTING_CONFIG_DEFAULT[field.key];
-								onConfigChange(field.key, String(defaultValue));
+								settingsStore.resetParameterToServerDefault(field.key);
+								onConfigChange(field.key, '');
 							}}
 							class="absolute top-1/2 right-8 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded transition-colors hover:bg-muted"
 							aria-label="Reset to default"
@@ -197,14 +223,11 @@
 					{field.help || SETTING_CONFIG_INFO[field.key]}
 				</p>
 			{/if}
-		{:else if field.type === 'checkbox'}
-			{@const isDisabled = field.key === 'pdfAsImage' && !supportsVision()}
-
+		{:else if field.type === SettingsFieldType.CHECKBOX}
 			<div class="flex items-start space-x-3">
 				<Checkbox
 					id={field.key}
 					checked={Boolean(localConfig[field.key])}
-					disabled={isDisabled}
 					onCheckedChange={(checked) => onConfigChange(field.key, checked)}
 					class="mt-1"
 				/>
@@ -212,21 +235,18 @@
 				<div class="space-y-1">
 					<label
 						for={field.key}
-						class="cursor-pointer text-sm leading-none font-medium {isDisabled
-							? 'text-muted-foreground'
-							: ''}"
+						class="flex cursor-pointer items-center gap-1.5 pt-1 pb-0.5 text-sm leading-none font-medium"
 					>
 						{field.label}
+
+						{#if field.isExperimental}
+							<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
+						{/if}
 					</label>
 
 					{#if field.help || SETTING_CONFIG_INFO[field.key]}
 						<p class="text-xs text-muted-foreground">
 							{field.help || SETTING_CONFIG_INFO[field.key]}
-						</p>
-					{:else if field.key === 'pdfAsImage' && !supportsVision()}
-						<p class="text-xs text-muted-foreground">
-							PDF-to-image processing requires a vision-capable model. PDFs will be processed as
-							text.
 						</p>
 					{/if}
 				</div>

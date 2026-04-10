@@ -5,13 +5,46 @@ find_package(Threads REQUIRED)
 add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
+            mtmd-image.cpp
             mtmd.h
+            mtmd-helper.cpp
+            mtmd-helper.h
             clip.cpp
             clip.h
             clip-impl.h
-            mtmd-helper.cpp
-            mtmd-helper.h
+            clip-model.h
+            clip-graph.h
+            models/models.h
+            models/cogvlm.cpp
+            models/conformer.cpp
+            models/dotsocr.cpp
+            models/gemma4v.cpp
+            models/glm4v.cpp
+            models/hunyuanocr.cpp
+            models/internvl.cpp
+            models/kimivl.cpp
+            models/kimik25.cpp
+            models/nemotron-v2-vl.cpp
+            models/llama4.cpp
+            models/llava.cpp
+            models/minicpmv.cpp
+            models/paddleocr.cpp
+            models/pixtral.cpp
+            models/qwen2vl.cpp
+            models/qwen3vl.cpp
+            models/step3vl.cpp
+            models/siglip.cpp
+            models/whisper-enc.cpp
+            models/deepseekocr.cpp
+            models/mobilenetv5.cpp
+            models/youtuvl.cpp
             )
+
+set_target_properties(mtmd PROPERTIES
+    VERSION ${LLAMA_INSTALL_VERSION}
+    SOVERSION 0
+    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
 
 target_link_libraries     (mtmd PUBLIC ggml llama)
 target_link_libraries     (mtmd PRIVATE Threads::Threads)
@@ -35,6 +68,10 @@ set_target_properties(mtmd
     PROPERTIES
     PUBLIC_HEADER "${MTMD_PUBLIC_HEADERS}")
 
+set_target_properties(mtmd
+    PROPERTIES
+    PRIVATE_HEADER debug/mtmd-debug.h)
+
 install(TARGETS mtmd LIBRARY PUBLIC_HEADER)
 
 if (NOT MSVC)
@@ -45,6 +82,15 @@ endif()
 if (TARGET BUILD_INFO)
     add_dependencies(mtmd        BUILD_INFO)
     add_dependencies(mtmd-helper BUILD_INFO)
+endif()
+
+# if mtmd is linked against common, we throw an error
+if (TARGET mtmd)
+    get_target_property(libs mtmd LINK_LIBRARIES)
+    if (libs AND "common" IN_LIST libs)
+        message(FATAL_ERROR "mtmd is designed to be a public library.\n"
+                            "It must not link against common")
+    endif()
 endif()
 
 add_executable(llama-llava-cli    deprecation-warning.cpp)
@@ -60,3 +106,9 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 target_link_libraries  (${TARGET} PRIVATE common mtmd Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# mtmd-debug tool
+add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
+set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
+target_link_libraries(llama-mtmd-debug PRIVATE common mtmd Threads::Threads)
+target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)

@@ -13,6 +13,18 @@ float16_t dequantFuncF32(const in decodeBufF32 bl, const in uint blockCoords[2],
     return vf16[idx];
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ1_0 {
+   block_q1_0 block;
+};
+
+float16_t dequantFuncQ1_0(const in decodeBufQ1_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+    const uint bit = (uint(bl.block.qs[(idx & 0x78) >> 3]) >> (idx & 0x7)) & 1u;
+    return bit != 0u ? d : -d;
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };
@@ -120,7 +132,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer decodeBufQ2
 float16_t dequantFuncQ2_K(const in decodeBufQ2_K bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
     decodeBufQ2_K_packed16 bl16 = decodeBufQ2_K_packed16(bl);
-    const f16vec2 d = bl.block.d;
+    const f16vec2 dm = bl.block.dm;
     const uint idx = coordInBlock[1];
 
     const uint scalesi = (idx & 0xF0) >> 4;             // 0..15
@@ -131,7 +143,7 @@ float16_t dequantFuncQ2_K(const in decodeBufQ2_K bl, const in uint blockCoords[2
     qs = unpack8(qs)[idx & 1];
 
     const uint scales = bl.block.scales[scalesi];
-    float16_t ret = d.x * float16_t(scales & 0xF) * float16_t(qs) - d.y * float16_t(scales >> 4);
+    float16_t ret = dm.x * float16_t(scales & 0xF) * float16_t(qs) - dm.y * float16_t(scales >> 4);
     return ret;
 }
 
@@ -680,12 +692,14 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
     uint32_t qs = bl.block.qs[iqs];
     qs >>= shift;
     qs &= 0xF;
-    float16_t ret = float16_t(kvalues_mxfp4[qs] * d);
+    float16_t ret = float16_t(kvalues_mxfp4[qs] * d * 0.5);
     return ret;
 }
 #endif
 
-#if defined(DATA_A_Q4_0)
+#if defined(DATA_A_Q1_0)
+#define dequantFuncA dequantFuncQ1_0
+#elif defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #elif defined(DATA_A_Q4_1)
 #define dequantFuncA dequantFuncQ4_1
