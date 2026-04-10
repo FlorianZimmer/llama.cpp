@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import json
 import signal
+import statistics
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,7 @@ DEFAULT_N_PREDICT = 8
 
 @dataclass
 class ScenarioResult:
+    repeat: int
     mode: str
     n_parallel: int
     outputs: list[str]
@@ -105,6 +107,21 @@ def describe_response(resp: dict[str, Any]) -> str:
     return ", ".join(extra)
 
 
+def summarize_predicted_per_second(responses: list[dict[str, Any]]) -> dict[str, float | list[float]]:
+    values = [float(resp["timings"]["predicted_per_second"]) for resp in responses]
+    summary: dict[str, float | list[float]] = {
+        "values": values,
+        "mean": statistics.fmean(values) if values else 0.0,
+        "min": min(values) if values else 0.0,
+        "max": max(values) if values else 0.0,
+    }
+    if len(values) > 1:
+        summary["stddev"] = statistics.pstdev(values)
+    else:
+        summary["stddev"] = 0.0
+    return summary
+
+
 def launch_server(
     binary: Path,
     model: Path,
@@ -147,7 +164,7 @@ def launch_server(
     if mode == "mtp":
         cmd.extend(["--spec-type", "mtp", "--draft-max", str(args.draft_max)])
 
-    log_path = log_dir / f"{mode}-np{n_parallel}.log"
+    log_path = log_dir / f"{mode}-np{n_parallel}-r{args._repeat_idx}.log"
     fout = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
         cmd,
@@ -179,6 +196,7 @@ def run_scenario(
     port: int,
     mode: str,
     n_parallel: int,
+    repeat: int,
     args: argparse.Namespace,
     log_dir: Path,
 ) -> ScenarioResult:
@@ -193,6 +211,7 @@ def run_scenario(
 
     outputs = [resp["content"] for resp in responses]
     return ScenarioResult(
+        repeat=repeat,
         mode=mode,
         n_parallel=n_parallel,
         outputs=outputs,
@@ -209,11 +228,85 @@ def assert_equal_outputs(lhs: ScenarioResult, rhs: ScenarioResult) -> None:
 
 
 def print_result(res: ScenarioResult) -> None:
-    print(f"{res.mode} np={res.n_parallel}")
+    print(f"{res.mode} np={res.n_parallel} repeat={res.repeat}")
     for idx, resp in enumerate(res.responses):
         print(f"  req{idx}: {describe_response(resp)}")
         print(f"  req{idx}: content={resp['content']!r}")
     print(f"  log={res.log_path}")
+
+
+def summarize_runs(runs: list[ScenarioResult]) -> dict[str, Any]:
+    per_request_values: list[list[float]] = []
+    for run in runs:
+        timings = [float(resp["timings"]["predicted_per_second"]) for resp in run.responses]
+        if not per_request_values:
+            per_request_values = [[] for _ in timings]
+        for idx, value in enumerate(timings):
+            per_request_values[idx].append(value)
+
+    request_summaries = [
+        {
+            "request_index": idx,
+            "mean": statistics.fmean(values) if values else 0.0,
+            "min": min(values) if values else 0.0,
+            "max": max(values) if values else 0.0,
+            "stddev": statistics.pstdev(values) if len(values) > 1 else 0.0,
+            "values": values,
+        }
+        for idx, values in enumerate(per_request_values)
+    ]
+
+    run_means = [
+        statistics.fmean([float(resp["timings"]["predicted_per_second"]) for resp in run.responses])
+        for run in runs
+    ]
+
+    return {
+        "repeats": len(runs),
+        "run_mean_predicted_per_second": {
+            "mean": statistics.fmean(run_means) if run_means else 0.0,
+            "min": min(run_means) if run_means else 0.0,
+            "max": max(run_means) if run_means else 0.0,
+            "stddev": statistics.pstdev(run_means) if len(run_means) > 1 else 0.0,
+            "values": run_means,
+        },
+        "per_request": request_summaries,
+    }
+
+
+def write_json_report(path: Path, args: argparse.Namespace, results: dict[tuple[str, int], list[ScenarioResult]]) -> None:
+    scenarios: list[dict[str, Any]] = []
+    for (mode, n_parallel), runs in sorted(results.items()):
+        scenarios.append(
+            {
+                "mode": mode,
+                "n_parallel": n_parallel,
+                "summary": summarize_runs(runs),
+                "runs": [
+                    {
+                        "repeat": run.repeat,
+                        "outputs": run.outputs,
+                        "timings_summary": summarize_predicted_per_second(run.responses),
+                        "responses": run.responses,
+                        "log_path": str(run.log_path),
+                    }
+                    for run in runs
+                ],
+            }
+        )
+
+    payload = {
+        "binary": str(Path(args.binary).resolve()),
+        "model": str(Path(args.model).resolve()),
+        "prompt": args.prompt,
+        "seed": args.seed,
+        "n_predict": args.n_predict,
+        "repeat": args.repeat,
+        "allow_known_np2_divergence": args.allow_known_np2_divergence,
+        "scenarios": scenarios,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def main() -> int:
@@ -235,6 +328,13 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=float, default=180.0, help="Seconds to wait for server health")
     parser.add_argument("--draft-max", type=int, default=1, help="Value for --draft-max in mtp mode")
     parser.add_argument("--log-dir", default=None, help="Directory for per-scenario logs")
+    parser.add_argument("--repeat", type=int, default=1, help="How many times to rerun each scenario")
+    parser.add_argument("--json-out", default=None, help="Optional path for a machine-readable JSON report")
+    parser.add_argument(
+        "--allow-known-np2-divergence",
+        action="store_true",
+        help="Allow the known native-MTP np>1 exactness limitation while still requiring valid responses",
+    )
     args = parser.parse_args()
 
     binary = Path(args.binary).resolve()
@@ -252,55 +352,81 @@ def main() -> int:
     print(f"logs={log_dir}")
 
     scenarios = [
-        ("baseline", 1, args.port_base + 0),
-        ("mtp", 1, args.port_base + 1),
-        ("baseline", 2, args.port_base + 2),
-        ("mtp", 2, args.port_base + 3),
+        ("baseline", 1),
+        ("mtp", 1),
+        ("baseline", 2),
+        ("mtp", 2),
     ]
 
-    results: dict[tuple[str, int], ScenarioResult] = {}
+    results: dict[tuple[str, int], list[ScenarioResult]] = {}
 
-    for mode, n_parallel, port in scenarios:
-        print(f"\n== running {mode} np={n_parallel} on port {port} ==")
-        results[(mode, n_parallel)] = run_scenario(
-            binary=binary,
-            model=model,
-            host=args.host,
-            port=port,
-            mode=mode,
-            n_parallel=n_parallel,
-            args=args,
-            log_dir=log_dir,
-        )
-        print_result(results[(mode, n_parallel)])
+    for repeat in range(args.repeat):
+        args._repeat_idx = repeat
+        for scenario_idx, (mode, n_parallel) in enumerate(scenarios):
+            port = args.port_base + repeat * 16 + scenario_idx
+            print(f"\n== running {mode} np={n_parallel} repeat={repeat + 1}/{args.repeat} on port {port} ==")
+            result = run_scenario(
+                binary=binary,
+                model=model,
+                host=args.host,
+                port=port,
+                mode=mode,
+                n_parallel=n_parallel,
+                repeat=repeat,
+                args=args,
+                log_dir=log_dir,
+            )
+            print_result(result)
+            results.setdefault((mode, n_parallel), []).append(result)
 
     print("\n== validating exact greedy equality ==")
-    assert_equal_outputs(results[("baseline", 1)], results[("mtp", 1)])
-    assert_equal_outputs(results[("baseline", 2)], results[("mtp", 2)])
+    baseline_np1_runs = results[("baseline", 1)]
+    mtp_np1_runs = results[("mtp", 1)]
+    baseline_np2_runs = results[("baseline", 2)]
+    mtp_np2_runs = results[("mtp", 2)]
+
+    for repeat, (baseline_run, mtp_run) in enumerate(zip(baseline_np1_runs, mtp_np1_runs, strict=True)):
+        assert_equal_outputs(baseline_run, mtp_run)
+        if not args.allow_known_np2_divergence:
+            assert_equal_outputs(baseline_np2_runs[repeat], mtp_np2_runs[repeat])
 
     for n_parallel in (1, 2):
-        mtp = results[("mtp", n_parallel)]
-        if not any(resp.get("timings", {}).get("draft_n", 0) > 0 for resp in mtp.responses):
-            raise AssertionError(f"mtp np={n_parallel} did not report any native draft activity")
+        for mtp_run in results[("mtp", n_parallel)]:
+            if not any(resp.get("timings", {}).get("draft_n", 0) > 0 for resp in mtp_run.responses):
+                raise AssertionError(f"mtp np={n_parallel} repeat={mtp_run.repeat} did not report any native draft activity")
 
-    baseline_output = results[("baseline", 1)].outputs[0]
-    for key, res in results.items():
-        for out in res.outputs:
-            if out != baseline_output:
-                raise AssertionError(f"scenario {key} output {out!r} does not match baseline np=1 output {baseline_output!r}")
+    for repeat, baseline_run in enumerate(baseline_np1_runs):
+        baseline_output = baseline_run.outputs[0]
+        for key, scenario_runs in results.items():
+            mode, n_parallel = key
+            if args.allow_known_np2_divergence and mode == "mtp" and n_parallel == 2:
+                continue
+            for run in scenario_runs:
+                if run.repeat != repeat:
+                    continue
+                for out in run.outputs:
+                    if out != baseline_output:
+                        raise AssertionError(
+                            f"scenario {key} repeat={repeat} output {out!r} does not match baseline np=1 output {baseline_output!r}"
+                        )
 
-    print("all greedy outputs match exactly")
+    if args.allow_known_np2_divergence:
+        print("all required greedy outputs match exactly; mtp np=2 divergence was allowed for this run")
+    else:
+        print("all greedy outputs match exactly")
 
     print("\n== summary ==")
     for n_parallel in (1, 2):
-        baseline = results[("baseline", n_parallel)]
-        mtp = results[("mtp", n_parallel)]
-        baseline_tps = [resp["timings"]["predicted_per_second"] for resp in baseline.responses]
-        mtp_tps = [resp["timings"]["predicted_per_second"] for resp in mtp.responses]
+        baseline_summary = summarize_runs(results[("baseline", n_parallel)])
+        mtp_summary = summarize_runs(results[("mtp", n_parallel)])
         print(
-            f"np={n_parallel}: baseline tok/s={baseline_tps}, "
-            f"mtp tok/s={mtp_tps}"
+            f"np={n_parallel}: baseline run-mean tok/s={baseline_summary['run_mean_predicted_per_second']['values']}, "
+            f"mtp run-mean tok/s={mtp_summary['run_mean_predicted_per_second']['values']}"
         )
+
+    if args.json_out:
+        write_json_report(Path(args.json_out).resolve(), args, results)
+        print(f"json={Path(args.json_out).resolve()}")
 
     return 0
 

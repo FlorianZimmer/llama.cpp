@@ -40,6 +40,30 @@ With the backend-resident seed transport enabled on CUDA, the exact Berlin and M
 
 ## Method
 
+## Benchmark Protocol
+
+Every default-on native-MTP performance change should be measured against:
+
+- greedy baseline on the same binary
+- the immediately previous landed native-MTP step
+- Berlin exact at `np=1`, stability-only at `np=2`: seed `42`, `n_predict=48`
+- Moon exact at `np=1`, stability-only at `np=2`: seed `31415`, `n_predict=64`
+- Rust stress: `np=2`, seed `777`, `n_predict=64`
+
+Practical rules:
+
+- keep Berlin and Moon exact for `np=1`
+- treat Berlin, Moon, and Rust at `np > 1` as stability-only cases on this hybrid/recurrent native-MTP CUDA path unless batch-invariance work changes the contract
+- judge success by end-to-end tok/s, not by lower internal `t_*` counters alone
+- treat sub-`1%` movement as noise unless it repeats clearly across reruns
+- drop or park a candidate if it only helps the Rust stress case or only moves micro-profile timings
+
+The validation harness for this protocol now supports:
+
+- `--repeat` for repeated scenario runs
+- `--json-out` for machine-readable baseline/current comparisons
+- `--allow-known-np2-divergence` for any `np > 1` stability-only run on this path
+
 Common settings:
 
 - `ctx-size=4096`

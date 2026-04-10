@@ -1850,20 +1850,32 @@ static void capture_mtp_seed_rows(
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
     GGML_ASSERT(row_size == (size_t) dst.n_embd * sizeof(float));
 
-    dst.next_seed_epoch();
-
-    if (!mtp_capture_seed_rows_backend(tensor, seq_to_row, dst, sched, row_size)) {
-        // Keep the old host round-trip path for host-backed and single-sequence fallback.
-        // On non-host backends with multiple live sequences, dropping back to host can still
-        // hit the existing hybrid/recurrent np>1 exactness limitation, so prefer no seed.
-        if (tensor->buffer != nullptr &&
-            !ggml_backend_buffer_is_host(tensor->buffer) &&
-            seq_to_row.size() > 1 &&
-            !mtp_backend_seed_force_host()) {
+    switch (dst.seed_mode) {
+        case LLAMA_MTP_SEED_MODE_BACKEND:
+            mtp_capture_seed_rows_backend(tensor, seq_to_row, dst, sched, row_size);
             return;
-        }
-        mtp_capture_seed_rows_host(tensor, seq_to_row, dst, sched, row_size);
+        case LLAMA_MTP_SEED_MODE_HOST:
+            mtp_capture_seed_rows_host(tensor, seq_to_row, dst, sched, row_size);
+            return;
+        case LLAMA_MTP_SEED_MODE_NONE:
+            break;
     }
+
+    if (mtp_capture_seed_rows_backend(tensor, seq_to_row, dst, sched, row_size)) {
+        return;
+    }
+
+    // Keep the old host round-trip path for host-backed and single-sequence fallback.
+    // On non-host backends with multiple live sequences, dropping back to host can still
+    // hit the existing hybrid/recurrent np>1 exactness limitation, so prefer no seed.
+    if (tensor->buffer != nullptr &&
+        !ggml_backend_buffer_is_host(tensor->buffer) &&
+        seq_to_row.size() > 1 &&
+        !mtp_backend_seed_force_host()) {
+        return;
+    }
+
+    mtp_capture_seed_rows_host(tensor, seq_to_row, dst, sched, row_size);
 }
 
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
@@ -2019,6 +2031,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    if (native_mtp.enabled()) {
+        native_mtp.next_seed_epoch();
+    }
 
     int64_t n_outputs_prev = 0;
 
