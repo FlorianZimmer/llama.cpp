@@ -1277,6 +1277,12 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_output_logits(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    want_output_logits = value;
+}
+
 void llama_context::set_output_tokens(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2262,7 +2268,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits = true;
+    bool has_logits = want_output_logits;
     bool has_embd   = cparams.embeddings;
 
     // TODO: hacky enc-dec support
@@ -3473,6 +3479,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_output_tokens(llama_context * ctx, bool output_tokens) {
     ctx->set_output_tokens(output_tokens);
+}
+
+void llama_set_output_logits(llama_context * ctx, bool output_logits) {
+    ctx->set_output_logits(output_logits);
 }
 
 void llama_synchronize(llama_context * ctx) {

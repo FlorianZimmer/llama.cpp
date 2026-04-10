@@ -31,6 +31,23 @@ Supporting CUDA gates:
 
 The authoritative harness for this protocol is [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py), which now supports repeated runs, structured JSON output, optional profile parsing, and relaxed `np>1` validation for the documented hybrid/recurrent limitation.
 
+## Current Optimization Status
+
+Dense 9B CUDA optimization steps on top of the upstream-prep native-MTP path:
+
+| Step | Change | Primary `np=1` result | Status |
+| --- | --- | --- | --- |
+| 0 | Benchmark gate only | baseline `175.31`, mtp `162.54` | reference |
+| 1 | Greedy verifier-accept fast path | baseline `175.55`, mtp `164.12` | kept |
+| 2 | Dedicated MTP scheduler/result cache | no repeatable win | dropped |
+| 3 | Skip raw-logit downloads on token-only greedy verifier chunks | baseline `171.32`, mtp `167.04` on the primary gate; `np=2` short primary about break-even/slightly positive | kept |
+
+Notes:
+
+- Step 1 reduced accept-path overhead by bypassing the generic sampler path when direct greedy verifier tokens were already available.
+- The dedicated MTP scheduler experiment did not materially move the draft bucket under repeated measurement, so it was not kept.
+- Step 3 keeps the change generic: the server can disable raw-logit output only for decode chunks that are fully covered by the token-only native-MTP greedy path.
+
 Bench date: 2026-04-09
 
 Model:

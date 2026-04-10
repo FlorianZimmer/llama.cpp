@@ -1042,6 +1042,10 @@ extern "C" {
     // This is a generic opt-in helper for consumers that can safely use direct greedy tokens.
     LLAMA_API void llama_set_output_tokens(struct llama_context * ctx, bool output_tokens);
 
+    // Set whether the context should make raw logits available through llama_get_logits*().
+    // Disabling this can reduce output-transfer overhead for consumers that only need token ids.
+    LLAMA_API void llama_set_output_logits(struct llama_context * ctx, bool output_logits);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

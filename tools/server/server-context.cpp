@@ -3121,20 +3121,6 @@ private:
             return ok;
         };
 
-        bool use_output_tokens = false;
-        for (const auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING) {
-                continue;
-            }
-
-            if (server_native_mtp_can_use_output_fast_path(slot.smpl.get(), slot.uses_native_mtp())) {
-                use_output_tokens = true;
-                break;
-            }
-        }
-
-        llama_set_output_tokens(ctx, use_output_tokens);
-
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3148,6 +3134,41 @@ private:
                 batch.seq_id   + i,
                 batch.logits   + i,
             };
+
+            bool use_output_tokens = false;
+            bool disable_output_logits = true;
+            bool has_output_rows = false;
+
+            for (int32_t j = 0; j < n_tokens; ++j) {
+                if (!batch_view.logits[j]) {
+                    continue;
+                }
+
+                has_output_rows = true;
+
+                const int32_t batch_idx = i + j;
+                const llama_seq_id seq_id = batch_view.seq_id[j][0];
+
+                const auto it_slot = std::find_if(slots.begin(), slots.end(), [seq_id](const server_slot & slot) {
+                    return slot.id == seq_id;
+                });
+
+                if (it_slot == slots.end() ||
+                    !server_native_mtp_can_use_output_fast_path(it_slot->smpl.get(), it_slot->uses_native_mtp()) ||
+                    std::find(it_slot->i_batch_dft.begin(), it_slot->i_batch_dft.end(), batch_idx) == it_slot->i_batch_dft.end()) {
+                    disable_output_logits = false;
+                    continue;
+                }
+
+                use_output_tokens = true;
+            }
+
+            if (!has_output_rows) {
+                disable_output_logits = false;
+            }
+
+            llama_set_output_tokens(ctx, use_output_tokens);
+            llama_set_output_logits(ctx, !disable_output_logits);
 
             const int ret = llama_decode(ctx, batch_view);
 

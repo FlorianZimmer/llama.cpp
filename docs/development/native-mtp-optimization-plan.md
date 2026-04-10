@@ -56,6 +56,10 @@ Fixed CUDA cases:
 
 This step is mandatory before runtime changes are judged.
 
+Status:
+
+- landed in commit `47ba219dd`
+
 ### 2. Reduce accept-path overhead first
 
 Primary target:
@@ -82,7 +86,35 @@ Why this is first:
 
 - accept cost is currently the largest recurring bucket and is paid every speculative step
 
-### 3. Check draft-path hot reuse before redesigning it
+Status:
+
+- landed in commit `5cfd26302`
+- result: small but repeatable `np=1` gain on the dense 9B CUDA gate from direct greedy verifier-token accept, with generic fallback still intact
+
+### 3. Reduce verifier output-transfer cost on the same greedy path
+
+Primary targets:
+
+- `tools/server/server-context.cpp`
+- `src/llama-context.cpp`
+- `include/llama.h`
+
+Approach:
+
+- keep the greedy verifier-token fast path from step 2
+- when a decode chunk consists only of pure-greedy native-MTP verifier outputs, request output tokens but suppress raw-logit downloads for that chunk
+- keep raw logits enabled for all mixed or generic sampling batches
+
+Why this is next:
+
+- after step 2, the remaining accept cost is still dominated by always-paid verifier output handling
+- this keeps the change generic and local, without model-specific hacks
+
+Status:
+
+- landed locally after step 2
+- result: another small but repeatable `np=1` gain on the dense 9B CUDA gate, plus break-even/slightly positive behavior on the short primary `np=2` case
+### 4. Check draft-path hot reuse before redesigning it
 
 Primary target:
 
@@ -99,7 +131,13 @@ Do not:
 - start a second standalone seed-path project
 - add a dedicated scheduler unless counters show it is necessary
 
-### 4. Add a conservative replay-triggered cooldown
+Status:
+
+- attempted with a dedicated MTP scheduler/result cache
+- dropped
+- reason: end-to-end gains did not hold up under repeated benchmarking; the draft bucket barely moved, so the apparent win was noise rather than a real structural improvement
+
+### 5. Add a conservative replay-triggered cooldown
 
 Primary target:
 
@@ -115,7 +153,7 @@ Purpose:
 
 - reduce bad-prompt thrash without destabilizing the good exact path
 
-### 5. Keep only small hot-path cleanups that beat noise
+### 6. Keep only small hot-path cleanups that beat noise
 
 Primary targets:
 
