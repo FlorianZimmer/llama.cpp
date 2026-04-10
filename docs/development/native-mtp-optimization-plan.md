@@ -1,6 +1,7 @@
 # Native MTP Optimization Plan
 
 This branch is now explicitly scoped to dense Qwen 3.5 native MTP only.
+That optimization work is now paused on this branch after the last surviving dense-only step.
 
 ## V1 Scope
 
@@ -47,7 +48,8 @@ Interpretation:
 - the kept qwen35-local step clears the dense V1 bar on `9B q8_0`
 - `9B UD-Q4_K_XL` improved materially versus the previous MTP branch, but it is still not a broad speed-positive target
 - `27B UD-Q4_K_XL` also improved versus the previous MTP branch, but it remains regression-only coverage
-- the current one-token native-MTP design still has narrow upside; this step likely exhausts the remaining low-risk dense-only branch
+- the current one-token native-MTP design still has narrow upside, but this step appears to exhaust the remaining low-risk dense-only branch
+- further work from here is on hold until there is time to take on deeper runtime-state changes
 
 ## What Survived In This Step
 
@@ -136,6 +138,33 @@ Answer:
 - yes, but narrowly
 - the current one-token design is now clearly worth carrying for `Qwen3.5-9B q8_0`
 - the same design is still not broad dense speed-positive support for `UD-Q4_K_XL` or `27B`
+- the branch is therefore being paused in its current state rather than widened with more small heuristics
+
+## Why The Branch Is Paused
+
+The branch is paused because the remaining gap now looks structural rather than local:
+
+- the runtime is still hard-capped to one drafted token per verifier step
+- that keeps draft-side amortization low, especially once the verifier is already efficient
+- the current server/runtime stack still pays restore / replay style costs instead of using explicit speculative branch-state storage
+- step visibility shows the obvious verifier fast paths are already being taken on the dense `np=1` path
+- dense model prep and quantization audits did not reveal a missing tensor-quality rescue that explains the remaining shortfall
+
+This is why the branch can be both true and limited at the same time:
+
+- native MTP works correctly on the checked dense models
+- it can produce a real single-user win on `Qwen3.5-9B q8_0`
+- it still does not broaden into a reliable dense speedup story across the checked `UD-Q4_K_XL` and `27B` targets
+
+## Why This Still Trails Deeper Runtimes
+
+The current branch does not yet implement the pieces that would be needed to approach the deeper speculative-runtime economics seen in systems such as vLLM or SGLang:
+
+- explicit speculative branch-state storage inside the runtime
+- a lower-level draft / verify / commit path that avoids the current replay-style economics
+- true multi-token native drafting that amortizes verifier work over more than one continuation token
+
+Without those pieces, this branch can validate native MTP and recover narrow wins, but it cannot reasonably be expected to match the broader speculative decode speedups from runtimes designed around deeper state management.
 
 Practical stop condition from here:
 

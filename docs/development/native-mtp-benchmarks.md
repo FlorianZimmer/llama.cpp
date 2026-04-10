@@ -3,6 +3,7 @@
 Bench date: 2026-04-10
 
 This note records the current dense-only benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
+This benchmark line is now paused after the current dense-only branch result.
 
 ## Benchmark Protocol
 
@@ -145,8 +146,25 @@ The kept qwen35-local step preserved that visibility profile on the new `np=1` r
 - dense native MTP is worth carrying today on `Qwen3.5-9B q8_0`
 - dense `Q4` improved meaningfully versus the previous MTP branch, but still does not justify a broad feature claim
 - `27B` remains too expensive for the current one-token runtime design even after the local qwen35 step
+- the current dense-only branch is therefore paused in this state rather than extended with more small local heuristics
 - this likely exhausts the remaining low-risk dense-only qwen35 branch:
   - if a future local step cannot beat `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`, the remaining ceiling should be treated as structural
+
+## Why The Result Is Limited
+
+The benchmark outcome is now clear:
+
+- the implementation works and stays exact at `np=1` on the checked dense path
+- the speedup is narrow rather than broad
+- the remaining gap is not explained by an obvious missed fast path or a pending dense quantization fix
+
+The main blockers are structural:
+
+- the current runtime drafts only one continuation token per verifier step
+- speculative state is still managed with restore / replay style behavior instead of explicit branch-state storage
+- that leaves too little amortization on heavier dense targets such as `27B UD-Q4_K_XL`
+
+This is also why parity with speculative runtimes such as vLLM or SGLang is not a realistic expectation for the current branch shape.
 
 ## Historical Note
 
