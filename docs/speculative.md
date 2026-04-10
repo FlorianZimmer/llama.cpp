@@ -24,7 +24,14 @@ Current support is narrow:
 
 - only models with native MTP tensors can use it;
 - unsupported models fail fast at startup;
-- v1 currently targets the LM-only path.
+- v1 currently targets the LM-only path;
+- v1 is intentionally single-step at runtime: even if a model advertises more than one predictor layer, the current native `mtp` path only drafts one continuation token per verifier step.
+
+Why the single-step limit exists today:
+
+- this is a runtime policy limit, not a fundamental GGUF or architecture limit;
+- the current design already carries generic NextN metadata/tensors and a reusable native-MTP seed/input path;
+- supporting `> 1` drafted tokens would require a follow-up runtime/model implementation that recursively or iteratively consumes deeper predictor layers, but it does not require a broad rearchitecture of the current native-MTP plumbing.
 
 Current limitation:
 

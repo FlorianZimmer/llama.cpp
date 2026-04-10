@@ -120,6 +120,7 @@ Observed CUDA range:
 - CUDA improved clearly on the short/medium exact cases, but the gain was smaller, roughly `+2%` to `+23%`.
 - The known hybrid/recurrent `np > 1` exactness limitation is still real on CUDA. The Rust `np=2` case remained a representative failure and was also slightly slower than baseline.
 - On exact workloads, native MTP is already useful on both CPU and CUDA with this model, but the benefit is workload-dependent and should not be treated as a universal speedup.
+- The current native-MTP runtime is intentionally single-step even when GGUF metadata can represent more than one predictor layer. Extending it to recursive multi-step drafting should be possible within the current architecture, but it is follow-up runtime/model work rather than something already proven by the current branch.
 
 ## Qwen3.5-35B-A3B MoE Check
 
