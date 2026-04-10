@@ -6,7 +6,7 @@ If you need omitted surrounding context, you may consult the public upstream rep
 
 ## Current review target
 
-- branch: `feat/native-mtp-upstream-v1-prep`
+- branch: `feat/native-mtp-qwen35-dense-speedup`
 - local upstream base used here: `upstream/master` at `d6f3030047f85a98b009189e76f441fe818ea44d`
 
 ## Important branch fact

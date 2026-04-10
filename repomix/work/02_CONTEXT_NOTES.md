@@ -2,7 +2,7 @@ CONTEXT_NOTES:
 
 Branch context:
 
-- Current branch: `feat/native-mtp-upstream-v1-prep`
+- Current branch: `feat/native-mtp-qwen35-dense-speedup`
 - Public diff base used locally: `d6f3030047f85a98b009189e76f441fe818ea44d`
 - This is a private mirror. Included local docs and files are the source of truth for branch state.
 
