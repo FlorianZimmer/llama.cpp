@@ -206,16 +206,32 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mtp_seed::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (t_seed && seed && n_mtp > 0) {
+    if (mode == LLAMA_MTP_SEED_MODE_HOST && t_seed && seed && n_mtp > 0) {
         ggml_backend_tensor_set(t_seed, seed, 0, (size_t) n_embd*n_mtp*ggml_element_size(t_seed));
     }
 }
 
 bool llm_graph_input_mtp_seed::can_reuse(const llm_graph_params & params) {
-    seed  = params.mtp_seed;
+    mode = params.mtp_seed_mode;
+    seed = params.mtp_seed;
+    seed_backend = params.mtp_seed_backend;
+    seed_generation = params.mtp_seed_generation;
     n_mtp = params.n_mtp;
 
-    return t_seed->ne[0] == n_embd && t_seed->ne[1] == params.n_mtp;
+    if (t_seed->ne[0] != n_embd || t_seed->ne[1] != params.n_mtp) {
+        return false;
+    }
+
+    switch (mode) {
+        case LLAMA_MTP_SEED_MODE_NONE:
+            return false;
+        case LLAMA_MTP_SEED_MODE_HOST:
+            return t_seed->view_src == nullptr;
+        case LLAMA_MTP_SEED_MODE_BACKEND:
+            return t_seed->view_src == seed_backend;
+    }
+
+    return false;
 }
 
 void llm_graph_input_mtp_tokens::set_input(const llama_ubatch * ubatch) {
@@ -983,7 +999,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_seed_mode    (params.mtp_seed_mode),
     mtp_seed         (params.mtp_seed),
+    mtp_seed_backend (params.mtp_seed_backend),
+    mtp_seed_generation(params.mtp_seed_generation),
     mtp_tokens       (params.mtp_tokens),
     n_mtp            (params.n_mtp),
     samplers         (params.samplers),
@@ -1797,11 +1816,20 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_mtp_seed() const {
-    auto inp = std::make_unique<llm_graph_input_mtp_seed>(n_embd, n_mtp, mtp_seed);
+    auto inp = std::make_unique<llm_graph_input_mtp_seed>(n_embd, n_mtp, mtp_seed_mode, mtp_seed, mtp_seed_backend, mtp_seed_generation);
 
     auto & cur = inp->t_seed;
 
-    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_mtp);
+    if (mtp_seed_mode == LLAMA_MTP_SEED_MODE_BACKEND) {
+        GGML_ASSERT(mtp_seed_backend != nullptr);
+
+        cur = ggml_view_2d(ctx0, mtp_seed_backend, n_embd, n_mtp, mtp_seed_backend->nb[1], 0);
+        GGML_ASSERT(cur != nullptr);
+        GGML_ASSERT(ggml_backend_view_init(cur) == GGML_STATUS_SUCCESS);
+    } else {
+        cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_mtp);
+    }
+
     ggml_set_input(cur);
     ggml_set_name(cur, "mtp_seed");
 
