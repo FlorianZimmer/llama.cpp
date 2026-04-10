@@ -61,14 +61,17 @@ Benchmarked models:
 
 ## Headline Result
 
-- This 3-repeat matrix includes the landed hybrid/recurrent post-replay guard fix.
-- No checked model or quant is net-positive on `np=1` in the current 3-repeat median.
-- `Qwen3.5-9B q8_0` is still the only checked path with repeatable net-positive wins, but only on the easier `np=2` cases:
-  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
-  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
-- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere in the current sweep.
-- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere, though less catastrophically than in the pre-fix sweep.
-- `Qwen3.5-35B-A3B` is now `np=1` exact across the checked quants, including the balanced `Q4_K_M` GGUF, but remains substantially slower than baseline.
+- The dense replay-guard narrowing rerun is now the current branch reading for V1 prep.
+- `Qwen3.5-9B q8_0` recovered clear repeated `np=1` wins after removing the post-replay plain-step guard from dense `qwen35` while keeping it on `qwen35moe`:
+  - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
+  - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
+  - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
+- `Qwen3.5-9B UD-Q4_K_XL` improved materially but is still not a clean `np=1` speed-positive target:
+  - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
+  - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
+  - `bad np=2`: `163.00 -> 161.88 tok/s` (`0.993x`)
+- `Qwen3.5-27B UD-Q4_K_XL` remains clearly speed-negative and is no longer a plausible near-term speed target.
+- `Qwen3.5-35B-A3B Q4_K_M` stayed `np=1` exact in the smoke rerun, with the MoE-only post-replay guard still firing on replayed steps.
 
 ## Current Scope Decision
 
@@ -87,23 +90,57 @@ Based on the current branch history and the post-guard regression, the recommend
 Why this is now the right scope:
 
 - `Qwen3.5-9B q8_0` is still the only path that has ever shown meaningful CUDA wins in this branch
-- `Qwen3.5-9B q8_0` also regressed materially after the permanent replay guard, under the same newer harness:
+- `Qwen3.5-9B q8_0` did regress materially after the broad post-replay guard, under the same newer harness:
   - pre-guard file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
   - post-guard file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
   - `primary np=1`: `1.082x -> 0.999x`
   - `good np=1`: `1.030x -> 0.938x`
+- the dense-only replay-guard narrowing rerun recovered those wins:
+  - current file: `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
+  - `primary np=1`: `0.999x -> 1.081x`
+  - `good np=1`: `0.938x -> 1.032x`
 - the visibility pass showed that speculative accept rows are already almost fully on the greedy verifier fast path with logits suppressed
-- so the remaining problem is no longer “recover an easy server fast path”; it is much closer to replay-guard / hybrid-state economics
+- so the remaining dense problem is no longer “recover an easy server fast path”; the remaining lever that mattered was replay policy scope
+- `Qwen3.5-9B UD-Q4_K_XL` improved under the same narrowing, but still not enough to become a reliable speed-positive target
+- `Qwen3.5-27B UD-Q4_K_XL` remained clearly negative, so it stays regression-only for V1
 - `Qwen3.5-35B-A3B` remains materially speed-negative even after the quant-quality rescue and replay-guard correctness fix
 
 Interpretation:
 
 - the current single-token native-MTP upside is real on the 9B Q8 path
-- no checked path is currently an `np=1` end-to-end win
+- the current branch does have a checked `np=1` end-to-end win again on `Qwen3.5-9B q8_0`
 - once verifier economics get worse for the model or quant, draft + accept + replay overhead dominates quickly
 - the larger dense and MoE cases are not blocked on “more benchmarking”; they are blocked on control-path economics and, for some quants, acceptance quality / exactness
 
-## Full Matrix
+## Dense V1 Rerun
+
+Artifacts:
+
+- `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-v1-triage/qwen35-35b-a3b-q4_k_m-smoke.json`
+
+Current dense V1 branch result:
+
+| Model | `-np` | Primary | Good | Bad | Reading |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B Q8_0 | 1 | `1.081x` | `1.032x` | `0.991x` | active speed target recovered |
+| Qwen3.5-9B Q8_0 | 2 | `1.033x` | `1.104x` | `0.998x` | still favorable on easy prompts |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `0.957x` | `0.931x` | `0.934x` | improved, still not a clean win |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `1.006x` | `0.694x` | `0.993x` | inconsistent; not a V1 speed target |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `0.826x` | `0.964x` | `0.929x` | regression-only |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `0.548x` | `0.515x` | `0.556x` | clearly not viable |
+
+MoE smoke after the narrowing:
+
+- `Qwen3.5-35B-A3B Q4_K_M` stayed exact on `primary`, `good`, and `bad` `np=1`
+- the retained MoE-only post-replay guard still fired:
+  - `primary`: `forced_plain=1`, `guard=1`
+  - `good`: `forced_plain=3`, `guard=3`
+  - `bad`: `forced_plain=5`, `guard=5`
+
+## Broad Sweep Before Dense Guard Narrowing
 
 ### Primary
 
@@ -199,22 +236,22 @@ Bad `np=2` interpretation:
 
 - The current native-MTP implementation is now benchmark-clean for:
   - `Qwen3.5-9B`, `Qwen3.5-27B`, and the checked `Qwen3.5-35B-A3B` quants on `np=1` correctness
-  - `Qwen3.5-35B-A3B Q4_K_M` after the post-replay guard fix
-  - `Qwen3.5-9B q8_0` as the only current net-positive path, but only on the easier `np=2` cases
+  - `Qwen3.5-35B-A3B Q4_K_M` after the retained `qwen35moe` post-replay guard
+  - `Qwen3.5-9B q8_0` as the active dense speed target, now again speed-positive on checked `np=1` and easy `np=2` cases
 - The current implementation is not yet benchmark-good for:
-  - any checked `np=1` end-to-end win
   - broad dense-model speedups across quants
+  - `Qwen3.5-9B UD-Q4_K_XL` as a reliable speed-positive target
   - 27B throughput
   - MoE throughput
   - `Qwen3.5-35B-A3B Q4_K_M` throughput even after the exactness fix
 
 Practical reading:
 
-- if the target is “ship a native-MTP case that is actually faster today”, the only clean answer from this matrix is still `Qwen3.5-9B q8_0`, and only on the easier `np=2` cases
-- if the target is “make native MTP broadly speed-positive”, the next optimization work has to reduce real control-path cost, especially accept and replay, while preserving the `np=1` exactness contract
+- if the target is “ship a native-MTP case that is actually faster today”, the clean answer from the current branch is `Qwen3.5-9B q8_0`
+- if the target is “make native MTP broadly speed-positive”, the remaining work is no longer a small server-local cleanup
 - for the first upstream-oriented series, the pragmatic read is narrower:
   - keep `9B q8_0` as the only active speed target
-  - keep `27B` as supporting dense regression coverage
+  - keep `9B UD-Q4_K_XL` and `27B UD-Q4_K_XL` only as supporting dense regression coverage
   - keep A3B only as correctness / stability regression coverage
   - do not treat `qwen35moe` as a speed target for v1
 
@@ -246,13 +283,19 @@ Follow-up that was tried and discarded:
 
 - a separate dense one-step post-replay cooldown was tested and then dropped
 - reason:
-  - current libllama marks `Qwen3.5-9B` and `Qwen3.5-27B` as `hybrid`, so the existing post-replay guard is already the live policy there
-  - the cooldown trial produced `0` distinct `cooldown_hits` on the q8 gate and no new behavioral separation from the existing guard
+  - current libllama marks `Qwen3.5-9B` and `Qwen3.5-27B` as `hybrid`, so a broad hybrid-level cooldown would just collapse into the same policy shape
+  - the cooldown trial produced no new behavioral separation from the existing guard
 
-Next local branch implied by this result:
+Follow-up that was then kept:
 
-- the only remaining narrow runtime branch worth trying is to see whether the replay guard can be narrowed safely for dense `Qwen3.5`
-- if that does not recover a clear repeated `9B q8_0 np=1` win, the current one-token native-MTP design should be treated as having reached its structural ceiling on this hybrid path
+- the post-replay plain-step guard was narrowed from broad hybrid `qwen35` + `qwen35moe` coverage to:
+  - recurrent models
+  - `qwen35moe`
+- result:
+  - `9B q8_0` recovered its earlier `np=1` wins
+  - `9B UD-Q4_K_XL` improved but stayed mixed
+  - `27B UD-Q4_K_XL` did not become viable
+  - A3B `Q4_K_M` smoke stayed exact with visible guard hits
 
 ## Raw Artifacts
 

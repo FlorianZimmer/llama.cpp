@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -60,6 +61,24 @@ static bool server_native_mtp_trace_replay_logits_enabled() {
     return enabled;
 }
 
+static bool server_native_mtp_needs_post_replay_guard(const llama_model * model) {
+    if (llama_model_is_recurrent(model)) {
+        return true;
+    }
+
+    char arch[64] = { 0 };
+    const int32_t n = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (n <= 0) {
+        return false;
+    }
+
+    // Keep the conservative post-replay plain-step guard on the hybrid MoE path
+    // that reproduced the checked np=1 divergence. Dense qwen35 keeps the same
+    // recurrent-backup restore path, but is the active speed target for the v1
+    // branch and did not show the same exactness failure before the broad guard.
+    return strcmp(arch, "qwen35moe") == 0;
+}
+
 static bool server_native_mtp_can_use_output_fast_path(const common_sampler * smpl, bool native_mtp) {
     return native_mtp && smpl != nullptr && common_sampler_can_accept_precomputed(smpl);
 }
@@ -97,7 +116,6 @@ struct server_slot {
     enum native_mtp_skip_reason_type : uint8_t {
         NATIVE_MTP_SKIP_REASON_NONE = 0,
         NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD = 1,
-        NATIVE_MTP_SKIP_REASON_POST_REPLAY_COOLDOWN = 2,
     };
 
     int id;
@@ -112,6 +130,7 @@ struct server_slot {
     common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
     bool native_mtp = false;
     int32_t native_mtp_max = 0;
+    bool native_mtp_post_replay_guard = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -382,7 +401,7 @@ struct server_slot {
     }
 
     bool uses_native_mtp_post_replay_guard() const {
-        return uses_native_mtp_recurrent_backup();
+        return uses_native_mtp() && native_mtp_post_replay_guard;
     }
 
     bool save_native_mtp_state(llama_state_seq_flags flags) {
@@ -986,10 +1005,12 @@ private:
 
                 slot.native_mtp = true;
                 slot.native_mtp_max = std::min<int32_t>(1, (int32_t) llama_model_n_native_mtp_predict(model));
+                slot.native_mtp_post_replay_guard = server_native_mtp_needs_post_replay_guard(model);
                 if (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)) {
                     slot.native_mtp_backup_id = (llama_seq_id) (llama_n_seq_max(ctx) + i);
                 }
-                SLT_INF(slot, "native MTP context initialized, max draft = %d\n", slot.native_mtp_max);
+                SLT_INF(slot, "native MTP context initialized, max draft = %d, post-replay guard = %d\n",
+                        slot.native_mtp_max, slot.native_mtp_post_replay_guard);
             }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
@@ -2322,7 +2343,6 @@ private:
             bool pure_fast_path = false;
             bool logits_suppressed = false;
             bool forced_plain = false;
-            bool post_replay_cooldown = false;
             bool post_replay_guard = false;
         };
 
@@ -2334,8 +2354,6 @@ private:
             switch (reason) {
                 case server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD:
                     return "post_replay_guard";
-                case server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_COOLDOWN:
-                    return "post_replay_cooldown";
                 case server_slot::NATIVE_MTP_SKIP_REASON_NONE:
                 default:
                     return "none";
@@ -2359,12 +2377,11 @@ private:
                 const int n_draft_max = slot.get_n_draft_max();
                 if (slot.uses_native_mtp_post_replay_guard() && slot.native_mtp_skip_next_draft > 0) {
                     if (server_native_mtp_trace_enabled()) {
-                        SRV_INF("native MTP prepass skip slot=%d reason=%s pending=%d guard=%d cooldown=%d\n",
+                        SRV_INF("native MTP prepass skip slot=%d reason=%s pending=%d guard=%d\n",
                                 slot.id,
                                 native_mtp_skip_reason_name(slot.native_mtp_skip_reason),
                                 slot.native_mtp_skip_next_draft,
-                                slot.native_mtp_skip_reason == server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD,
-                                slot.native_mtp_skip_reason == server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_COOLDOWN);
+                                slot.native_mtp_skip_reason == server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD);
                     }
                     continue;
                 }
@@ -2434,16 +2451,13 @@ private:
                 step_visibility.forced_plain = true;
                 step_visibility.post_replay_guard =
                     slot.native_mtp_skip_reason == server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD;
-                step_visibility.post_replay_cooldown =
-                    slot.native_mtp_skip_reason == server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_COOLDOWN;
                 slot.native_mtp_skip_next_draft -= 1;
                 n_draft_max = 0;
                 if (server_native_mtp_trace_enabled()) {
-                    SLT_INF(slot, "native MTP skip draft: reason=%s remaining=%d guard=%d cooldown=%d\n",
+                    SLT_INF(slot, "native MTP skip draft: reason=%s remaining=%d guard=%d\n",
                             native_mtp_skip_reason_name(slot.native_mtp_skip_reason),
                             slot.native_mtp_skip_next_draft,
-                            step_visibility.post_replay_guard,
-                            step_visibility.post_replay_cooldown);
+                            step_visibility.post_replay_guard);
                 }
                 if (slot.native_mtp_skip_next_draft == 0) {
                     slot.native_mtp_skip_reason = server_slot::NATIVE_MTP_SKIP_REASON_NONE;
@@ -3129,7 +3143,6 @@ private:
             bool pure_fast_path = false;
             bool logits_suppressed = false;
             bool forced_plain = false;
-            bool post_replay_cooldown = false;
             bool post_replay_guard = false;
             llama_tokens drafted;
             std::vector<llama_token> ids;
@@ -3517,7 +3530,6 @@ private:
                             " fast=0"
                             " logits_suppressed=0"
                             " forced_plain=1"
-                            " cooldown=%d"
                             " guard=%d"
                             " draft=%d us"
                             " snapshot=%d us"
@@ -3526,7 +3538,6 @@ private:
                             " replay_us=%d"
                             " total=%d us\n",
                             step,
-                            step_visibility.post_replay_cooldown,
                             step_visibility.post_replay_guard,
                             0,
                             0,
@@ -3581,7 +3592,6 @@ private:
                         result.pure_fast_path = it_step_visibility->second.pure_fast_path;
                         result.logits_suppressed = it_step_visibility->second.logits_suppressed;
                         result.forced_plain = it_step_visibility->second.forced_plain;
-                        result.post_replay_cooldown = it_step_visibility->second.post_replay_cooldown;
                         result.post_replay_guard = it_step_visibility->second.post_replay_guard;
                         native_mtp_step_visibility.erase(it_step_visibility);
                     }
@@ -3770,7 +3780,6 @@ private:
                             " fast=%d"
                             " logits_suppressed=%d"
                             " forced_plain=%d"
-                            " cooldown=%d"
                             " guard=%d"
                             " draft=%" PRId64 " us"
                             " snapshot=%" PRId64 " us"
@@ -3785,7 +3794,6 @@ private:
                             spec_result.pure_fast_path,
                             spec_result.logits_suppressed,
                             spec_result.forced_plain,
-                            spec_result.post_replay_cooldown,
                             spec_result.post_replay_guard,
                             spec_result.t_draft_us,
                             spec_result.t_snapshot_us,

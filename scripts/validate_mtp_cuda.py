@@ -44,7 +44,6 @@ STEP_RE = re.compile(
     r" fast=(?P<fast>[01])"
     r" logits_suppressed=(?P<logits_suppressed>[01])"
     r" forced_plain=(?P<forced_plain>[01])"
-    r" cooldown=(?P<cooldown>[01])"
     r" guard=(?P<guard>[01])"
     r" draft=(?P<draft_us>\d+)\s+us"
     r" snapshot=(?P<snapshot_us>\d+)\s+us"
@@ -137,7 +136,6 @@ class ProfileTotals:
                 "fast": int(match.group("fast")),
                 "logits_suppressed": int(match.group("logits_suppressed")),
                 "forced_plain": int(match.group("forced_plain")),
-                "cooldown": int(match.group("cooldown")),
                 "guard": int(match.group("guard")),
                 "draft_us": int(match.group("draft_us")),
                 "snapshot_us": int(match.group("snapshot_us")),
@@ -217,7 +215,6 @@ class ProfileTotals:
                 "pure_fast_path_steps": sum(step["fast"] for step in speculative_steps),
                 "logits_suppressed_steps": sum(step["logits_suppressed"] for step in speculative_steps),
                 "forced_plain_steps": sum(step["forced_plain"] for step in self.steps),
-                "cooldown_hits": sum(step["cooldown"] for step in self.steps),
                 "guard_hits": sum(step["guard"] for step in self.steps),
             },
             "steps": self.steps,

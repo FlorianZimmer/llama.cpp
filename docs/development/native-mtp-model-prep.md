@@ -263,10 +263,12 @@ This matters because `/mnt/models` can fill up quickly during BF16 and multi-qua
     - restore+replay can rebuild a correct immediate next-token state
     - the first speculative verifier batch after replay is the piece that breaks exactness on this model/quant
 - Fix now landed in the server:
-  - hybrid/recurrent native-MTP slots now always force one plain verifier step immediately after a replay
+  - the post-replay plain-step guard is now retained for:
+    - recurrent models
+    - `qwen35moe`
   - that restored `np=1` exactness for the canonical A3B `Q4_K_M` GGUF on the checked `primary`, `good`, and `bad` CUDA cases
-  - the same guard stayed exact on the checked 9B and 27B dense references, and A3B `np=2` remained stability-clean in a smoke run
-  - the tradeoff is conservative: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
+  - dense `qwen35` no longer pays that guard by default, which recovered the `Qwen3.5-9B q8_0` `np=1` speed-positive path
+  - the tradeoff is still conservative on the MoE side: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
 - For MoE, the main issue was not “MTP is unsupported”; the main issue was preserving MTP tensors correctly and then accepting that runtime speedup may still be poor.
 - For the first upstream-oriented series, that means:
   - keep the MoE path available locally for regression and future work
