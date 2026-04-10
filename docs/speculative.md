@@ -42,6 +42,7 @@ Practical guidance:
 
 - if strict greedy equality is required today, prefer `-np 1`;
 - if `-np > 1` is more important than exact reproducibility, native `mtp` can still be useful when the measured speedup on your model and prompts outweighs the residual risk of divergence.
+- speedup is model-dependent; some native-MTP models can work functionally but still lose to greedy baseline if the verifier is already very fast and the model only exposes a single predictor layer.
 
 ### n-gram Cache (`ngram-cache`)
 
