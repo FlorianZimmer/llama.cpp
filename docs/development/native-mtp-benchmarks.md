@@ -2,25 +2,19 @@
 
 Bench date: 2026-04-10
 
-This note records the current end-to-end CUDA benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
+This note records the current dense-only benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
 
 ## Benchmark Protocol
 
-- judge every change by end-to-end tok/s, not phase timing alone
 - compare native MTP against greedy baseline on the same model and prompt
 - require exact `np=1` output match to greedy baseline
-- treat `np>1` as stability-only on the current hybrid/recurrent path
-- ignore small movement unless it repeats across the 3-run median
-- keep per-step native-MTP timing visible with `LLAMA_SERVER_MTP_PROFILE=1`
+- treat `np>1` as stability-only on the current hybrid path
+- judge changes by repeated end-to-end tok/s, not internal timing alone
+- keep `LLAMA_SERVER_MTP_PROFILE=1` available for per-step timing and acceptance
 
 Authoritative harness:
 
 - [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py)
-
-The harness now parses two native-MTP profile signals:
-
-- aggregate phase totals from `native MTP profile: ...`
-- per-step timing and acceptance from `native MTP step: ...`
 
 ## Method
 
@@ -55,267 +49,90 @@ Benchmarked models:
 - `/mnt/models/GGUF/Qwen3.5-9B-MTP-UD-Q4_K_XL.gguf`
 - `/mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf`
 - `/mnt/models/GGUF/Qwen3.5-27B-MTP-UD-Q4_K_XL.gguf`
-- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf`
-- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q5_K_M-fixed.gguf`
-- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-UD-Q4_K_XL-fixed.gguf`
 
 ## Headline Result
 
-- The dense replay-guard narrowing rerun is now the current branch reading for V1 prep.
-- `Qwen3.5-9B q8_0` recovered clear repeated `np=1` wins after removing the post-replay plain-step guard from dense `qwen35` while keeping it on `qwen35moe`:
+- `Qwen3.5-9B q8_0` is the only checked dense path with a meaningful `np=1` win:
   - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
   - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
   - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
-- `Qwen3.5-9B UD-Q4_K_XL` improved materially but is still not a clean `np=1` speed-positive target:
+- `Qwen3.5-9B UD-Q4_K_XL` improved after the dense guard narrowing, but is still not a reliable speed-positive target:
   - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
+  - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
   - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
-  - `bad np=2`: `163.00 -> 161.88 tok/s` (`0.993x`)
-- `Qwen3.5-27B UD-Q4_K_XL` remains clearly speed-negative and is no longer a plausible near-term speed target.
-- `Qwen3.5-35B-A3B Q4_K_M` stayed `np=1` exact in the smoke rerun, with the MoE-only post-replay guard still firing on replayed steps.
+- `Qwen3.5-27B UD-Q4_K_XL` remains clearly negative and is regression-only for dense V1:
+  - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
+  - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
+  - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
 
-## Current Scope Decision
-
-Based on the current branch history and the post-guard regression, the recommended scope for the first upstream-oriented series is:
-
-- active speed target:
-  - `Qwen3.5-9B q8_0`
-- supporting dense correctness / regression coverage:
-  - `Qwen3.5-9B UD-Q4_K_XL`
-  - `Qwen3.5-27B UD-Q4_K_XL`
-- regression-only coverage:
-  - `Qwen3.5-35B-A3B`, especially `Q4_K_M` `np=1`
-- deferred from the first upstreamable series:
-  - `qwen35moe` / `Qwen3.5-35B-A3B` as an active speed target
-
-Why this is now the right scope:
-
-- `Qwen3.5-9B q8_0` is still the only path that has ever shown meaningful CUDA wins in this branch
-- `Qwen3.5-9B q8_0` did regress materially after the broad post-replay guard, under the same newer harness:
-  - pre-guard file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
-  - post-guard file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
-  - `primary np=1`: `1.082x -> 0.999x`
-  - `good np=1`: `1.030x -> 0.938x`
-- the dense-only replay-guard narrowing rerun recovered those wins:
-  - current file: `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
-  - `primary np=1`: `0.999x -> 1.081x`
-  - `good np=1`: `0.938x -> 1.032x`
-- the visibility pass showed that speculative accept rows are already almost fully on the greedy verifier fast path with logits suppressed
-- so the remaining dense problem is no longer “recover an easy server fast path”; the remaining lever that mattered was replay policy scope
-- `Qwen3.5-9B UD-Q4_K_XL` improved under the same narrowing, but still not enough to become a reliable speed-positive target
-- `Qwen3.5-27B UD-Q4_K_XL` remained clearly negative, so it stays regression-only for V1
-- `Qwen3.5-35B-A3B` remains materially speed-negative even after the quant-quality rescue and replay-guard correctness fix
-
-Interpretation:
-
-- the current single-token native-MTP upside is real on the 9B Q8 path
-- the current branch does have a checked `np=1` end-to-end win again on `Qwen3.5-9B q8_0`
-- once verifier economics get worse for the model or quant, draft + accept + replay overhead dominates quickly
-- the larger dense and MoE cases are not blocked on “more benchmarking”; they are blocked on control-path economics and, for some quants, acceptance quality / exactness
-
-## Dense V1 Rerun
+## Dense V1 Branch Result
 
 Artifacts:
 
 - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
 - `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
 - `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
-- `/tmp/native-mtp-v1-triage/qwen35-35b-a3b-q4_k_m-smoke.json`
-
-Current dense V1 branch result:
 
 | Model | `-np` | Primary | Good | Bad | Reading |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3.5-9B Q8_0 | 1 | `1.081x` | `1.032x` | `0.991x` | active speed target recovered |
-| Qwen3.5-9B Q8_0 | 2 | `1.033x` | `1.104x` | `0.998x` | still favorable on easy prompts |
-| Qwen3.5-9B UD-Q4_K_XL | 1 | `0.957x` | `0.931x` | `0.934x` | improved, still not a clean win |
-| Qwen3.5-9B UD-Q4_K_XL | 2 | `1.006x` | `0.694x` | `0.993x` | inconsistent; not a V1 speed target |
+| Qwen3.5-9B Q8_0 | 1 | `1.081x` | `1.032x` | `0.991x` | only active speed target |
+| Qwen3.5-9B Q8_0 | 2 | `1.033x` | `1.104x` | `0.998x` | favorable only on easier prompts |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `0.957x` | `0.931x` | `0.934x` | supporting regression coverage |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `1.006x` | `0.694x` | `0.993x` | inconsistent |
 | Qwen3.5-27B UD-Q4_K_XL | 1 | `0.826x` | `0.964x` | `0.929x` | regression-only |
 | Qwen3.5-27B UD-Q4_K_XL | 2 | `0.548x` | `0.515x` | `0.556x` | clearly not viable |
 
-MoE smoke after the narrowing:
+## Broad-Guard Regression And Recovery
 
-- `Qwen3.5-35B-A3B Q4_K_M` stayed exact on `primary`, `good`, and `bad` `np=1`
-- the retained MoE-only post-replay guard still fired:
-  - `primary`: `forced_plain=1`, `guard=1`
-  - `good`: `forced_plain=3`, `guard=3`
-  - `bad`: `forced_plain=5`, `guard=5`
+The most important dense regression in this branch was the broad post-replay guard.
 
-## Broad Sweep Before Dense Guard Narrowing
+Same-harness comparison:
 
-### Primary
+- pre-guard:
+  - `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.082x`
+  - `good np=1`: `1.030x`
+- broad-guard:
+  - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `0.999x`
+  - `good np=1`: `0.938x`
+- current dense-only branch:
+  - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.081x`
+  - `good np=1`: `1.032x`
 
-| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3.5-9B UD-Q4_K_XL | 1 | `175.91` | `159.01` | `0.904x` | yes |
-| Qwen3.5-9B UD-Q4_K_XL | 2 | `165.77` | `149.86` | `0.904x` | stability-only |
-| Qwen3.5-9B Q8_0 | 1 | `150.53` | `150.31` | `0.999x` | yes |
-| Qwen3.5-9B Q8_0 | 2 | `127.85` | `133.26` | `1.042x` | stability-only |
-| Qwen3.5-27B UD-Q4_K_XL | 1 | `72.35` | `62.27` | `0.861x` | yes |
-| Qwen3.5-27B UD-Q4_K_XL | 2 | `57.34` | `50.05` | `0.873x` | stability-only |
-| Qwen3.5-35B-A3B Q4_K_M | 1 | `228.26` | `170.72` | `0.748x` | yes |
-| Qwen3.5-35B-A3B Q4_K_M | 2 | `154.35` | `59.16` | `0.383x` | stability-only |
-| Qwen3.5-35B-A3B Q5_K_M | 1 | `221.34` | `167.90` | `0.759x` | yes |
-| Qwen3.5-35B-A3B Q5_K_M | 2 | `150.87` | `58.45` | `0.387x` | stability-only |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `202.80` | `129.34` | `0.638x` | yes |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `145.57` | `69.83` | `0.480x` | stability-only |
+Interpretation:
 
-### Good
+- the branch did suffer a real dense regression
+- that regression was caused by applying a conservative replay guard too broadly
+- removing that guard from dense `qwen35` recovered the earlier `9B q8_0` win
 
-| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.94` | `167.83` | `0.857x` | yes |
-| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.82` | `145.65` | `0.895x` | stability-only |
-| Qwen3.5-9B Q8_0 | 1 | `148.62` | `139.40` | `0.938x` | yes |
-| Qwen3.5-9B Q8_0 | 2 | `132.66` | `137.12` | `1.034x` | stability-only |
-| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.94` | `61.48` | `0.867x` | yes |
-| Qwen3.5-27B UD-Q4_K_XL | 2 | `59.26` | `55.09` | `0.930x` | stability-only |
-| Qwen3.5-35B-A3B Q4_K_M | 1 | `243.16` | `163.47` | `0.672x` | yes |
-| Qwen3.5-35B-A3B Q4_K_M | 2 | `170.04` | `74.49` | `0.438x` | stability-only |
-| Qwen3.5-35B-A3B Q5_K_M | 1 | `234.38` | `174.36` | `0.744x` | yes |
-| Qwen3.5-35B-A3B Q5_K_M | 2 | `180.66` | `93.19` | `0.516x` | stability-only |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `220.52` | `151.49` | `0.687x` | yes |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `160.53` | `94.02` | `0.586x` | stability-only |
+## Step Visibility Result
 
-### Bad
+The per-step visibility pass ruled out an easy remaining server-local win.
 
-| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.39` | `162.72` | `0.833x` | yes |
-| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.59` | `133.78` | `0.823x` | stability-only |
-| Qwen3.5-9B Q8_0 | 1 | `148.82` | `125.10` | `0.841x` | yes |
-| Qwen3.5-9B Q8_0 | 2 | `132.99` | `115.83` | `0.871x` | stability-only |
-| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.87` | `63.97` | `0.903x` | yes |
-| Qwen3.5-27B UD-Q4_K_XL | 2 | `58.64` | `53.61` | `0.914x` | stability-only |
-| Qwen3.5-35B-A3B Q4_K_M | 1 | `251.70` | `177.53` | `0.705x` | yes |
-| Qwen3.5-35B-A3B Q4_K_M | 2 | `190.39` | `108.20` | `0.568x` | stability-only |
-| Qwen3.5-35B-A3B Q5_K_M | 1 | `243.17` | `174.54` | `0.718x` | yes |
-| Qwen3.5-35B-A3B Q5_K_M | 2 | `186.98` | `111.72` | `0.597x` | stability-only |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `224.48` | `174.48` | `0.777x` | yes |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `167.94` | `128.60` | `0.766x` | stability-only |
+Representative coverage from `/tmp/native-mtp-step-01`:
 
-## Per-Step Native-MTP Profile
+- `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+- `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+- `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
 
-These tables come from the new per-step `native MTP step:` profile parsing. Totals are aggregate MTP-only time across the 3 repeats for the given case and `-np`, while `mean step total us` is the average end-to-end cost of one speculative step after draft/snapshot/accept/restore/replay are combined.
-
-### Primary `np=1`
-
-| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3.5-9B UD-Q4_K_XL | `12/15 (0.800)` | `21.212` | `75.516` | `30.801` | `8503.1` |
-| Qwen3.5-9B Q8_0 | `12/15 (0.800)` | `23.585` | `99.580` | `8.597` | `8785.1` |
-| Qwen3.5-27B UD-Q4_K_XL | `9/15 (0.600)` | `24.823` | `129.636` | `48.043` | `13502.1` |
-| Qwen3.5-35B-A3B Q4_K_M | `12/15 (0.800)` | `17.023` | `54.279` | `13.234` | `5637.1` |
-| Qwen3.5-35B-A3B Q5_K_M | `12/15 (0.800)` | `17.124` | `55.569` | `13.250` | `5730.9` |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | `9/15 (0.600)` | `18.619` | `58.111` | `23.066` | `6654.7` |
-
-Primary `np=1` interpretation:
-
-- 9B Q8 still has the smallest replay bucket on the dense path, but even there the `np=1` median is now effectively break-even rather than a clean win.
-- 9B UD-Q4 has the same short-case acceptance ratio as Q8, but replay is much larger and the end-to-end result stays negative.
-- 27B still shows the same dense scaling problem: lower acceptance and a much more expensive accept+replay path.
-- The A3B quants are exact again on `np=1`, and their replay bucket on this short case is modest, but baseline decode is so fast that even modest speculative overhead stays net negative.
-
-### Bad `np=2`
-
-| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3.5-9B UD-Q4_K_XL | `126/182 (0.692)` | `91.303` | `581.841` | `143.500` | `4463.2` |
-| Qwen3.5-9B Q8_0 | `126/184 (0.685)` | `117.090` | `663.657` | `82.937` | `4644.1` |
-| Qwen3.5-27B UD-Q4_K_XL | `140/184 (0.761)` | `127.729` | `958.105` | `395.062` | `7962.4` |
-| Qwen3.5-35B-A3B Q4_K_M | `141/183 (0.770)` | `316.863` | `394.586` | `185.392` | `4822.4` |
-| Qwen3.5-35B-A3B Q5_K_M | `147/183 (0.803)` | `314.705` | `389.498` | `174.579` | `4725.2` |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | `158/183 (0.863)` | `316.775` | `387.955` | `122.578` | `4496.7` |
-
-Bad `np=2` interpretation:
-
-- 27B remains the clearest dense regression: even with better acceptance than the 9B bad cases, accept and replay are still too expensive.
-- The A3B quants are not primarily limited by replay alone; they are already so fast in baseline mode that even moderate draft + accept overhead is too expensive.
-- The balanced `Q4_K_M` GGUF is no longer a correctness outlier after the post-replay guard, but its throughput is still materially below baseline.
+So the current dense shortfall is not mainly “we are still missing the verifier fast path”.
 
 ## Current Conclusions
 
-- The current native-MTP implementation is now benchmark-clean for:
-  - `Qwen3.5-9B`, `Qwen3.5-27B`, and the checked `Qwen3.5-35B-A3B` quants on `np=1` correctness
-  - `Qwen3.5-35B-A3B Q4_K_M` after the retained `qwen35moe` post-replay guard
-  - `Qwen3.5-9B q8_0` as the active dense speed target, now again speed-positive on checked `np=1` and easy `np=2` cases
-- The current implementation is not yet benchmark-good for:
-  - broad dense-model speedups across quants
-  - `Qwen3.5-9B UD-Q4_K_XL` as a reliable speed-positive target
-  - 27B throughput
-  - MoE throughput
-  - `Qwen3.5-35B-A3B Q4_K_M` throughput even after the exactness fix
+- dense native MTP is only worth carrying today on `Qwen3.5-9B q8_0`
+- dense `Q4` still does not show the consistent `np=1` single-user win needed for a broad feature claim
+- `27B` remains too expensive for the current one-token runtime design
+- the next dense-only branch should be judged against a clear maintenance bar:
+  - if it cannot produce a repeatable `>= 5%` `np=1` win on `9B q8_0`, the current design is probably not worth carrying upstream as a speed feature
 
-Practical reading:
+## Historical Note
 
-- if the target is “ship a native-MTP case that is actually faster today”, the clean answer from the current branch is `Qwen3.5-9B q8_0`
-- if the target is “make native MTP broadly speed-positive”, the remaining work is no longer a small server-local cleanup
-- for the first upstream-oriented series, the pragmatic read is narrower:
-  - keep `9B q8_0` as the only active speed target
-  - keep `9B UD-Q4_K_XL` and `27B UD-Q4_K_XL` only as supporting dense regression coverage
-  - keep A3B only as correctness / stability regression coverage
-  - do not treat `qwen35moe` as a speed target for v1
+`qwen35moe` / `Qwen3.5-35B-A3B` were removed from this V1 prep branch after local experiments showed:
 
-## Step-01 Visibility Gate
+- extra quantization rescue work was required just to restore exactness
+- a conservative replay guard was needed on the MoE path
+- throughput stayed materially below baseline even after those fixes
 
-After the main 2026-04-10 sweep, the branch was rerun with expanded per-step visibility in `native MTP step:` so the validator could count:
-
-- pure fast-path verifier steps
-- logits-suppressed accept steps
-- forced plain post-replay steps
-- guard hits
-
-Dense-gate result:
-
-- speculative accept rows are already almost fully on the intended greedy verifier fast path
-- representative coverage from `/tmp/native-mtp-step-01`:
-  - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
-  - `9B q8_0 bad np=2`: `182/186` pure-fast-path, `182/186` logits-suppressed
-  - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
-  - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
-- A3B `Q4_K_M` smoke remained exact on `primary`, `good`, and `bad` `np=1`
-
-Implication:
-
-- there is little evidence left for a profitable “split pure verifier rows out of mixed decode chunks” optimization on the current Qwen 3.5 path
-- the remaining drag is mostly verifier/replay economics, not a hidden fast-path coverage leak
-
-Follow-up that was tried and discarded:
-
-- a separate dense one-step post-replay cooldown was tested and then dropped
-- reason:
-  - current libllama marks `Qwen3.5-9B` and `Qwen3.5-27B` as `hybrid`, so a broad hybrid-level cooldown would just collapse into the same policy shape
-  - the cooldown trial produced no new behavioral separation from the existing guard
-
-Follow-up that was then kept:
-
-- the post-replay plain-step guard was narrowed from broad hybrid `qwen35` + `qwen35moe` coverage to:
-  - recurrent models
-  - `qwen35moe`
-- result:
-  - `9B q8_0` recovered its earlier `np=1` wins
-  - `9B UD-Q4_K_XL` improved but stayed mixed
-  - `27B UD-Q4_K_XL` did not become viable
-  - A3B `Q4_K_M` smoke stayed exact with visible guard hits
-
-## Raw Artifacts
-
-Per-model JSON summaries:
-
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-ud-q4.json`
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-27b-ud-q4.json`
-- `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q4_k_m.json`
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q5_k_m.json`
-- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-ud-q4.json`
-- `/tmp/native-mtp-step-01/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-step-01/qwen35-9b-ud-q4.json`
-- `/tmp/native-mtp-step-01/qwen35-27b-ud-q4.json`
-- `/tmp/native-mtp-step-01/qwen35-35b-a3b-q4_k_m-smoke.json`
-
-Each JSON also points at its per-scenario log directory under `/tmp`.
-
-## Related Notes
-
-- [native-mtp-optimization-plan.md](native-mtp-optimization-plan.md)
-- [native-mtp-model-prep.md](native-mtp-model-prep.md)
+That history is still useful for review, but it is no longer part of the live dense-only V1 benchmark set.

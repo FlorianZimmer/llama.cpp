@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
-#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -62,21 +61,7 @@ static bool server_native_mtp_trace_replay_logits_enabled() {
 }
 
 static bool server_native_mtp_needs_post_replay_guard(const llama_model * model) {
-    if (llama_model_is_recurrent(model)) {
-        return true;
-    }
-
-    char arch[64] = { 0 };
-    const int32_t n = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-    if (n <= 0) {
-        return false;
-    }
-
-    // Keep the conservative post-replay plain-step guard on the hybrid MoE path
-    // that reproduced the checked np=1 divergence. Dense qwen35 keeps the same
-    // recurrent-backup restore path, but is the active speed target for the v1
-    // branch and did not show the same exactness failure before the broad guard.
-    return strcmp(arch, "qwen35moe") == 0;
+    return llama_model_is_recurrent(model);
 }
 
 static bool server_native_mtp_can_use_output_fast_path(const common_sampler * smpl, bool native_mtp) {

@@ -1,103 +1,86 @@
 USER_GOAL:
-Review the current private native-MTP state in this llama.cpp mirror and answer two scope-defining questions for the next cycle:
+Review the current dense-only native-MTP branch in this private llama.cpp mirror and produce a concrete implementation plan for recovering and broadening `np=1` single-user speedups on Qwen 3.5 dense models.
 
-1. Should we spend another branch on deeper hybrid replay/guard economics for Qwen 3.5 native MTP, or is that too large/risky for this first upstream-oriented implementation?
-2. Should `Qwen3.5-35B-A3B` / `qwen35moe` stay in the native-MTP scope at all, or should it be removed/deferred because the expected upside is too small relative to the complexity and correctness cost?
-
-DELIVERABLE_TYPE: RESULT
+DELIVERABLE_TYPE: PLAN
 
 USER_REQUEST:
-Please review this private-mirror native-MTP implementation and give a concrete recommendation about branch scope and next actions.
+Please review this private-mirror native-MTP implementation and give a practical next-step plan for dense Qwen 3.5 only.
 
-The main questions are:
+The current branch has just been narrowed for V1 prep:
 
-1. We already know `Qwen3.5-9B q8_0` used to be clearly faster in an earlier branch state. Did the later correctness work regress that path in a fundamental way, and if so, is it worth targeting deeper hybrid replay/guard economics next?
-2. How do other public MTP-capable inference stacks handle the kinds of issues we ran into here:
-   - verifier fast-path / logits suppression
-   - replay / rollback after rejected drafts
-   - hybrid or recurrent state restoration
-   - dense vs MoE runtime economics
-   - exactness expectations at low draft depth
-3. Is `Qwen3.5-35B-A3B` / `qwen35moe` worth keeping in scope for the first upstreamable native-MTP series, or should it be explicitly deferred or removed for now?
+- `qwen35` native MTP is still in scope
+- `qwen35moe` native MTP support has been removed from the live branch
+- `Qwen3.5-35B-A3B` / MoE is no longer part of the live V1 code or benchmark scope
+- the branch now focuses only on:
+  - `Qwen3.5-9B q8_0`
+  - `Qwen3.5-9B UD-Q4_K_XL`
+  - `Qwen3.5-27B UD-Q4_K_XL`
 
-Please answer using the included local files as the source of truth for this private branch. For broader comparison, you may use public sources surgically.
+What I need from you:
 
-Important: do not broaden into a generic literature survey. Focus on public implementations that are directly useful for this decision. Examples of useful targets if relevant:
+1. Review the current dense-only state and propose the best way forward to achieve a real `np=1` speedup on Qwen 3.5 dense models, ideally across the checked quants rather than only `9B q8_0`.
+2. Make the plan benchmark-gated after every step against:
+   - greedy baseline
+   - the immediately previous native-MTP result
+3. Be explicit about what we already tried that failed, regressed, or did not survive repeated end-to-end tok/s testing, so the plan does not waste cycles.
+4. Tell us whether the remaining ceiling for the current one-token native-MTP design looks:
+   - still attackable with one more dense-only runtime branch
+   - or mostly structural unless we do deeper runtime-state work
+5. If you recommend deeper work, separate:
+   - what is still realistic for an upstream-friendly dense V1
+   - what belongs in a larger follow-up branch
 
-- public upstream `ggml-org/llama.cpp` only where needed to compare with this branch
-- public inference stacks / engines that concretely support MTP or close speculative decoding variants for Qwen-class models, especially where replay/rollback, verifier batching, or MoE support are documented or visible in code
+Important local branch facts:
 
-What I want back:
+- The active dense target is `Qwen3.5-9B q8_0`.
+- Current branch result on the live dense-only state:
+  - `Qwen3.5-9B q8_0`
+    - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
+    - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
+    - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
+  - `Qwen3.5-9B UD-Q4_K_XL`
+    - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
+    - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
+    - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
+  - `Qwen3.5-27B UD-Q4_K_XL`
+    - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
+    - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
+    - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
 
-1. A direct answer to whether the next step should be:
-   - a deeper hybrid replay/guard branch
-   - a narrower dense-only cleanup branch
-   - or a stop/defer decision because the remaining ceiling is likely structural for the current one-token native-MTP design
-2. A direct answer to whether `qwen35moe` should stay in scope for the first upstreamable series.
-3. A short comparison against other public MTP-capable stacks:
-   - how they handle replay / verifier / state problems
-   - what they do differently from this branch if anything materially relevant
-   - whether any of those ideas look realistically portable here
-4. A pragmatic recommended path for this private mirror in priority order, with explicit “do now”, “separate later branch”, and “drop/defer” buckets.
+Critical history:
 
-Critical benchmark context:
+- We did have an earlier faster dense `9B q8_0` state under the same newer harness:
+  - file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.082x`
+  - `good np=1`: `1.030x`
+- A broad post-replay guard regressed that path badly:
+  - file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `0.999x`
+  - `good np=1`: `0.938x`
+- The current dense-only branch recovered the earlier `9B q8_0` win by removing that broad guard from dense `qwen35`.
 
-- This branch already had an earlier faster `Qwen3.5-9B q8_0` state under the current harness, before the permanent replay guard:
-  - from `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
-  - `primary np=1`: `150.83 -> 163.23 tok/s` (`1.082x`)
-  - `good np=1`: `148.88 -> 153.38 tok/s` (`1.030x`)
-  - `primary np=2`: `128.08 -> 138.55 tok/s` (`1.082x`)
-  - `good np=2`: `131.40 -> 145.13 tok/s` (`1.104x`)
-- Current branch state after the permanent hybrid/recurrent post-replay guard:
-  - from `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
-  - `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
-  - `good np=1`: `148.62 -> 139.40 tok/s` (`0.938x`)
-  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
-  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
-  - `bad np=1`: `148.82 -> 125.10 tok/s` (`0.841x`)
-  - `bad np=2`: `132.99 -> 115.83 tok/s` (`0.871x`)
+Important measurement result:
 
-Current branch-wide reading from the full 2026-04-10 matrix:
-
-- no checked model or quant is net-positive on `np=1`
-- only `Qwen3.5-9B q8_0` remains speed-positive at all, and only on the easier `np=2` cases
-- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere
-- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere
-- `Qwen3.5-35B-A3B` is slower everywhere
-- `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again after the replay guard fix, but still far from speed-positive
-
-Very important local finding from the new visibility pass:
-
-- speculative accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
-- representative coverage from `/tmp/native-mtp-step-01`:
+- The visibility pass already showed speculative accept rows are almost entirely on the intended fast path with logits suppressed.
+- Representative coverage:
   - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
   - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
   - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
-- this means the earlier “maybe split pure verifier rows out of mixed chunks” idea is now probably not the main win
 
-Another very important local finding:
+That means the next plan should not assume “find another verifier fast path in server-context.cpp” is the main missing win.
 
-- in this branch, `Qwen3.5` dense is currently classified as `hybrid` in libllama too, not just `Qwen3.5-MoE`
-- so the current one-step post-replay guard is already the live policy on the checked 9B and 27B targets, not just on A3B
-- a trial “dense cooldown” branch produced no distinct `cooldown_hits`; it collapsed into the same guard behavior and was dropped
+What I want back:
 
-MoE-specific reality check:
+1. A direct reading of whether we already exhausted the easy server-local wins.
+2. A small-step plan for the next dense-only branch, benchmark-gated after every step.
+3. A separate list of larger follow-up ideas only if they are truly outside a reasonable V1.
+4. A specific call on whether the current one-token native-MTP design is likely capable of:
+   - consistent `>= 5%` `np=1` speedups on dense Qwen 3.5
+   - or only narrow wins like `9B q8_0`
 
-- `Qwen3.5-35B-A3B` native MTP is now functionally/correctness-clean on the checked `np=1` cases
-- but it is still materially slower than baseline on every checked quant
-- current local belief is that this may simply not be a good speed target even with a cleaner implementation, because the model is already a fast active-parameter MoE path and the current native-MTP depth is only one token
+If you use public references, be surgical. Focus on implementations or documentation that directly help this branch:
 
-Please do not just say “more profiling needed”. I want a specific call:
+- public upstream `ggml-org/llama.cpp` only where needed
+- public vLLM / SGLang / TensorRT-LLM only where they materially illuminate replay, verifier, state, or dense runtime economics for MTP-like paths
 
-- continue deeper on hybrid replay/guard economics now
-- or stop here and narrow scope for the first upstreamable series
-
-CONSTRAINTS:
-
-- preserve the already-validated `np=1` exactness contract on the checked dense and A3B cases
-- prefer upstream-friendly conclusions over heroic local-only hacks
-- separate:
-  - “worth doing in this private mirror next”
-  - “worth exploring later in a dedicated branch”
-  - “not worth keeping in scope for v1”
-- if you use public upstream or other public projects, fetch them surgically and explain exactly why they matter
+Please keep the plan practical and codebase-aware. Do not turn this into a generic research survey.

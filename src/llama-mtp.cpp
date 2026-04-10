@@ -19,7 +19,6 @@ static ggml_context_ptr llama_mtp_init_ctx(size_t n_tensors) {
 static bool llm_arch_supports_native_mtp(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
-        case LLM_ARCH_QWEN35MOE:
             return true;
         default:
             return false;

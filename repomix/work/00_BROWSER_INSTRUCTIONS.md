@@ -14,6 +14,7 @@ You are an AI assistant running in a browser. You received a Repomix-packed cont
   - optional constraints (time, stack, risk tolerance, etc.)
 - Repo context: selected source files and configs
 - Optional `repomix/work/02_CONTEXT_NOTES.md` (short excerpts only)
+- Optional `repomix/work/04_UPSTREAM_DIFF_SUMMARY.md` describing what this private branch changes relative to public `upstream/master`
 
 ## Hard rules
 - Produce **exactly one** final deliverable section: `DELIVERABLE_FOR_CODEX_CLI`.
@@ -21,6 +22,8 @@ You are an AI assistant running in a browser. You received a Repomix-packed cont
 - Do not include filler, long summaries, or generic explanations.
 - When referencing code, always include **file paths** and (if possible) **symbols** (functions/classes).
 - If something is missing from context, state the smallest assumption needed and continue.
+- If more surrounding context is needed than is included here, you may consult the public `ggml-org/llama.cpp` upstream repository surgically.
+- Treat the included local files and `04_UPSTREAM_DIFF_SUMMARY.md` as authoritative for what changed in this private branch.
 
 ---
 

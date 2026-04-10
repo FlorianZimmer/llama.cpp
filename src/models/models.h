@@ -632,13 +632,6 @@ private:
                         int * sections,
                         int   il);
 
-    ggml_tensor * build_layer_attn(
-    llm_graph_input_attn_no_cache * inp_attn,
-                ggml_tensor * cur,
-                ggml_tensor * inp_pos,
-                        int * sections,
-                        int   il);
-
     ggml_tensor * build_layer_attn_linear(
          llm_graph_input_rs * inp,
                 ggml_tensor * cur,
