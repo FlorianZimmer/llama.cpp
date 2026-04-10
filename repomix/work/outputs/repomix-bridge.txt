@@ -1,0 +1,2861 @@
+================================================================
+Directory Structure
+================================================================
+common/
+  speculative.cpp
+  speculative.h
+docs/
+  development/
+    native-mtp-benchmarks.md
+repomix/
+  work/
+    00_BROWSER_INSTRUCTIONS.md
+    01_REQUEST.md
+    02_CONTEXT_NOTES.md
+    03_CODE_EXCERPTS.md
+scripts/
+  validate_mtp_cuda.py
+src/
+  llama-mtp.cpp
+  llama-mtp.h
+tools/
+  server/
+    tests/
+      unit/
+        test_speculative.py
+
+================================================================
+Files
+================================================================
+
+================
+File: repomix/work/01_REQUEST.md
+================
+USER_GOAL:
+Create a detailed implementation plan for the remaining upstream-friendly native-MTP performance work in this private llama.cpp mirror.
+
+DELIVERABLE_TYPE: PLAN
+
+USER_REQUEST:
+Please create a detailed step-by-step implementation plan for the three remaining native-MTP optimization areas in this branch:
+
+1. adaptive native-MTP backoff on replay-heavy workloads
+2. replay-path reduction / cheaper rejection handling
+3. small server hot-path cleanup
+
+This should be one coherent plan that tries to finish all three in one go, but it must stay pragmatic:
+- if one strategy does not pan out, set it aside and continue to the next
+- only treat something as a blocker if it truly prevents progress on the others
+
+The plan must require benchmarking after every landed step, always against:
+- baseline greedy decode
+- the immediately previous native-MTP implementation
+
+Do not count an optimization as successful unless it shows a real end-to-end speedup on the validated exact cases, not just lower internal phase timings.
+
+Please use the provided repo slice first. If you need more context from the public llama.cpp repo, fetch only a few additional relevant lines/files surgically. This is a very large codebase, so do not expand scope casually.
+
+What I want from you:
+- a prioritized phased implementation plan
+- estimated payoff and scope for each step
+- exact files / code areas to touch
+- validation checkpoints after each step
+- fallback / rollback rules if a strategy is not paying off
+- explicit guidance for keeping the work upstream-friendly, simple, maintainable, and reusable for future native-MTP models rather than hard-coding Qwen 3.5 assumptions
+
+CONSTRAINTS (optional):
+- Preserve current exactness on validated cases:
+  - CUDA Berlin `np=1/2`
+  - CUDA Moon `np=1/2`
+- The known Rust `np=2` stress case is still allowed to diverge because it reflects the documented hybrid/recurrent `np>1` exactness limitation.
+- Avoid invasive scheduler/backend API refactors unless absolutely necessary.
+- Prefer policy/runtime/server changes before backend/kernel surgery.
+- Keep instrumentation/debug aids lightweight and removable.
+- Be explicit about what should be measured before and after each step.
+
+================
+File: repomix/work/02_CONTEXT_NOTES.md
+================
+CONTEXT_NOTES (optional):
+
+- Repo / branch state:
+  - repo: `/home/florian/llama.cpp-upstream-mtp-plan`
+  - branch: `feat/native-mtp-backend-seed`
+  - current commit in this private mirror: `0c6c01d1f` (`native MTP: keep seed transport on backend`)
+
+- High-level native-MTP status already implemented in this private mirror:
+  - HF -> GGUF + loader support for Qwen 3.5 native MTP / NextN
+  - runtime native-MTP path for Qwen 3.5 and Qwen 3.5 MoE
+  - server integration for `--spec-type mtp`
+  - rollback / replay hardening for recurrent / hybrid models
+  - backend-resident seed transport for CUDA / non-host verifier paths
+
+- Current correctness contract:
+  - validated exact:
+    - CUDA Berlin `np=1/2`
+    - CUDA Moon `np=1/2`
+  - known limitation:
+    - CUDA Rust `np=2` still diverges because of the documented hybrid / recurrent `np>1` exactness limitation
+    - do not spend this plan trying to “solve” that batch-invariance problem unless there is a very small upstream-friendly mitigation
+
+- Important recent finding:
+  - the backend-resident seed transport was worth landing structurally, but it did not materially improve end-to-end CUDA throughput on the validated exact cases
+  - actual before/after MTP tok/s on this host were roughly flat:
+    - Berlin `np=1`: `173.37 -> 172.71`
+    - Berlin `np=2`: `160.44 / 160.88 -> 160.46 / 160.04`
+    - Moon `np=1`: `151.79 -> 150.84`
+    - Moon `np=2`: `141.07 / 140.74 -> 139.45 / 139.75`
+  - implication:
+    - the host round trip is no longer the highest-value remaining target
+    - the next real wins have to come from draft policy / replay cost / server runtime overhead
+
+- Remaining optimization backlog to plan:
+  1. adaptive native-MTP backoff on replay-heavy prompts
+  2. replay-path reduction
+  3. small server hot-path cleanup
+
+- What is already known about those priorities:
+  - replay-heavy workloads are the main bad case now
+  - replay dominates the remaining overhead on prompts like the Rust stress case
+  - smaller server-loop/container setup costs still exist, but they are clearly secondary
+  - future steps must always prove real end-to-end tok/s improvement, not just lower internal timings
+
+- Current validation / benchmarking method already present in this mirror:
+  - unit tests:
+    - `LLAMA_SERVER_BIN_PATH=/home/florian/llama.cpp-upstream-mtp-plan/build-cuda-server/bin/llama-server .venv-tests/bin/python -m pytest tools/server/tests/unit/test_speculative.py -q`
+  - exact CUDA validation:
+    - `python3 scripts/validate_mtp_cuda.py --binary build-cuda-server/bin/llama-server --model /mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf ...`
+  - benchmark note:
+    - `docs/development/native-mtp-benchmarks.md`
+
+- Key benchmark inputs currently considered representative:
+  - Berlin exact case:
+    - prompt: `Write one short sentence about Berlin.`
+    - seed: `42`
+    - `n_predict=48`
+    - exact for `np=1/2`
+  - Moon exact case:
+    - prompt: `Write two short sentences about the Moon.`
+    - seed: `31415`
+    - `n_predict=64`
+    - exact for `np=1/2`
+  - Rust stress case:
+    - prompt: `List three reasons Rust is used for systems programming.`
+    - seed: `777`
+    - `n_predict=64`
+    - still non-exact for `np=2`, but should not regress into corruption / crashes / invalid token streams
+
+- What the external planner should assume about implementation style:
+  - keep it upstream-friendly and simple
+  - prefer generic native-MTP runtime improvements over Qwen-only hacks
+  - keep changes understandable for future native-MTP model support
+  - avoid large scheduler/backend changes unless the payoff is clearly better than server/runtime policy improvements
+
+- Recent private-mirror changes not necessarily obvious from upstream public files:
+  - backend-resident native-MTP seed transport is already implemented here
+  - it uses persistent `seed_cache_dev` / `seed_batch_dev`, explicit seed mode, and generation-based graph reuse invalidation
+  - debug envs currently exist for rollout:
+    - `LLAMA_MTP_BACKEND_SEED_DEBUG=1`
+    - `LLAMA_MTP_BACKEND_SEED_FORCE_HOST=1`
+  - the forced host fallback is only for comparison/debugging and is not the validated fast path on non-host multi-sequence CUDA
+
+- Surgical public llama.cpp context is allowed if needed.
+  Suggested upstream URLs to inspect only if necessary:
+  - `https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp`
+    - current server batching / speculative structure
+  - `https://github.com/ggml-org/llama.cpp/blob/master/src/llama-context.cpp`
+    - current context/runtime patterns
+  - `https://github.com/ggml-org/llama.cpp/blob/master/ggml/include/ggml-backend.h`
+    - backend copy / sync / event APIs
+  - `https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-backend.cpp`
+    - scheduler input-copy behavior / split logic
+  Use these surgically. Do not expand into broad repo exploration unless a concrete step truly requires it.
+
+================
+File: repomix/work/00_BROWSER_INSTRUCTIONS.md
+================
+# Repository Bridge Instructions (Read First)
+
+You are an AI assistant running in a browser. You received a Repomix-packed context file for a repository.
+
+## Mission
+1) Read **DELIVERABLE_TYPE** + **USER_REQUEST** (included below).
+2) Use the provided repository context to produce exactly **one** deliverable the user can paste back into Codex CLI.
+3) Stay implementation-oriented. Prefer minimal, high-signal changes.
+
+## Inputs you will find in this pack
+- `repomix/work/01_REQUEST.md`
+  - `DELIVERABLE_TYPE`: one of PLAN | REVIEW | RESULT | BRAINSTORM
+  - `USER_REQUEST`: verbatim user text
+  - optional constraints (time, stack, risk tolerance, etc.)
+- Repo context: selected source files and configs
+- Optional `repomix/work/02_CONTEXT_NOTES.md` (short excerpts only)
+
+## Hard rules
+- Produce **exactly one** final deliverable section: `DELIVERABLE_FOR_CODEX_CLI`.
+- Do not output multiple alternative deliverables.
+- Do not include filler, long summaries, or generic explanations.
+- When referencing code, always include **file paths** and (if possible) **symbols** (functions/classes).
+- If something is missing from context, state the smallest assumption needed and continue.
+
+---
+
+## Required output format (always the same skeleton)
+
+### 1) Understanding
+- 2–4 bullets restating the request in your own words
+- Assumptions (only if necessary)
+- Success criteria (how we know it’s done)
+
+### 2) Repo Map (relevant only)
+- 5–15 bullets: the most relevant files/dirs and why
+
+### 3) Key Findings
+- Concrete observations with file paths and symbols
+- Call out constraints, conflicts, sharp edges
+
+### 4) Approach (brief)
+- Recommended approach + tradeoffs (short)
+- If DELIVERABLE_TYPE=REVIEW, focus on critique + improvements
+- If DELIVERABLE_TYPE=BRAINSTORM, focus on options + decision points
+
+### 5) DELIVERABLE_FOR_CODEX_CLI (THIS MUST BE LAST)
+Produce content depending on `DELIVERABLE_TYPE`:
+
+#### If DELIVERABLE_TYPE = PLAN
+Provide:
+- Steps (numbered, granular)
+- Files to edit/create (exact paths)
+- Change summary per file (what to add/remove)
+- Commands to run (tests/build/lint/run)
+- Validation checklist
+- Risks / gotchas (brief)
+
+#### If DELIVERABLE_TYPE = REVIEW
+Provide:
+- Overall assessment (1–3 bullets)
+- Priority-ordered issues (P0/P1/P2) with file paths/symbols
+- Concrete recommendations (what to change, where)
+- Optional: a minimal “next plan” (<= 8 steps)
+- Validation / regression risks
+
+#### If DELIVERABLE_TYPE = RESULT
+Provide:
+- The final artifact(s) that Codex should apply (e.g., patch-like edits, file contents, or exact snippets)
+- For each file: path + “insert/replace” instructions (unambiguous)
+- Commands to run
+- Validation checklist
+
+#### If DELIVERABLE_TYPE = BRAINSTORM
+Provide:
+- 2–4 viable options (with tradeoffs)
+- A recommended option + why
+- A short “decision checklist” (what to decide / confirm)
+- A minimal next step plan (<= 6 steps)
+
+End after `DELIVERABLE_FOR_CODEX_CLI`. No extra text.
+
+================
+File: common/speculative.h
+================
+#pragma once
+
+#include "llama.h"
+#include "common.h"
+
+struct common_speculative;
+
+// comma separated list of all types
+std::string common_speculative_type_name_str();
+
+// convert string to type
+enum common_speculative_type common_speculative_type_from_name(const std::string & name);
+
+// convert type to string
+std::string common_speculative_type_to_str(enum common_speculative_type type);
+
+// check if the llama_context is compatible for speculative decoding
+// note: clears the memory of the context
+bool common_speculative_is_compat(llama_context * ctx_tgt);
+
+common_speculative * common_speculative_init(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt);
+
+void common_speculative_free(common_speculative * spec);
+
+// optionally call once at the beginning of a new generation
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+
+// sample up to n_draft tokens and add them to the batch using the draft model
+llama_tokens common_speculative_draft(
+                     common_speculative * spec,
+        const common_params_speculative & params,
+                     const llama_tokens & prompt,
+                            llama_token   id_last);
+
+// informs the speculative decoder that n_accepted tokens were accepted by the target model
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+
+// print statistics about the speculative decoding
+void common_speculative_print_stats(const common_speculative * spec);
+
+================
+File: repomix/work/03_CODE_EXCERPTS.md
+================
+# Focused Code Excerpts
+
+These excerpts are from large files that are too expensive to include whole. They cover the current native-MTP runtime shape, the server-side speculative / replay path, and the measurement hooks that future optimizations must preserve.
+
+## `tools/server/server-context.cpp`
+
+### Native MTP profiling counters and runtime flags on each slot
+
+```cpp
+48	static bool server_native_mtp_profile_enabled() {
+49	    static const bool enabled = getenv("LLAMA_SERVER_MTP_PROFILE") != nullptr;
+50	    return enabled;
+51	}
+...
+74	    struct native_mtp_profile_data {
+75	        int32_t n_draft_calls = 0;
+76	        int32_t n_snapshot = 0;
+77	        int32_t n_accept = 0;
+78	        int32_t n_restore = 0;
+79	        int32_t n_replay = 0;
+80	
+81	        int64_t t_draft_us = 0;
+82	        int64_t t_snapshot_us = 0;
+83	        int64_t t_accept_us = 0;
+84	        int64_t t_restore_us = 0;
+85	        int64_t t_replay_us = 0;
+86	    };
+...
+96	    common_speculative * spec = nullptr;
+97	    common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+98	    bool native_mtp = false;
+99	    int32_t native_mtp_max = 0;
+...
+197	    std::vector<uint8_t> native_mtp_state;
+198	    llama_state_seq_flags native_mtp_state_flags = 0;
+199	    llama_seq_id native_mtp_backup_id = -1;
+200	    native_mtp_profile_data native_mtp_profile;
+```
+
+### Slot-level speculation helpers
+
+```cpp
+314	    common_speculative_type runtime_spec_type() const {
+315	        if (native_mtp) {
+316	            return COMMON_SPECULATIVE_TYPE_MTP;
+317	        }
+...
+334	    bool can_speculate() const {
+335	        if (task) {
+336	            return task->params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+337	                has_spec_runtime(task->params.speculative.type);
+338	        }
+339	
+340	        return runtime_spec_type() != COMMON_SPECULATIVE_TYPE_NONE;
+341	    }
+...
+390	    int get_n_draft_max() const {
+393	        if (!can_speculate()) {
+394	            return 0;
+395	        }
+...
+398	        int n_draft_max = task->params.speculative.n_max;
+400	        if (uses_native_mtp()) {
+401	            n_draft_max = std::min(n_draft_max, native_mtp_max);
+402	        }
+...
+406	        n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
+409	            n_draft_max = std::min(n_draft_max, n_remaining - 1);
+...
+414	        if (n_draft_max < task->params.speculative.n_min) {
+415	            ...
+416	            n_draft_max = 0;
+417	        }
+419	        return n_draft_max;
+420	    }
+```
+
+### Where per-slot native-MTP phase timing is reported today
+
+```cpp
+522	        if (server_native_mtp_profile_enabled() && native_mtp && n_draft_total > 0) {
+523	            const auto to_ms = [](int64_t us) { return us / 1000.0; };
+524	            const int64_t t_native_total_us =
+525	                    native_mtp_profile.t_draft_us +
+526	                    native_mtp_profile.t_snapshot_us +
+527	                    native_mtp_profile.t_accept_us +
+528	                    native_mtp_profile.t_restore_us +
+529	                    native_mtp_profile.t_replay_us;
+...
+539	                    to_ms(native_mtp_profile.t_draft_us),    native_mtp_profile.n_draft_calls,
+540	                    to_ms(native_mtp_profile.t_snapshot_us), native_mtp_profile.n_snapshot,
+541	                    to_ms(native_mtp_profile.t_accept_us),   native_mtp_profile.n_accept,
+542	                    to_ms(native_mtp_profile.t_restore_us),  native_mtp_profile.n_restore,
+543	                    to_ms(native_mtp_profile.t_replay_us),   native_mtp_profile.n_replay,
+544	                    to_ms(t_native_total_us));
+545	        }
+```
+
+### Batched native-MTP draft generation across generating slots
+
+```cpp
+2288	        std::unordered_map<int, llama_tokens> native_mtp_drafts;
+...
+2304	                const int n_draft_max = slot.get_n_draft_max();
+2305	                if (!slot.uses_native_mtp() || n_draft_max <= 0) {
+2306	                    continue;
+2307	                }
+...
+2321	                const int32_t n_mtp = llama_native_mtp_draft_batch(
+2322	                        ctx,
+2323	                        mtp_seq_ids.data(),
+2324	                        mtp_tokens.data(),
+2325	                        mtp_pos.data(),
+2326	                        mtp_slots.size(),
+2327	                        mtp_batch_draft.data(),
+2328	                        1);
+...
+2332	                    mtp_slot->native_mtp_profile.n_draft_calls += 1;
+2333	                    mtp_slot->native_mtp_profile.t_draft_us += t_mtp_draft_us / (int64_t) mtp_slots.size();
+...
+2338	                        native_mtp_drafts[mtp_slots[i]->id] = { mtp_batch_draft[i] };
+```
+
+### Per-slot draft, snapshot, and draft-batch expansion
+
+```cpp
+2363	            const int n_draft_max = slot.get_n_draft_max();
+2364	            if (n_draft_max > 0) {
+...
+2373	                if (slot.uses_native_mtp()) {
+2374	                    auto it_draft = native_mtp_drafts.find(slot.id);
+2375	                    if (it_draft != native_mtp_drafts.end()) {
+2376	                        draft = it_draft->second;
+2377	                    } else {
+2378	                        draft.resize((size_t) std::min(1, n_draft_max));
+...
+2381	                        const int32_t n_mtp = llama_native_mtp_draft(
+2382	                                slot.ctx,
+2383	                                slot.id,
+2384	                                slot.sampled,
+2385	                                slot.prompt.tokens.pos_next(),
+2386	                                draft.data(),
+2387	                                draft.size());
+...
+2407	                const bool use_recurrent_backup = slot.uses_native_mtp_recurrent_backup();
+2408	                const llama_state_seq_flags native_mtp_state_flags =
+2409	                    slot.uses_native_mtp() && !use_recurrent_backup && llama_model_is_hybrid(llama_get_model(slot.ctx))
+2410	                        ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+2411	                        : 0;
+2412	
+2413	                if (slot.uses_native_mtp() && !draft.empty()) {
+2414	                    const int64_t t_snapshot_start = ggml_time_us();
+2415	                    const bool saved = use_recurrent_backup
+2416	                            ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.id, slot.native_mtp_backup_id, -1, -1)
+2417	                            : slot.save_native_mtp_state(native_mtp_state_flags);
+2418	                    slot.native_mtp_profile.n_snapshot += 1;
+2419	                    slot.native_mtp_profile.t_snapshot_us += ggml_time_us() - t_snapshot_start;
+2420	
+2421	                    if (!saved) {
+2422	                        ...
+2423	                        draft.clear();
+2424	                    }
+2425	                }
+...
+2432	                if (slot.task->params.speculative.n_min > (int) draft.size()) {
+2433	                    ...
+2434	                } else {
+2435	                    slot.n_draft_total += draft.size();
+2436	                    for (size_t i = 0; i < draft.size(); i++) {
+2437	                        slot.i_batch_dft.push_back(batch.n_tokens);
+2438	                        common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
+2439	                        slot.prompt.tokens.push_back(draft[i]);
+2440	                    }
+2441	                    slot.drafted = std::move(draft);
+2442	                }
+```
+
+### Replay helper used after rejection
+
+```cpp
+3042	        struct native_replay_entry {
+3043	            server_slot * slot = nullptr;
+3044	            size_t n_prompt_base = 0;
+3045	        };
+...
+3059	        auto replay_native_mtp_prefix_batch = [&](const std::vector<native_replay_entry> & replay_slots) {
+3060	            size_t n_replay_total = 0;
+3061	            size_t n_replay_max = 0;
+3062	            for (const auto & replay_slot : replay_slots) {
+3063	                ...
+3065	                const size_t n_replay = replay_slot.slot->prompt.n_tokens() - replay_slot.n_prompt_base;
+3066	                n_replay_total += n_replay;
+3067	                n_replay_max = std::max(n_replay_max, n_replay);
+3068	            }
+...
+3074	            llama_batch replay = llama_batch_init((int32_t) replay_slots.size(), 0, 1);
+...
+3079	            for (size_t step = 0; step < n_replay_max; ++step) {
+3080	                common_batch_clear(replay);
+...
+3085	                    const size_t n_replay = slot.prompt.n_tokens() - replay_slot.n_prompt_base;
+3086	                    if (step >= n_replay) {
+3087	                        continue;
+3088	                    }
+...
+3091	                    const bool logits = step + 1 == n_replay;
+3092	                    common_batch_add(replay, slot.prompt.tokens[replay_slot.n_prompt_base + step], pos, { slot.id }, logits);
+...
+3110	                if (llama_decode(ctx, replay) != 0) {
+3111	                    ok = false;
+3112	                    break;
+3113	                }
+3114	            }
+...
+3116	            llama_batch_free(replay);
+3117	            return ok;
+3118	        };
+```
+
+### Accept, rollback, and replay decision path
+
+```cpp
+3301	            // speculative decoding - main model sample and accept
+3302	            std::vector<speculative_accept_result> speculative_results;
+...
+3314	                if (slot.uses_native_mtp()) {
+3315	                    slot.native_mtp_profile.n_accept += 1;
+3316	                    slot.native_mtp_profile.t_accept_us += ggml_time_us() - t_accept_start;
+3317	                }
+...
+3326	            bool any_native_replay = false;
+3327	            for (auto & spec_result : speculative_results) {
+3328	                auto & slot = *spec_result.slot;
+3329	                const size_t n_accepted_draft = spec_result.ids.size() - 1;
+3330	                spec_result.n_prompt_base = slot.prompt.n_tokens() - spec_result.n_draft - 1;
+3331	                spec_result.needs_native_replay = slot.uses_native_mtp() && n_accepted_draft < spec_result.n_draft;
+3332	                any_native_replay = any_native_replay || spec_result.needs_native_replay;
+...
+3346	                slot.n_draft_accepted += spec_result.ids.size() - 1;
+...
+3353	                // rollback to the state before sampling the draft tokens
+3354	                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - spec_result.n_draft);
+3355	
+3356	                // add accepted tokens to the prompt
+3357	                slot.prompt.tokens.insert({spec_result.ids.begin(), spec_result.ids.end() - 1});
+3358	                slot.sampled = spec_result.ids.back(); // last accepted token
+3359	            }
+...
+3361	            std::vector<native_replay_entry> native_replay_slots;
+3362	            if (any_native_replay) {
+3363	                for (auto & spec_result : speculative_results) {
+```
+
+## `src/llama-context.cpp`
+
+### Current native-MTP draft entry point and backend-resident seed path
+
+```cpp
+701	int32_t llama_context::mtp_draft_batch(
+...
+712	    // Finish the verifier decode and seed copy before reusing the scheduler for MTP.
+713	    synchronize();
+...
+720	    if (native_mtp.seed_mode == LLAMA_MTP_SEED_MODE_NONE) {
+721	        return 0;
+722	    }
+...
+730	    switch (native_mtp.seed_mode) {
+731	        case LLAMA_MTP_SEED_MODE_NONE:
+732	            return 0;
+733	        case LLAMA_MTP_SEED_MODE_HOST:
+...
+748	        case LLAMA_MTP_SEED_MODE_BACKEND:
+749	            if (!native_mtp.seed_backend.ready()) {
+750	                return 0;
+751	            }
+...
+765	                ggml_backend_tensor_copy(
+766	                        native_mtp.seed_backend.seed_cache_rows[seq_ids[i]],
+767	                        native_mtp.seed_backend.seed_batch_rows[i]);
+768	            }
+...
+781	            mtp_seed_backend = native_mtp.seed_backend.seed_batch_dev;
+782	            mtp_seed_generation = native_mtp.seed_backend.generation;
+783	            break;
+784	    }
+...
+836	    const auto gparams = graph_params(
+837	            gf_res_prev.get(),
+838	            ubatch,
+839	            nullptr,
+840	            LLM_GRAPH_TYPE_MTP,
+841	            native_mtp.seed_mode,
+842	            mtp_seed,
+843	            mtp_seed_backend,
+844	            mtp_seed_generation,
+845	            tokens,
+846	            n_seq);
+```
+
+### Current verifier hidden-state capture dispatcher
+
+```cpp
+1840	static void capture_mtp_seed_rows(
+1841	        ggml_tensor * tensor,
+1842	        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+1843	        llama_mtp_state & dst,
+1844	        ggml_backend_sched_t sched) {
+...
+1854	    dst.next_seed_epoch();
+1855	
+1856	    if (!mtp_capture_seed_rows_backend(tensor, seq_to_row, dst, sched, row_size)) {
+1857	        // Keep the old host round-trip path for host-backed and single-sequence fallback.
+1858	        // On non-host backends with multiple live sequences, dropping back to host can still
+1859	        // hit the existing hybrid/recurrent np>1 exactness limitation, so prefer no seed.
+1860	        if (tensor->buffer != nullptr &&
+1861	            !ggml_backend_buffer_is_host(tensor->buffer) &&
+1862	            seq_to_row.size() > 1 &&
+1863	            !mtp_backend_seed_force_host()) {
+1864	            return;
+1865	        }
+1866	        mtp_capture_seed_rows_host(tensor, seq_to_row, dst, sched, row_size);
+1867	    }
+1868	}
+...
+2166	        if (native_mtp.enabled() && t_embd_raw && n_outputs > 0) {
+2167	            const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
+2168	            capture_mtp_seed_rows(t_embd_raw, seq_to_output_row, native_mtp, sched.get());
+2169	        }
+```
+
+## `src/llama-graph.cpp`
+
+### Current backend-view MTP seed input
+
+```cpp
+206	void llm_graph_input_mtp_seed::set_input(const llama_ubatch * ubatch) {
+...
+209	    if (mode == LLAMA_MTP_SEED_MODE_HOST && t_seed && seed && n_mtp > 0) {
+210	        ggml_backend_tensor_set(t_seed, seed, 0, (size_t) n_embd*n_mtp*ggml_element_size(t_seed));
+211	    }
+212	}
+...
+214	bool llm_graph_input_mtp_seed::can_reuse(const llm_graph_params & params) {
+215	    mode = params.mtp_seed_mode;
+216	    seed = params.mtp_seed;
+217	    seed_backend = params.mtp_seed_backend;
+218	    seed_generation = params.mtp_seed_generation;
+219	    n_mtp = params.n_mtp;
+...
+229	        case LLAMA_MTP_SEED_MODE_HOST:
+230	            return t_seed->view_src == nullptr;
+231	        case LLAMA_MTP_SEED_MODE_BACKEND:
+232	            return t_seed->view_src == seed_backend;
+233	    }
+...
+1818	ggml_tensor * llm_graph_context::build_inp_mtp_seed() const {
+1819	    auto inp = std::make_unique<llm_graph_input_mtp_seed>(n_embd, n_mtp, mtp_seed_mode, mtp_seed, mtp_seed_backend, mtp_seed_generation);
+...
+1823	    if (mtp_seed_mode == LLAMA_MTP_SEED_MODE_BACKEND) {
+1824	        GGML_ASSERT(mtp_seed_backend != nullptr);
+1825	
+1826	        cur = ggml_view_2d(ctx0, mtp_seed_backend, n_embd, n_mtp, mtp_seed_backend->nb[1], 0);
+1827	        GGML_ASSERT(cur != nullptr);
+1828	        GGML_ASSERT(ggml_backend_view_init(cur) == GGML_STATUS_SUCCESS);
+1829	    } else {
+1830	        cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_mtp);
+1831	    }
+```
+
+## `scripts/validate_mtp_cuda.py`
+
+### Current exactness / throughput validation contract
+
+```python
+256    scenarios = [
+257        ("baseline", 1, args.port_base + 0),
+258        ("mtp", 1, args.port_base + 1),
+259        ("baseline", 2, args.port_base + 2),
+260        ("mtp", 2, args.port_base + 3),
+261    ]
+...
+278    assert_equal_outputs(results[("baseline", 1)], results[("mtp", 1)])
+279    assert_equal_outputs(results[("baseline", 2)], results[("mtp", 2)])
+...
+282    for n_parallel in (1, 2):
+283        mtp = results[("mtp", n_parallel)]
+284        if not any(resp.get("timings", {}).get("draft_n", 0) > 0 for resp in mtp.responses):
+285            raise AssertionError(f"mtp np={n_parallel} did not report any native draft activity")
+...
+295    for n_parallel in (1, 2):
+296        baseline = results[("baseline", n_parallel)]
+297        mtp = results[("mtp", n_parallel)]
+298        baseline_tps = [resp["timings"]["predicted_per_second"] for resp in baseline.responses]
+299        mtp_tps = [resp["timings"]["predicted_per_second"] for resp in mtp.responses]
+```
+
+## Notes for the planner
+
+- The next plan should assume the backend seed path is already landed and mostly not the bottleneck anymore.
+- The strongest remaining lever looks server/runtime-side:
+  - smarter decision to skip / shrink speculation on replay-heavy steps
+  - cheaper replay after rejection
+  - smaller per-step server hot-path cleanup
+- Any proposed change should include a measurement point against:
+  - baseline greedy decode
+  - the previous native-MTP step on this branch
+- If a proposed optimization only improves internal phase timings but not end-to-end tok/s on Berlin or Moon exact cases, it should be deprioritized or dropped.
+
+================
+File: common/speculative.cpp
+================
+#include "speculative.h"
+
+#include "common.h"
+#include "ggml.h"
+#include "llama.h"
+#include "log.h"
+#include "ngram-cache.h"
+#include "ngram-map.h"
+#include "ngram-mod.h"
+#include "sampling.h"
+
+#include <algorithm>
+#include <cstring>
+#include <iomanip>
+#include <map>
+
+#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
+#define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+const std::vector<enum common_speculative_type> common_speculative_types = {
+    COMMON_SPECULATIVE_TYPE_NONE,
+    COMMON_SPECULATIVE_TYPE_DRAFT,
+    COMMON_SPECULATIVE_TYPE_MTP,
+    COMMON_SPECULATIVE_TYPE_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+};
+
+const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
+    {"none",          COMMON_SPECULATIVE_TYPE_NONE},
+    {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
+    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
+    {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
+    {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+    {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
+    {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+    {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+};
+
+struct common_speculative_config {
+    common_speculative_type type;
+    common_params_speculative params;
+
+    common_speculative_config(common_speculative_type t,
+            const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
+};
+
+static bool common_speculative_are_compatible(
+    const llama_model * model_tgt,
+    const llama_model * model_dft) {
+    const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+    const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
+
+    const bool vocab_type_tgt = llama_vocab_type(vocab_tgt);
+    LOG_DBG("%s: vocab_type tgt: %d\n", __func__, vocab_type_tgt);
+
+    const bool vocab_type_dft = llama_vocab_type(vocab_dft);
+    LOG_DBG("%s: vocab_type dft: %d\n", __func__, vocab_type_dft);
+
+    if (vocab_type_tgt != vocab_type_dft) {
+        LOG_DBG("%s: draft model vocab type must match target model to use speculation but ", __func__);
+        LOG_DBG("vocab_type_dft = %d while vocab_type_tgt = %d\n", vocab_type_dft, vocab_type_tgt);
+        return false;
+    }
+
+    if (
+        llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
+        llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
+        llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft) ||
+        llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft)
+    ) {
+        LOG_DBG("%s: draft model special tokens must match target model to use speculation\n", __func__);
+        return false;
+    }
+
+    {
+        const int n_vocab_tgt = llama_vocab_n_tokens(vocab_tgt);
+        const int n_vocab_dft = llama_vocab_n_tokens(vocab_dft);
+        const int vocab_diff  = n_vocab_tgt > n_vocab_dft
+            ? n_vocab_tgt - n_vocab_dft
+            : n_vocab_dft - n_vocab_tgt;
+
+        if (vocab_diff > SPEC_VOCAB_MAX_SIZE_DIFFERENCE) {
+            LOG_DBG("%s: draft model vocab must closely match target model to use speculation but ", __func__);
+            LOG_DBG("target vocab size %d does not match draft vocab size %d - difference %d, max allowed %d\n",
+                    n_vocab_tgt, llama_vocab_n_tokens(vocab_dft), vocab_diff, SPEC_VOCAB_MAX_SIZE_DIFFERENCE);
+            return false;
+        }
+
+        for (int i = SPEC_VOCAB_CHECK_START_TOKEN_ID; i < std::min(n_vocab_tgt, n_vocab_dft); ++i) {
+            const char * token_text_tgt = llama_vocab_get_text(vocab_tgt, i);
+            const char * token_text_dft = llama_vocab_get_text(vocab_dft, i);
+
+            if (std::strcmp(token_text_tgt, token_text_dft) != 0) {
+                LOG_DBG("%s: draft model vocab must match target model to use speculation but ", __func__);
+                LOG_DBG("token %d content differs - target '%s', draft '%s'\n", i,
+                        common_token_to_piece(vocab_tgt, i).c_str(),
+                        common_token_to_piece(vocab_dft, i).c_str());
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// state of an implementation of speculative decoding
+//
+// each implementation has a unique type and a state that is implementation-specific
+// in a subclass of common_speculative_state
+struct common_speculative_state {
+    const enum common_speculative_type type;
+
+    size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
+    size_t n_call_draft  = 0; // number of times this implementation was called for generation.
+    size_t n_call_accept = 0; // number of times this implementation was called for accumulation.
+
+    size_t n_gen_drafts = 0; // number of times a draft or part was generated by this implementation.
+    size_t n_acc_drafts = 0; // number of times a draft or part was accepted by the target model.
+    size_t n_gen_tokens = 0; // number of tokens generated by this implementation.
+    size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
+
+    // TODO: track performance of most recent calls
+    const bool gen_perf = true; // whether to generate performance stats.
+
+    int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
+    int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
+    int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+
+    common_speculative_state(enum common_speculative_type type) : type(type) {}
+
+    virtual ~common_speculative_state() = default;
+
+    virtual void begin(const llama_tokens & prompt) = 0;
+
+    virtual void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) = 0;
+
+    virtual void accept(uint16_t n_accepted) = 0;
+};
+
+struct common_speculative_state_draft : public common_speculative_state {
+    llama_context * ctx_tgt; // only used for retokenizing from ctx_dft
+    llama_context * ctx_dft;
+
+    common_sampler * smpl;
+
+    llama_batch  batch;
+    llama_tokens prompt_dft;
+
+    bool vocab_cmpt = true; // whether retokenization is needed
+    std::unordered_map<std::string, std::string> vocab_map;
+
+    common_speculative_state_draft(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            const std::vector<std::pair<std::string, std::string>> & replacements)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft(ctx_dft)
+    {
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+        smpl = nullptr;
+
+        // TODO: optimize or pass from outside?
+        // {
+        //     common_params_sampling params;
+        //     params.no_perf = false;
+        //
+        //     params.top_k = 40;
+        //     params.top_p = 0.9;
+        //
+        //     params.samplers = {
+        //         COMMON_SAMPLER_TYPE_TOP_K,
+        //         COMMON_SAMPLER_TYPE_TOP_P,
+        //         COMMON_SAMPLER_TYPE_INFILL,
+        //     };
+        //
+        //     result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
+        // }
+        {
+            common_params_sampling params;
+            params.no_perf = false;
+            params.top_k = 10;
+            params.samplers = {
+                COMMON_SAMPLER_TYPE_TOP_K,
+            };
+
+            smpl = common_sampler_init(llama_get_model(ctx_dft), params);
+        }
+
+        vocab_cmpt = common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
+        LOG_DBG("vocab_cmpt = %d\n", vocab_cmpt);
+
+        if (!vocab_cmpt) {
+            LOG_WRN("the target and draft vocabs are not compatible - tokens will be translated between the two\n");
+
+            for (const auto & pair : replacements) {
+                vocab_map[pair.first] = pair.second;
+            }
+        }
+    }
+
+    ~common_speculative_state_draft() override {
+        llama_perf_context_print(ctx_dft);
+
+        llama_free(ctx_dft);
+
+        common_sampler_free(smpl);
+
+        llama_batch_free(batch);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        auto * spec = this;
+
+        auto & batch      = spec->batch;
+        auto & ctx_tgt    = spec->ctx_tgt;
+        auto & ctx_dft    = spec->ctx_dft;
+        auto & smpl       = spec->smpl;
+        auto & prompt_dft = spec->prompt_dft;
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        int reuse_i = 0;
+        int reuse_n = 0;
+
+        const int n_ctx = llama_n_ctx(ctx_dft) - params.n_max;
+
+        llama_tokens prompt_cnv;
+        if (!spec->vocab_cmpt) {
+            std::string text;
+
+            text = common_detokenize(ctx_tgt, prompt_tgt, true);
+            text = replace_to_dft(text);
+
+            LOG_DBG("%s: main->draft detokenized string: '%s'\n", __func__, text.c_str());
+
+            prompt_cnv = common_tokenize(ctx_dft, text, false, true);
+
+            // convert id_last to draft vocab. llama_detokenize is called directly to avoid an allocation
+            const auto * model_tgt = llama_get_model(ctx_tgt);
+            const auto * vocab_tgt = llama_model_get_vocab(model_tgt);
+
+            int32_t n_chars = llama_detokenize(vocab_tgt, &id_last, 1, nullptr, 0, false, false);
+            GGML_ASSERT(n_chars < 0 && "failed to detokenize id_last");
+
+            text.resize(-n_chars);
+            llama_detokenize(vocab_tgt, &id_last, 1, text.data(), text.size(), false, false);
+            text = replace_to_dft(text);
+
+            LOG_DBG("main->draft detokenized id_last(%d): '%s'\n", id_last, text.c_str());
+            id_last = common_tokenize(ctx_dft, text, false, true)[0];
+        }
+
+        const llama_tokens & prompt_cur = spec->vocab_cmpt ? prompt_tgt : prompt_cnv;
+
+        const int i_start = std::max<int>(0, (int) prompt_cur.size() - n_ctx);
+
+        // reuse as much as possible from the old draft context
+        // ideally, the draft context should be as big as the target context and we will always reuse the entire prompt
+        for (int i = 0; i < (int) prompt_dft.size(); ++i) {
+            int cur = 0;
+            while (i_start + cur < (int) prompt_cur.size() &&
+                    i       + cur < (int) prompt_dft.size() &&
+                    prompt_cur[i_start + cur] == prompt_dft[i + cur]) {
+                cur++;
+            }
+
+            if ((cur >= 256 || n_ctx >= (int) prompt_cur.size()) && cur > reuse_n) {
+                reuse_i = i;
+                reuse_n = cur;
+            }
+        }
+
+        LOG_DBG("%s: reuse_i = %d, reuse_n = %d, prompt = %d\n", __func__, reuse_i, reuse_n, (int) prompt_dft.size());
+
+        result.clear();
+        result.reserve(params.n_max);
+
+        if (reuse_n == 0) {
+            llama_memory_clear(mem_dft, false);
+            prompt_dft.clear();
+        } else {
+            // this happens when a previous draft has been discarded (for example, due to being too small), but the
+            // target model agreed with it. in this case, we simply pass back the previous results to save compute
+            if (reuse_i + reuse_n < (int) prompt_dft.size() && prompt_dft[reuse_i + reuse_n] == id_last) {
+                for (int i = reuse_i + reuse_n + 1; i < (int) prompt_dft.size(); ++i) {
+                    result.push_back(prompt_dft[i]);
+
+                    if (params.n_max <= (int) result.size()) {
+                        break;
+                    }
+                }
+
+                return;
+            }
+
+            if (reuse_i > 0) {
+                llama_memory_seq_rm (mem_dft, 0, 0, reuse_i);
+                llama_memory_seq_add(mem_dft, 0, reuse_i, -1, -reuse_i);
+
+                prompt_dft.erase(prompt_dft.begin(), prompt_dft.begin() + reuse_i);
+            }
+
+            if (reuse_n < (int) prompt_dft.size()) {
+                llama_memory_seq_rm (mem_dft, 0, reuse_n, -1);
+                prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
+            }
+        }
+
+        // prepare a batch to evaluate any new tokens in the prompt
+        common_batch_clear(batch);
+
+        for (size_t i = i_start + reuse_n; i < prompt_cur.size(); ++i) {
+            //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_cur[i]);
+            common_batch_add(batch, prompt_cur[i], i - i_start, { 0 }, false);
+
+            prompt_dft.push_back(prompt_cur[i]);
+        }
+
+        // we should rarely end-up here during normal decoding
+        if (batch.n_tokens > 0) {
+            //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
+
+            llama_decode(ctx_dft, batch);
+        }
+
+        const llama_pos n_past = prompt_dft.size();
+
+        LOG_DBG("%s: n_past = %d\n", __func__, n_past);
+
+        common_batch_clear(batch);
+        common_batch_add  (batch, id_last, n_past, { 0 }, true);
+
+        prompt_dft.push_back(id_last);
+
+        LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
+
+        llama_decode(ctx_dft, batch);
+
+        common_sampler_reset(smpl);
+
+        // sample n_draft tokens from the draft model
+        for (int i = 0; i < params.n_max; ++i) {
+            common_batch_clear(batch);
+
+            common_sampler_sample(smpl, ctx_dft, 0, true);
+
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+            for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                LOG_DBG(" - draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                        k, i, cur_p->data[k].id, cur_p->data[k].p, common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+            }
+
+            // add drafted token for each sequence
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+
+            result.push_back(id);
+
+            if (params.n_max <= (int) result.size()) {
+                break;
+            }
+
+            // only collect very high-confidence draft tokens
+            if (cur_p->data[0].p < params.p_min) {
+                break;
+            }
+
+            common_batch_add(batch, id, n_past + i + 1, { 0 }, true);
+
+            // evaluate the drafted tokens on the draft model
+            llama_decode(ctx_dft, batch);
+
+            prompt_dft.push_back(id);
+        }
+
+        if (!spec->vocab_cmpt) {
+            std::string detokenized = common_detokenize(ctx_dft, result, true);
+            detokenized = replace_to_tgt(detokenized);
+            LOG_DBG("draft->main detokenized string: '%s'\n", detokenized.c_str());
+            result = common_tokenize(ctx_tgt, detokenized, false, true);
+            if (result.size() > (size_t)params.n_max) {
+                result.resize(params.n_max);
+            }
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        // noop
+        GGML_UNUSED(n_accepted);
+    }
+
+    std::string replace_to_dft(const std::string & input) const {
+        std::string result = input;
+
+        for (const auto & pair : this->vocab_map) {
+            size_t pos = result.find(pair.first);
+            while (pos != std::string::npos) {
+                result.replace(pos, pair.first.length(), pair.second);
+                pos = result.find(pair.first, pos + pair.second.length());
+            }
+        }
+
+        return result;
+    }
+
+    std::string replace_to_tgt(const std::string & input) const {
+        std::string result = input;
+
+        for (const auto & pair : this->vocab_map) {
+            size_t pos = result.find(pair.second);
+            while (pos != std::string::npos) {
+                result.replace(pos, pair.second.length(), pair.first);
+                pos = result.find(pair.second, pos + pair.first.length());
+            }
+        }
+
+        return result;
+    }
+};
+
+struct common_speculative_state_eagle3 : public common_speculative_state {
+    common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & draft_tokens) override {
+        // TODO: implement
+        GGML_UNUSED(params);
+        GGML_UNUSED(prompt_tgt);
+        GGML_UNUSED(id_last);
+        GGML_UNUSED(draft_tokens);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        // noop
+        GGML_UNUSED(n_accepted);
+    }
+};
+
+// state of self-speculation (simple implementation, not ngram-map)
+struct common_speculative_state_ngram_simple : public common_speculative_state {
+    common_ngram_simple_config config;
+
+    common_speculative_state_ngram_simple(
+            enum common_speculative_type type,
+            common_ngram_simple_config config)
+        : common_speculative_state(type), config(config) {}
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+
+        result = common_ngram_simple_draft(config, prompt_tgt, id_last);
+        GGML_UNUSED(params);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        // noop
+        GGML_UNUSED(n_accepted);
+    }
+};
+
+struct common_speculative_state_ngram_map_k : public common_speculative_state {
+    // draft ngram map for speculative decoding without draft model
+    common_ngram_map map;
+
+    common_speculative_state_ngram_map_k(
+            enum common_speculative_type type,
+            common_ngram_map map)
+        : common_speculative_state(type), map(std::move(map)) {}
+
+    void begin(const llama_tokens & prompt) override {
+        common_ngram_map_begin(map, prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        common_ngram_map_draft(map, prompt_tgt, id_last, result);
+        GGML_UNUSED(params);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        common_ngram_map_accept(map, n_accepted);
+    }
+};
+
+struct common_speculative_state_ngram_mod : public common_speculative_state {
+    common_ngram_mod & mod;
+
+    // the last position in the prompt that was added to the ngram container
+    size_t i_last = 0;
+
+    // length of the last drafted n‑gram (number of tokens returned by draft)
+    size_t n_draft_last = 0;
+
+    // consecutive accept rounds with low acceptance fraction (< 0.5)
+    int n_low = 0;
+
+    // enable trace logging if LLAMA_TRACE is set
+    const bool verbose;
+
+    common_speculative_state_ngram_mod(enum common_speculative_type type, common_ngram_mod & mod)
+        : common_speculative_state(type), mod(mod), verbose(std::getenv("LLAMA_TRACE") != nullptr) {
+        static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        i_last = 0;
+
+        n_draft_last = 0;
+
+        const size_t n = mod.get_n();
+
+        if (prompt.size() < n) {
+            return;
+        }
+
+        for (size_t i = 0; i < prompt.size() - n; ++i) {
+            mod.add(prompt.data() + i);
+        }
+
+        i_last = prompt.size() - n;
+
+        const double f = (double)mod.get_used() / (double)mod.size();
+        LOG_INF("%s: ngram_mod occupancy = %zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), f);
+
+        constexpr double f_thold = 0.25;
+        if (f > f_thold) {
+            LOG_WRN("%s: ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", __func__, f, f_thold);
+
+            mod.reset();
+        }
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        GGML_UNUSED(params);
+
+        n_draft_last = 0;
+
+        const size_t cur_len = prompt_tgt.size();
+        if (cur_len < mod.get_n()) {
+            return;
+        }
+
+        const size_t n = mod.get_n();
+
+        // add new ngrams in chunks
+        if (i_last + 32 < cur_len) {
+            for (size_t i = i_last; i < cur_len - n; ++i) {
+                mod.add(prompt_tgt.data() + i);
+            }
+
+            i_last = cur_len - n;
+        }
+
+        result.resize(n + params.n_max);
+        for (size_t i = 0; i < n - 1; ++i) {
+            result[i] = prompt_tgt[cur_len - n + 1 + i];
+        }
+        result[n - 1] = id_last;
+
+        for (int i = 0; i < params.n_max; ++i) {
+            const llama_token token = mod.get(result.data() + i);
+            if (token == common_ngram_mod::EMPTY) {
+                if (i < params.n_min) {
+                    result.clear();
+                    return;
+                }
+
+                result.resize(n + i);
+                break;
+            }
+            result[n + i] = token;
+        }
+
+        // only return the m tokens that were drafted
+        for (size_t i = 0; n + i < result.size(); ++i) {
+            result[i] = result[n + i];
+        }
+        result.resize(result.size() - n);
+
+        // store length of drafted n‑gram for later acceptance analysis
+        n_draft_last = result.size();
+    }
+
+    void accept(uint16_t n_accepted) override {
+        if (verbose) {
+            LOG_INF("%s: accepted %d tokens from %zu drafted tokens\n", __func__, n_accepted, n_draft_last);
+        }
+
+        // compute acceptance fraction if we have a recorded draft length
+        if (n_draft_last > 0) {
+            const double f_acc = (double)n_accepted / (double)n_draft_last;
+            if (f_acc < 0.5) {
+                n_low++;
+                if (n_low >= 3) {
+                    LOG_WRN("%s: low acceptance streak (%d) – resetting ngram_mod\n", __func__, n_low);
+
+                    mod.reset();
+                    n_low = 0;
+                }
+            } else {
+                n_low = 0;
+            }
+        }
+    }
+};
+
+struct common_speculative_state_ngram_cache : public common_speculative_state {
+    uint16_t n_draft;
+    bool save_dynamic;
+    bool save_static;
+
+    common_ngram_cache ngram_cache_context;
+    common_ngram_cache ngram_cache_dynamic;
+    common_ngram_cache ngram_cache_static;
+
+    size_t cache_size = 0; // number of tokens in n-gram cache
+
+    common_speculative_state_ngram_cache(
+            const enum common_speculative_type type,
+            const std::string & path_static,
+            const std::string & path_dynamic,
+            uint16_t            n_draft,
+            bool                save_dynamic,
+            bool                save_static)
+        : common_speculative_state(type)
+        , n_draft(n_draft)
+        , save_dynamic(save_dynamic)
+        , save_static(save_static)
+    {
+        if (!path_static.empty()) {
+            try {
+                ngram_cache_static = common_ngram_cache_load(path_static);
+            } catch (...) {
+                LOG_ERR("failed to open static lookup cache: %s", path_static.c_str());
+                GGML_ABORT("Couldn't read static lookup cache");
+            }
+        }
+
+        if (!path_dynamic.empty()) {
+            try {
+                ngram_cache_dynamic = common_ngram_cache_load(path_dynamic);
+            } catch (...) {
+                LOG_ERR("failed to open dynamic lookup cache: %s", path_dynamic.c_str());
+                GGML_ABORT("Couldn't read dynamic lookup cache");
+            }
+        }
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        GGML_UNUSED(params);
+
+        if (cache_size < prompt_tgt.size() + 1) {
+            llama_tokens tokens_new;
+            tokens_new.reserve(prompt_tgt.size() + 1 - cache_size);
+            for (size_t j = cache_size; j < prompt_tgt.size(); ++j) {
+                tokens_new.push_back(prompt_tgt[j]);
+            }
+            tokens_new.push_back(id_last); // add the last token
+
+            // Update context ngram cache with new prompt_tgt:
+            common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                    tokens_new, tokens_new.size(), false);
+            cache_size = prompt_tgt.size() + 1;
+        }
+
+        llama_tokens inp;
+        inp.reserve(prompt_tgt.size() + 1);
+        for (size_t j = 0; j < prompt_tgt.size(); ++j) {
+            inp.push_back(prompt_tgt[j]);
+        }
+        inp.push_back(id_last);
+
+        result.push_back(id_last);
+
+        common_ngram_cache_draft(inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                ngram_cache_context,
+                ngram_cache_dynamic,
+                ngram_cache_static);
+
+        if (result.size() > 0) {
+            // delete first token in result (which is the id_last token)
+            result.erase(result.begin());
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        // TODO: noop
+        GGML_UNUSED(n_accepted);
+    }
+};
+
+struct common_speculative {
+    std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
+    common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
+};
+
+static common_ngram_map get_common_ngram_map(const common_speculative_config & config) {
+    uint16_t size_key   = config.params.ngram_size_n;
+    uint16_t size_value = config.params.ngram_size_m;
+    bool     key_only   = (config.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
+    uint16_t min_hits   = config.params.ngram_min_hits;
+
+    return common_ngram_map(size_key, size_value, key_only, min_hits);
+}
+
+static common_speculative_state_ngram_cache create_state_ngram_cache(
+        const std::string & path_static, const std::string & path_dynamic,
+        const common_speculative_config & config) {
+    uint16_t n_draft = 8; // TODO get from config?
+
+    // TODO bool param in common/common.h to set save_static/save_dynamic?
+    bool save_static = false;
+    bool save_dynamic = false;
+
+    common_speculative_state_ngram_cache state(config.type, path_static, path_dynamic, n_draft, save_static, save_dynamic);
+
+    return state;
+}
+
+std::string common_speculative_type_name_str() {
+    std::string result;
+    for (size_t i = 0; i < common_speculative_types.size(); i++) {
+        if (i > 0) {
+            result += ", ";
+        }
+        result += common_speculative_type_to_str(common_speculative_types[i]);
+    }
+    return result;
+}
+
+std::string common_speculative_type_to_str(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
+        case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
+        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
+        case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        default:                                    return "unknown";
+    }
+}
+
+enum common_speculative_type common_speculative_type_from_name(const std::string & name) {
+    const auto it = common_speculative_type_from_name_map.find(name);
+    if (it == common_speculative_type_from_name_map.end()) {
+        return COMMON_SPECULATIVE_TYPE_COUNT;
+    }
+    return it->second;
+}
+
+bool common_speculative_is_compat(llama_context * ctx_tgt) {
+    auto * mem = llama_get_memory(ctx_tgt);
+    if (mem == nullptr) {
+        return false;
+    }
+
+    bool res = true;
+
+    llama_memory_clear(mem, true);
+
+    // eval 2 tokens to check if the context is compatible
+    std::vector<llama_token> tmp;
+    tmp.push_back(0);
+    tmp.push_back(0);
+
+    int ret = llama_decode(ctx_tgt, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        res = false;
+        goto done;
+    }
+
+    // try to remove the last tokens
+    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+        res = false;
+        goto done;
+    }
+
+done:
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx_tgt);
+
+    return res;
+}
+
+// initialization of the speculative decoding system
+//
+common_speculative * common_speculative_init(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt) {
+    llama_context * ctx_dft = nullptr;
+    if (params.model_dft) {
+        ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+        if (ctx_dft == nullptr) {
+            LOG_ERR("%s", "failed to create draft context\n");
+            return nullptr;
+        }
+    }
+
+    // Compute the implementations to use based on the config and their order of preference
+    std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
+    {
+        bool has_draft = !params.mparams_dft.path.empty();
+        bool has_mtp = params.type == COMMON_SPECULATIVE_TYPE_MTP;
+        bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+
+        bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
+        bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
+        bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+        bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+
+        // In a more complex implementation we could use the same implementation but with different parameters.
+        // This was initially used in PR-18471 but removed to simplify the code.
+        if (has_mtp) {
+            LOG_DBG("%s: native MTP is handled by the main llama_context runtime\n", __func__);
+        }
+        if (has_ngram_simple) {
+            // This implementation can guess a lot of tokens without any draft model.
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, params));
+        }
+        if (has_ngram_map_k) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K, params));
+        }
+        if (has_ngram_map_k4v) {
+            // This implementation can guess tokens with high acceptance rate but is more expensive.
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, params));
+        }
+        if (has_ngram_mod) {
+            // shared instance for all speculative decoding contexts
+            if (!params.ngram_mod) {
+                params.ngram_mod = std::make_shared<common_ngram_mod>(params.ngram_size_n, 4*1024*1024);
+
+                LOG_INF("%s: initialized ngram_mod with n=%d, size=%zu (%.3f MB)\n", __func__,
+                        params.ngram_size_n, params.ngram_mod->size(),
+                        (float)(params.ngram_mod->size_bytes())/1024/1024);
+
+                if (params.ngram_size_n < 16) {
+                    LOG_WRN("%s: ngram_mod n=%d is too small - poor quality is possible, see: https://github.com/ggml-org/llama.cpp/pull/19164\n", __func__, params.ngram_size_n);
+                }
+            }
+
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, params));
+        }
+        if (has_ngram_cache) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_draft) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
+        }
+        if (has_draft_eagle3) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+        }
+    }
+
+    std::vector<std::unique_ptr<common_speculative_state>> impls = {};
+
+    for (const common_speculative_config & config : configs) {
+        LOG_DBG("%s: adding implementation %s\n", __func__, common_speculative_type_to_str(config.type).c_str());
+        switch (config.type) {
+            case COMMON_SPECULATIVE_TYPE_NONE:
+                break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT: {
+                impls.push_back(std::make_unique<common_speculative_state_draft>(config.type,
+                    /* .ctx_tgt      = */ ctx_tgt,
+                    /* .ctx_dft      = */ ctx_dft,
+                    /* .replacements = */ params.replacements
+                ));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_EAGLE3: {
+                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
+                common_ngram_map ngram_map = get_common_ngram_map(config);
+
+                uint16_t ngram_size_key   = ngram_map.size_key;
+                uint16_t mgram_size_value = ngram_map.size_value;
+
+                auto config_simple = common_ngram_simple_config {
+                    /* .size_ngram      = */ ngram_size_key,
+                    /* .size_mgram      = */ mgram_size_value
+                };
+                auto state = std::make_unique<common_speculative_state_ngram_simple>(
+                    /* .type            = */ config.type,
+                    /* .state           = */ config_simple
+                );
+                impls.push_back(std::move(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: {
+                impls.push_back(std::make_unique<common_speculative_state_ngram_map_k>(
+                    (config.type),
+                    get_common_ngram_map(config)
+                ));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
+                GGML_ASSERT(config.params.ngram_mod);
+                impls.push_back(std::make_unique<common_speculative_state_ngram_mod>(config.type, *config.params.ngram_mod));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
+                auto state = create_state_ngram_cache(
+                        params.lookup_cache_static, params.lookup_cache_dynamic, config);
+                impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    if (impls.empty()) {
+        LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        return nullptr;
+    }
+
+    auto * result = new common_speculative {
+        /* .impls = */ std::move(impls)
+    };
+
+    return result;
+}
+
+void common_speculative_free(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    delete spec;
+}
+
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
+        impl->begin(prompt);
+        impl->n_call_begin++;
+    }
+}
+
+llama_tokens common_speculative_draft(
+        common_speculative * spec,
+        const common_params_speculative & params,
+        const llama_tokens & prompt_tgt, // specified in target model vocab
+        llama_token id_last) {
+    llama_tokens result;
+
+    spec->curr_impl = nullptr; // reset current implementation
+
+    for (auto & impl : spec->impls) {
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft(params, prompt_tgt, id_last, result);
+            impl->n_call_draft++;
+        }
+
+        if (!result.empty()) {
+            LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
+                    common_speculative_type_to_str(impl.get()->type).c_str(), prompt_tgt.size(),
+                    impl.get()->n_call_draft, result.size());
+
+            spec->curr_impl = impl.get(); // set current implementation for stats
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += result.size();
+
+            break; // We have a draft, so break out of the loop and return it.
+        }
+    }
+
+    return result;
+}
+
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+    if (n_accepted == 0) {
+        return;
+    }
+
+    common_speculative_state * impl = spec->curr_impl;
+
+    GGML_ASSERT(impl);
+
+    {
+        common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
+        if (n_accepted > 0) {
+            impl->n_acc_drafts++;
+            impl->n_acc_tokens += n_accepted;
+        }
+
+        impl->accept(n_accepted);
+        impl->n_call_accept++;
+    }
+}
+
+void common_speculative_print_stats(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (const auto & impl : spec->impls) {
+        std::string str_perf;
+        if (impl->gen_perf) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
+            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+        } else {
+            str_perf = "";
+        }
+
+        LOG_INF("statistics %s: #calls(b,g,a) = %zu %zu %zu, #gen drafts = %zu, #acc drafts = %zu, #gen tokens = %zu, #acc tokens = %zu%s\n",
+                common_speculative_type_to_str(impl->type).c_str(),
+                impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
+                impl->n_gen_drafts,
+                impl->n_acc_drafts,
+                impl->n_gen_tokens,
+                impl->n_acc_tokens,
+                str_perf.c_str());
+    }
+}
+
+================
+File: scripts/validate_mtp_cuda.py
+================
+#!/usr/bin/env python3
+
+import argparse
+import concurrent.futures
+import json
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_PROMPT = "Hello"
+DEFAULT_SEED = 12345
+DEFAULT_N_PREDICT = 8
+
+
+@dataclass
+class ScenarioResult:
+    mode: str
+    n_parallel: int
+    outputs: list[str]
+    responses: list[dict[str, Any]]
+    log_path: Path
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def wait_for_server(base_url: str, proc: subprocess.Popen[str], timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    last_error = "server did not become healthy"
+
+    while time.time() < deadline:
+        ret = proc.poll()
+        if ret is not None:
+            raise RuntimeError(f"server exited early with code {ret}")
+
+        try:
+            get_json(f"{base_url}/health", timeout=2.0)
+            return
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+            time.sleep(0.25)
+
+    raise RuntimeError(last_error)
+
+
+def stop_server(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def completion_payload(prompt: str, n_predict: int, seed: int) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "temperature": 0,
+        "seed": seed,
+        "cache_prompt": False,
+    }
+
+
+def format_toks(resp: dict[str, Any]) -> str:
+    timings = resp.get("timings", {})
+    predicted = timings.get("predicted_per_second")
+    if predicted is None:
+        return "n/a"
+    return f"{predicted:.2f}"
+
+
+def describe_response(resp: dict[str, Any]) -> str:
+    timings = resp.get("timings", {})
+    extra = []
+    extra.append(f"tok/s={format_toks(resp)}")
+    if "draft_n" in timings and "draft_n_accepted" in timings:
+        extra.append(f"draft={timings['draft_n']}")
+        extra.append(f"accepted={timings['draft_n_accepted']}")
+    extra.append(f"slot={resp.get('id_slot', '?')}")
+    return ", ".join(extra)
+
+
+def launch_server(
+    binary: Path,
+    model: Path,
+    host: str,
+    port: int,
+    n_parallel: int,
+    mode: str,
+    args: argparse.Namespace,
+    log_dir: Path,
+) -> tuple[subprocess.Popen[str], Path]:
+    cmd = [
+        str(binary),
+        "-m",
+        str(model),
+        "-ngl",
+        args.ngl,
+        "-fa",
+        args.flash_attn,
+        "-c",
+        str(args.ctx_size),
+        "-b",
+        str(args.batch_size),
+        "-ub",
+        str(args.ubatch_size),
+        "-t",
+        str(args.threads),
+        "-tb",
+        str(args.threads_batch),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--no-webui",
+        "--no-warmup",
+        "--perf",
+        "-np",
+        str(n_parallel),
+    ]
+
+    if mode == "mtp":
+        cmd.extend(["--spec-type", "mtp", "--draft-max", str(args.draft_max)])
+
+    log_path = log_dir / f"{mode}-np{n_parallel}.log"
+    fout = log_path.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=fout,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc, log_path
+
+
+def run_requests(base_url: str, prompt: str, n_predict: int, seed: int, n_parallel: int) -> list[dict[str, Any]]:
+    payloads = [
+        completion_payload(prompt=prompt, n_predict=n_predict, seed=seed + i)
+        for i in range(n_parallel)
+    ]
+
+    def do_request(payload: dict[str, Any]) -> dict[str, Any]:
+        return post_json(f"{base_url}/completion", payload, timeout=120.0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as tp:
+        futures = [tp.submit(do_request, payload) for payload in payloads]
+        return [f.result() for f in futures]
+
+
+def run_scenario(
+    binary: Path,
+    model: Path,
+    host: str,
+    port: int,
+    mode: str,
+    n_parallel: int,
+    args: argparse.Namespace,
+    log_dir: Path,
+) -> ScenarioResult:
+    proc, log_path = launch_server(binary, model, host, port, n_parallel, mode, args, log_dir)
+    base_url = f"http://{host}:{port}"
+
+    try:
+        wait_for_server(base_url, proc, timeout_s=args.startup_timeout)
+        responses = run_requests(base_url, args.prompt, args.n_predict, args.seed, n_parallel)
+    finally:
+        stop_server(proc)
+
+    outputs = [resp["content"] for resp in responses]
+    return ScenarioResult(
+        mode=mode,
+        n_parallel=n_parallel,
+        outputs=outputs,
+        responses=responses,
+        log_path=log_path,
+    )
+
+
+def assert_equal_outputs(lhs: ScenarioResult, rhs: ScenarioResult) -> None:
+    if lhs.outputs != rhs.outputs:
+        raise AssertionError(
+            f"output mismatch for np={lhs.n_parallel}: {lhs.mode}={lhs.outputs!r} vs {rhs.mode}={rhs.outputs!r}"
+        )
+
+
+def print_result(res: ScenarioResult) -> None:
+    print(f"{res.mode} np={res.n_parallel}")
+    for idx, resp in enumerate(res.responses):
+        print(f"  req{idx}: {describe_response(resp)}")
+        print(f"  req{idx}: content={resp['content']!r}")
+    print(f"  log={res.log_path}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate CUDA native MTP against baseline llama-server output and throughput.")
+    parser.add_argument("--binary", default="build-cuda/bin/llama-server", help="Path to llama-server")
+    parser.add_argument("--model", required=True, help="Path to GGUF model")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    parser.add_argument("--port-base", type=int, default=18100, help="Base port for spawned servers")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt used for greedy validation")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base seed")
+    parser.add_argument("--n-predict", type=int, default=DEFAULT_N_PREDICT, help="Generated tokens per request")
+    parser.add_argument("--ctx-size", type=int, default=4096, help="Context size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--ubatch-size", type=int, default=64, help="Ubatch size")
+    parser.add_argument("--threads", type=int, default=8, help="CPU threads")
+    parser.add_argument("--threads-batch", type=int, default=8, help="CPU batch threads")
+    parser.add_argument("--ngl", default="all", help="Value for -ngl")
+    parser.add_argument("--flash-attn", default="on", choices=["on", "off", "auto"], help="Value for -fa")
+    parser.add_argument("--startup-timeout", type=float, default=180.0, help="Seconds to wait for server health")
+    parser.add_argument("--draft-max", type=int, default=1, help="Value for --draft-max in mtp mode")
+    parser.add_argument("--log-dir", default=None, help="Directory for per-scenario logs")
+    args = parser.parse_args()
+
+    binary = Path(args.binary).resolve()
+    model = Path(args.model).resolve()
+    if not binary.is_file():
+        raise FileNotFoundError(f"llama-server not found: {binary}")
+    if not model.is_file():
+        raise FileNotFoundError(f"model not found: {model}")
+
+    log_dir = Path(args.log_dir).resolve() if args.log_dir else Path(tempfile.mkdtemp(prefix="mtp-cuda-validate-"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"binary={binary}")
+    print(f"model={model}")
+    print(f"logs={log_dir}")
+
+    scenarios = [
+        ("baseline", 1, args.port_base + 0),
+        ("mtp", 1, args.port_base + 1),
+        ("baseline", 2, args.port_base + 2),
+        ("mtp", 2, args.port_base + 3),
+    ]
+
+    results: dict[tuple[str, int], ScenarioResult] = {}
+
+    for mode, n_parallel, port in scenarios:
+        print(f"\n== running {mode} np={n_parallel} on port {port} ==")
+        results[(mode, n_parallel)] = run_scenario(
+            binary=binary,
+            model=model,
+            host=args.host,
+            port=port,
+            mode=mode,
+            n_parallel=n_parallel,
+            args=args,
+            log_dir=log_dir,
+        )
+        print_result(results[(mode, n_parallel)])
+
+    print("\n== validating exact greedy equality ==")
+    assert_equal_outputs(results[("baseline", 1)], results[("mtp", 1)])
+    assert_equal_outputs(results[("baseline", 2)], results[("mtp", 2)])
+
+    for n_parallel in (1, 2):
+        mtp = results[("mtp", n_parallel)]
+        if not any(resp.get("timings", {}).get("draft_n", 0) > 0 for resp in mtp.responses):
+            raise AssertionError(f"mtp np={n_parallel} did not report any native draft activity")
+
+    baseline_output = results[("baseline", 1)].outputs[0]
+    for key, res in results.items():
+        for out in res.outputs:
+            if out != baseline_output:
+                raise AssertionError(f"scenario {key} output {out!r} does not match baseline np=1 output {baseline_output!r}")
+
+    print("all greedy outputs match exactly")
+
+    print("\n== summary ==")
+    for n_parallel in (1, 2):
+        baseline = results[("baseline", n_parallel)]
+        mtp = results[("mtp", n_parallel)]
+        baseline_tps = [resp["timings"]["predicted_per_second"] for resp in baseline.responses]
+        mtp_tps = [resp["timings"]["predicted_per_second"] for resp in mtp.responses]
+        print(
+            f"np={n_parallel}: baseline tok/s={baseline_tps}, "
+            f"mtp tok/s={mtp_tps}"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+================
+File: tools/server/tests/unit/test_speculative.py
+================
+import pytest
+from utils import *
+
+# We use a F16 MOE gguf as main model, and q4_0 as draft model
+
+server = ServerPreset.stories15m_moe()
+
+MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"
+
+def create_server():
+    global server
+    server = ServerPreset.stories15m_moe()
+    # set default values
+    server.model_draft = download_file(MODEL_DRAFT_FILE_URL)
+    server.draft_min = 4
+    server.draft_max = 8
+    server.fa = "off"
+
+
+@pytest.fixture(autouse=True)
+def fixture_create_server():
+    return create_server()
+
+
+def test_with_and_without_draft():
+    global server
+    server.model_draft = None  # disable draft model
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    })
+    assert res.status_code == 200
+    content_no_draft = res.body["content"]
+    server.stop()
+
+    # create new server with draft model
+    create_server()
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    })
+    assert res.status_code == 200
+    content_draft = res.body["content"]
+
+    assert content_no_draft == content_draft
+
+
+def test_different_draft_min_draft_max():
+    global server
+    test_values = [
+        (1, 2),
+        (1, 4),
+        (4, 8),
+        (4, 12),
+        (8, 16),
+    ]
+    last_content = None
+    for draft_min, draft_max in test_values:
+        server.stop()
+        server.draft_min = draft_min
+        server.draft_max = draft_max
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "I believe the meaning of life is",
+            "temperature": 0.0,
+            "top_k": 1,
+            "n_predict": 16,
+        })
+        assert res.status_code == 200
+        if last_content is not None:
+            assert last_content == res.body["content"]
+        last_content = res.body["content"]
+
+
+def test_slot_ctx_not_exceeded():
+    global server
+    server.n_ctx = 256
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Hello " * 248,
+        "temperature": 0.0,
+        "top_k": 1,
+        "speculative.p_min": 0.0,
+    })
+    assert res.status_code == 200
+    assert len(res.body["content"]) > 0
+
+
+def test_with_ctx_shift():
+    global server
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Hello " * 248,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 256,
+        "speculative.p_min": 0.0,
+    })
+    assert res.status_code == 200
+    assert len(res.body["content"]) > 0
+    assert res.body["tokens_predicted"] == 256
+    assert res.body["truncated"] == True
+
+
+def test_mtp_requires_native_model(tmp_path):
+    global server
+    server = ServerPreset.tinyllama2()
+    server.spec_type = "mtp"
+    server.log_path = str(tmp_path / "mtp-unsupported.log")
+
+    with pytest.raises(RuntimeError, match="Server process died"):
+        server.start()
+
+    with open(server.log_path, "r", encoding="utf-8") as f:
+        log_text = f.read()
+
+    assert "native MTP requested but the loaded model does not support it" in log_text
+
+
+def test_request_mtp_requires_native_runtime():
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "speculative.type": "mtp",
+    })
+
+    assert res.status_code == 400
+    assert "Requested speculative.type 'mtp'" in res.body["error"]["message"]
+    assert "only supports 'draft'" in res.body["error"]["message"]
+
+
+def test_request_can_disable_speculation():
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "speculative.type": "none",
+    })
+
+    assert res.status_code == 200
+    assert len(res.body["content"]) > 0
+
+
+@pytest.mark.parametrize("n_slots,n_requests", [
+    (1, 2),
+    (2, 2),
+])
+def test_multi_requests_parallel(n_slots: int, n_requests: int):
+    global server
+    server.n_slots = n_slots
+    server.start()
+    tasks = []
+    for _ in range(n_requests):
+        tasks.append((server.make_request, ("POST", "/completion", {
+            "prompt": "I believe the meaning of life is",
+            "temperature": 0.0,
+            "top_k": 1,
+        })))
+    results = parallel_function_calls(tasks)
+    for res in results:
+        assert res.status_code == 200
+        assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+================
+File: src/llama-mtp.cpp
+================
+#include "llama-mtp.h"
+
+#include "llama-arch.h"
+#include "llama-model.h"
+
+#include <algorithm>
+#include <limits>
+
+static ggml_context_ptr llama_mtp_init_ctx(size_t n_tensors) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ std::max<size_t>(1, n_tensors) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    return ggml_context_ptr { ggml_init(params) };
+}
+
+static bool llm_arch_supports_native_mtp(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool llama_mtp_backend_seed_state::ready() const {
+    return backend != nullptr &&
+        buft != nullptr &&
+        n_embd > 0 &&
+        generation > 0 &&
+        seed_cache_dev != nullptr &&
+        seed_batch_dev != nullptr &&
+        seed_cache_rows.size() == LLAMA_MAX_SEQ &&
+        seed_batch_rows.size() == LLAMA_MAX_SEQ;
+}
+
+bool llama_mtp_backend_seed_state::matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const {
+    return this->backend == backend && this->buft == buft && this->n_embd == n_embd && ready();
+}
+
+void llama_mtp_backend_seed_state::clear_capture_views() {
+    capture_ctxs.clear();
+}
+
+void llama_mtp_backend_seed_state::clear() {
+    clear_capture_views();
+    seed_cache_rows.clear();
+    seed_batch_rows.clear();
+    seed_cache_dev = nullptr;
+    seed_batch_dev = nullptr;
+    buf.reset();
+    ctx_views.reset();
+    ctx_roots.reset();
+    backend = nullptr;
+    buft = nullptr;
+    n_embd = 0;
+    generation = 0;
+}
+
+void llama_mtp_state::clear() {
+    accepted.clear();
+    draft.clear();
+    seed_epoch = 1;
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
+    clear_backend_capture_views();
+}
+
+void llama_mtp_state::reserve(uint32_t n_embd, uint32_t n_pos_per_embd) {
+    clear();
+
+    this->n_embd = n_embd;
+    this->n_pos_per_embd = n_pos_per_embd;
+
+    if (!enabled()) {
+        seed_embd.clear();
+        clear_backend_seed_storage();
+        return;
+    }
+
+    seed_embd.resize((size_t) n_embd * desc.n_draft);
+    seed_by_seq.resize((size_t) LLAMA_MAX_SEQ * n_embd);
+    seed_epoch_by_seq.assign(LLAMA_MAX_SEQ, 0);
+    accepted.reserve(desc.n_draft);
+    draft.reserve(desc.n_draft);
+
+    ubatch_token.resize(LLAMA_MAX_SEQ);
+    ubatch_pos.resize((size_t) LLAMA_MAX_SEQ * n_pos_per_embd);
+    ubatch_n_seq_id.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_id.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_id_unq.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    ubatch_output.resize(LLAMA_MAX_SEQ);
+    temp_seq_ids.resize(LLAMA_MAX_SEQ);
+    temp_seq_used.resize(LLAMA_MAX_SEQ);
+}
+
+void llama_mtp_state::next_seed_epoch() {
+    if (++seed_epoch == 0) {
+        seed_epoch = 1;
+        std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
+    }
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+}
+
+void llama_mtp_state::set_seed_mode(llama_mtp_seed_mode mode) {
+    seed_mode = mode;
+}
+
+bool llama_mtp_state::ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    if (!enabled() || backend == nullptr || buft == nullptr || n_embd == 0) {
+        return false;
+    }
+
+    if (seed_backend.matches(backend, buft, n_embd)) {
+        return true;
+    }
+
+    seed_backend.clear();
+
+    seed_backend.backend = backend;
+    seed_backend.buft = buft;
+    seed_backend.n_embd = n_embd;
+    seed_backend.generation = backend_seed_generation_next++;
+    if (backend_seed_generation_next == 0) {
+        backend_seed_generation_next = 1;
+    }
+
+    seed_backend.ctx_roots = llama_mtp_init_ctx(2);
+    seed_backend.ctx_views = llama_mtp_init_ctx(2*LLAMA_MAX_SEQ);
+    if (!seed_backend.ctx_roots || !seed_backend.ctx_views) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    if (!seed_backend.seed_cache_dev || !seed_backend.seed_batch_dev) {
+        seed_backend.clear();
+        return false;
+    }
+
+    ggml_set_name(seed_backend.seed_cache_dev, "mtp_seed_cache_dev");
+    ggml_set_name(seed_backend.seed_batch_dev, "mtp_seed_batch_dev");
+
+    seed_backend.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(seed_backend.ctx_roots.get(), buft));
+    if (!seed_backend.buf) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_rows.resize(LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_rows.resize(LLAMA_MAX_SEQ);
+
+    for (int32_t i = 0; i < LLAMA_MAX_SEQ; ++i) {
+        const size_t offset_cache = (size_t) i * seed_backend.seed_cache_dev->nb[1];
+        const size_t offset_batch = (size_t) i * seed_backend.seed_batch_dev->nb[1];
+
+        auto * cache_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_cache_dev, n_embd, offset_cache);
+        auto * batch_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_batch_dev, n_embd, offset_batch);
+        if (!cache_row || !batch_row) {
+            seed_backend.clear();
+            return false;
+        }
+
+        ggml_set_name(cache_row, "mtp_seed_cache_row");
+        ggml_set_name(batch_row, "mtp_seed_batch_row");
+
+        if (ggml_backend_view_init(cache_row) != GGML_STATUS_SUCCESS ||
+            ggml_backend_view_init(batch_row) != GGML_STATUS_SUCCESS) {
+            seed_backend.clear();
+            return false;
+        }
+
+        seed_backend.seed_cache_rows[i] = cache_row;
+        seed_backend.seed_batch_rows[i] = batch_row;
+    }
+
+    return true;
+}
+
+void llama_mtp_state::clear_backend_seed_storage() {
+    seed_backend.clear();
+}
+
+void llama_mtp_state::clear_backend_capture_views() {
+    seed_backend.clear_capture_views();
+}
+
+float * llama_mtp_state::seed_row(llama_seq_id seq_id) {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    return seed_by_seq.data() + (size_t) seq_id * n_embd;
+}
+
+const float * llama_mtp_state::seed_row(llama_seq_id seq_id) const {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    return seed_by_seq.data() + (size_t) seq_id * n_embd;
+}
+
+bool llama_mtp_state::has_seed(llama_seq_id seq_id) const {
+    return 0 <= seq_id && seq_id < LLAMA_MAX_SEQ && !seed_epoch_by_seq.empty() && seed_epoch_by_seq[seq_id] == seed_epoch;
+}
+
+void llama_mtp_state::mark_seed(llama_seq_id seq_id) {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    seed_epoch_by_seq[seq_id] = seed_epoch;
+}
+
+llama_ubatch llama_mtp_state::ubatch_reserve(uint32_t n_seq) {
+    GGML_ASSERT(n_seq <= LLAMA_MAX_SEQ);
+    GGML_ASSERT(n_pos_per_embd > 0);
+
+    std::fill(ubatch_seq_idx.begin(), ubatch_seq_idx.end(), -1);
+
+    return llama_ubatch {
+        /*.b_equal_seqs =*/ true,
+        /*.n_tokens     =*/ n_seq,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ n_seq,
+        /*.n_seqs_unq   =*/ n_seq,
+        /*.n_pos        =*/ n_pos_per_embd,
+        /*.token        =*/ ubatch_token.data(),
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ ubatch_pos.data(),
+        /*.n_seq_id     =*/ ubatch_n_seq_id.data(),
+        /*.seq_id       =*/ ubatch_seq_id.data(),
+        /*.seq_id_unq   =*/ ubatch_seq_id_unq.data(),
+        /*.seq_idx      =*/ ubatch_seq_idx.data(),
+        /*.output       =*/ ubatch_output.data(),
+        /*.data         =*/ nullptr,
+    };
+}
+
+
+llama_mtp_desc llama_mtp_init_desc(const llama_model & model) {
+    llama_mtp_desc res = {
+        /*.supported            =*/ false,
+        /*.n_predict            =*/ model.hparams.nextn_predict_layers,
+        /*.n_draft              =*/ model.hparams.nextn_predict_layers,
+        /*.dedicated_embeddings =*/ false,
+    };
+
+    if (!llm_arch_supports_native_mtp(model.arch) || res.n_predict == 0 || model.layers.empty()) {
+        return res;
+    }
+
+    const uint32_t il_mtp = model.hparams.n_layer - res.n_predict;
+    if (il_mtp >= model.layers.size()) {
+        return res;
+    }
+
+    const auto & layer = model.layers[il_mtp];
+
+    const bool has_nextn_inputs =
+        layer.nextn.eh_proj != nullptr &&
+        layer.nextn.enorm   != nullptr &&
+        layer.nextn.hnorm   != nullptr;
+
+    res.dedicated_embeddings = layer.nextn.embed_tokens != nullptr;
+
+    const bool has_nextn_head =
+        res.dedicated_embeddings ||
+        layer.nextn.shared_head_head != nullptr ||
+        model.output != nullptr;
+
+    res.supported = has_nextn_inputs && has_nextn_head;
+
+    return res;
+}
+
+================
+File: src/llama-mtp.h
+================
+#pragma once
+
+#include "llama-batch.h"
+#include "llama.h"
+
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
+#include <cstdint>
+#include <map>
+#include <vector>
+
+struct llama_model;
+struct ggml_context;
+struct ggml_tensor;
+
+struct llama_mtp_desc {
+    bool     supported            = false;
+    uint32_t n_predict            = 0;
+    uint32_t n_draft              = 0;
+    bool     dedicated_embeddings = false;
+};
+
+enum llama_mtp_seed_mode : uint8_t {
+    LLAMA_MTP_SEED_MODE_NONE    = 0,
+    LLAMA_MTP_SEED_MODE_HOST    = 1,
+    LLAMA_MTP_SEED_MODE_BACKEND = 2,
+};
+
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    uint32_t                   n_embd         = 0;
+    uint64_t                   generation     = 0;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+
+    ggml_context_ptr        ctx_roots;
+    ggml_context_ptr        ctx_views;
+    ggml_backend_buffer_ptr buf;
+
+    std::vector<ggml_tensor *>      seed_cache_rows;
+    std::vector<ggml_tensor *>      seed_batch_rows;
+    std::vector<ggml_context_ptr>   capture_ctxs;
+
+    bool ready() const;
+    bool matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const;
+    void clear();
+    void clear_capture_views();
+};
+
+struct llama_mtp_state {
+    llama_mtp_desc desc;
+    uint32_t       n_embd = 0;
+    uint32_t       n_pos_per_embd = 0;
+
+    std::vector<float>       seed_embd;
+    std::vector<llama_token> accepted;
+    std::vector<llama_token> draft;
+    std::vector<float>       seed_by_seq;
+    std::vector<uint32_t>    seed_epoch_by_seq;
+    uint32_t                 seed_epoch = 1;
+    llama_mtp_seed_mode      seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    uint64_t                 backend_seed_generation_next = 1;
+    llama_mtp_backend_seed_state seed_backend;
+
+    std::vector<llama_token>    ubatch_token;
+    std::vector<llama_pos>      ubatch_pos;
+    std::vector<int32_t>        ubatch_n_seq_id;
+    std::vector<llama_seq_id *> ubatch_seq_id;
+    std::vector<llama_seq_id>   ubatch_seq_id_unq;
+    std::vector<int32_t>        ubatch_seq_idx;
+    std::vector<int8_t>         ubatch_output;
+    std::vector<llama_seq_id>   temp_seq_ids;
+    std::vector<uint8_t>        temp_seq_used;
+
+    void clear();
+    void reserve(uint32_t n_embd, uint32_t n_pos_per_embd);
+    void next_seed_epoch();
+    void set_seed_mode(llama_mtp_seed_mode mode);
+    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+    void clear_backend_seed_storage();
+    void clear_backend_capture_views();
+
+    float * seed_row(llama_seq_id seq_id);
+    const float * seed_row(llama_seq_id seq_id) const;
+    bool has_seed(llama_seq_id seq_id) const;
+    void mark_seed(llama_seq_id seq_id);
+    llama_ubatch ubatch_reserve(uint32_t n_seq);
+
+    bool enabled() const {
+        return desc.supported && desc.n_draft > 0;
+    }
+};
+
+llama_mtp_desc llama_mtp_init_desc(const llama_model & model);
+
+================
+File: docs/development/native-mtp-benchmarks.md
+================
+# Native MTP Benchmarks
+
+Bench date: 2026-04-09
+
+Model:
+
+- `/mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf`
+
+Commit used for the code under test:
+
+- `01de729d4` (`native MTP: document np>1 exactness limits`)
+
+Backend seed transport update on 2026-04-10:
+
+- Branch under test: `feat/native-mtp-backend-seed`
+- Change: native-MTP seed transport can now keep verifier seed rows on the backend for CUDA/non-host paths instead of doing backend -> host -> backend each step
+- Validation status:
+  - exact and measured: CUDA Berlin `np=1/2`, CUDA Moon `np=1/2`
+  - known stress case unchanged: CUDA Rust `np=2` still demonstrates the documented hybrid/recurrent `np>1` exactness limitation
+- rollout/debug aids kept in-tree:
+  - `LLAMA_MTP_BACKEND_SEED_DEBUG=1` mirrors host seed rows and verifies backend cache/batch rows against them after synchronize
+  - `LLAMA_MTP_BACKEND_SEED_FORCE_HOST=1` is only for comparison/debugging; on non-host multi-sequence CUDA it reproduces the older host round-trip behavior and is not the validated fast path
+
+Backend availability on this host:
+
+- Benchmarked: CPU, CUDA
+- Not benchmarked here: Vulkan, HIP, SYCL, Metal
+
+Those other backends were not built or not available on this Linux machine, so the numbers below only cover the backends that were actually runnable in this environment.
+
+## PR-Ready Summary
+
+Native MTP for Qwen 3.5 is now wired end-to-end in llama.cpp: HF to GGUF conversion, model loading, runtime execution in a single verifier context, server integration, tests, and benchmark coverage. The current implementation is validated on the exact `-np 1` path and on some `-np 2` workloads, with measured speedups on both CPU and CUDA for exact cases.
+
+The main known limitation is still the documented hybrid/recurrent `-np > 1` exactness gap. On near-tie tokens, verifier numerics can change with batch shape across multiple live sequences, so native `mtp` can diverge from baseline greedy decode even when rollback and replay logic restore the correct model state after rejected drafts. That limitation is documented rather than hidden behind an incorrect exactness guarantee.
+
+On this host and model, CPU exact cases landed around `1.20x` to `1.53x`, while CUDA exact cases landed around `1.02x` to `1.23x`. The representative stress case remains CUDA Rust `np=2`, which still demonstrates the known exactness limitation and can also be slightly slower than baseline.
+
+With the backend-resident seed transport enabled on CUDA, the exact Berlin and Moon cases remain exact while avoiding the old host round trip. On the validated Berlin `np=2` case, native MTP measured `160.46 / 160.04 tok/s` versus baseline `129.64 / 133.66 tok/s`. On the validated Moon `np=2` case, native MTP measured `139.45 / 139.75 tok/s` versus baseline `130.41 / 133.00 tok/s`.
+
+## Method
+
+Common settings:
+
+- `ctx-size=4096`
+- `batch-size=128`
+- `ubatch-size=128`
+- `draft-max=1`
+- baseline = normal greedy decode
+- mtp = `--spec-type mtp`
+
+Backend-specific settings:
+
+- CPU:
+  - binary: `build-server/bin/llama-server`
+  - `-ngl 0`
+  - `-fa off`
+  - chosen config: `threads=32`, `threads-batch=32`
+- CUDA:
+  - binary: `build-cuda-server/bin/llama-server`
+  - `-ngl all`
+  - `-fa on`
+  - chosen config: `threads=4`, `threads-batch=4`
+
+The chosen per-backend configs came from a small tuning pass on the exact Berlin `np=2` case.
+
+## Tuning Pass
+
+CPU, Berlin, `np=2`, `n_predict=48`:
+
+- `t=8 tb=8`: exact, baseline `6.40 / 6.40 tok/s`, mtp `9.56 / 9.56 tok/s`
+- `t=16 tb=16`: not exact, baseline `8.62 / 8.62 tok/s`, mtp `10.85 / 10.51 tok/s`
+- `t=32 tb=32`: exact, baseline `7.56 / 7.70 tok/s`, mtp `11.41 / 11.41 tok/s`
+
+CUDA, Berlin, `np=2`, `n_predict=48`:
+
+- `t=4 tb=4`: exact, baseline `127.96 / 132.01 tok/s`, mtp `160.56 / 161.00 tok/s`
+- `t=8 tb=8`: exact, baseline `128.09 / 132.20 tok/s`, mtp `130.84 / 136.37 tok/s`
+- `t=12 tb=12`: exact, baseline `131.72 / 131.42 tok/s`, mtp `133.20 / 138.94 tok/s`
+
+## Full Matrix
+
+### CPU
+
+Config:
+
+- `build-server/bin/llama-server`
+- `-ngl 0`
+- `-fa off`
+- `threads=32`
+- `threads-batch=32`
+
+| Case | `-np` | Exact | Baseline tok/s | MTP tok/s | Speedup |
+| --- | ---: | --- | --- | --- | --- |
+| Berlin, seed 42, `n_predict=48` | 1 | yes | `8.08` | `12.40` | `1.53x` |
+| Berlin, seed 42, `n_predict=48` | 2 | yes | `7.77 / 7.77` | `11.22 / 11.22` | `1.44x` mean |
+| Moon, seed 31415, `n_predict=64` | 1 | yes | `7.61` | `10.20` | `1.34x` |
+| Moon, seed 31415, `n_predict=64` | 2 | yes | `7.55 / 7.55` | `9.79 / 9.80` | `1.30x` mean |
+| Rust, seed 777, `n_predict=64` | 1 | yes | `8.28` | `9.96` | `1.20x` |
+| Rust, seed 777, `n_predict=64` | 2 | yes on this run | `7.49 / 7.49` | `9.31 / 9.31` | `1.24x` mean |
+
+Observed CPU range:
+
+- exact cases measured here: `1.20x` to `1.53x`
+
+### CUDA
+
+Config:
+
+- `build-cuda-server/bin/llama-server`
+- `-ngl all`
+- `-fa on`
+- `threads=4`
+- `threads-batch=4`
+
+| Case | `-np` | Exact | Baseline tok/s | MTP tok/s | Speedup |
+| --- | ---: | --- | --- | --- | --- |
+| Berlin, seed 42, `n_predict=48` | 1 | yes | `148.69` | `173.37` | `1.17x` |
+| Berlin, seed 42, `n_predict=48` | 2 | yes | `128.29 / 132.26` | `160.44 / 160.88` | `1.23x` mean |
+| Moon, seed 31415, `n_predict=64` | 1 | yes | `148.65` | `151.79` | `1.02x` |
+| Moon, seed 31415, `n_predict=64` | 2 | yes | `131.10 / 131.32` | `141.07 / 140.74` | `1.07x` mean |
+| Rust, seed 777, `n_predict=64` | 1 | yes | `148.45` | `146.60` | `0.99x` |
+| Rust, seed 777, `n_predict=64` | 2 | no | `128.61 / 131.33` | `127.63 / 127.84` | `0.98x` mean |
+
+Observed CUDA range:
+
+- exact cases measured here: `1.02x` to `1.23x`
+- known stress failure here: Rust, `np=2`
+
+## Takeaways
+
+- CPU showed the largest upside on this host for the selected exact configurations, roughly `+20%` to `+53%`.
+- CUDA improved clearly on the short/medium exact cases, but the gain was smaller, roughly `+2%` to `+23%`.
+- The known hybrid/recurrent `np > 1` exactness limitation is still real on CUDA. The Rust `np=2` case remained a representative failure and was also slightly slower than baseline.
+- On exact workloads, native MTP is already useful on both CPU and CUDA with this model, but the benefit is workload-dependent and should not be treated as a universal speedup.
+
+## Speedup Backlog
+
+The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup and backend-resident seed transport. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
+
+### Completed: Backend-resident MTP seed path
+
+- landed on `feat/native-mtp-backend-seed`
+- result: validated exact CUDA path for Berlin `np=1/2` and Moon `np=1/2` without the backend -> host -> backend seed round trip
+- design that landed:
+  - persistent backend-owned `seed_cache_dev` and `seed_batch_dev`
+  - fixed-offset graph-visible backend view for `build_inp_mtp_seed()`
+  - explicit seed mode and generation-based graph reuse invalidation
+  - conservative fallback that keeps the host path for host-backed and single-sequence cases, while avoiding the old multi-sequence non-host host-round-trip path by default
+
+### Priority 1: Adaptive native-MTP backoff on replay-heavy prompts
+
+- expected gain: large on bad prompts, little or no change on good prompts
+- scope: medium
+- reason: once snapshotting was removed, replay became the dominant bad-case overhead on rejection-heavy prompts like the Rust stress case
+- risk: any adaptive policy has to stay understandable and upstream-friendly; it should not silently trade correctness or make the server behavior hard to reason about
+
+### Priority 2: Replay-path reduction
+
+- expected gain: modest on exact/easy prompts, more meaningful on prompts with lower draft acceptance
+- scope: medium to high
+- reason: replay is now the second largest remaining native-MTP overhead on many CUDA runs
+- examples: cheaper replay batching, less redundant verifier work after rejection, or avoiding replay entirely on cases where the state can be proven equivalent
+
+### Priority 3: Small server hot-path cleanup
+
+- expected gain: low
+- scope: small
+- reason: there are still per-step container/setup costs in the server loop, but the current profile says they are not the main bottleneck anymore
+
+## Raw Logs
+
+Representative logs from the full matrix are under:
+
+- `/tmp/mtp-bench-cpu-*`
+- `/tmp/mtp-bench-cuda-*`
+- summary JSON: `/tmp/mtp-bench-results.json`
+
+
+
+
+================================================================
+End of Codebase
+================================================================
