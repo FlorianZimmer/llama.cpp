@@ -1,0 +1,2889 @@
+================================================================
+Directory Structure
+================================================================
+docs/
+  development/
+    native-mtp-benchmarks.md
+    native-mtp-model-prep.md
+    native-mtp-optimization-plan.md
+repomix/
+  work/
+    00_BROWSER_INSTRUCTIONS.md
+    01_REQUEST.md
+    02_CONTEXT_NOTES.md
+    03_CODE_EXCERPTS.md
+scripts/
+  mtp_quant_overrides/
+    qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt
+    qwen35moe-a3b-q4_k_m-strict.tensor-types.txt
+  audit_mtp_quantization.py
+  validate_mtp_cuda.py
+src/
+  llama-mtp.cpp
+  llama-mtp.h
+
+================================================================
+Files
+================================================================
+
+================
+File: repomix/work/01_REQUEST.md
+================
+USER_GOAL:
+Review the current private native-MTP state in this llama.cpp mirror and produce a concrete next-step optimization plan for getting real net-positive end-to-end speedups on CUDA while staying upstream-friendly and maintainable.
+
+DELIVERABLE_TYPE: PLAN
+
+USER_REQUEST:
+Please review this private-mirror native-MTP implementation and produce a pragmatic optimization plan focused on real end-to-end speedups, not internal timing wins alone.
+
+Important benchmark context from the latest full sweep on 2026-04-10:
+
+- Models tested:
+  - Qwen3.5-9B `UD-Q4_K_XL`
+  - Qwen3.5-9B `q8_0`
+  - Qwen3.5-27B `UD-Q4_K_XL`
+  - Qwen3.5-35B-A3B `Q4_K_M`
+  - Qwen3.5-35B-A3B `Q5_K_M`
+  - Qwen3.5-35B-A3B `UD-Q4_K_XL`
+- Cases tested: `primary`, `good`, `bad`
+- Parallel counts tested: `np=1`, `np=2`
+- Repeats: `3`
+- Current result:
+  - no checked model or quant is net-positive on `np=1`
+  - Qwen3.5-9B `q8_0` is still the only speed-positive path, but only on the easier `np=2` cases
+  - Qwen3.5-9B `UD-Q4_K_XL` is slower everywhere
+  - Qwen3.5-27B is speed-negative everywhere
+  - Qwen3.5-35B-A3B is speed-negative everywhere
+  - Qwen3.5-35B-A3B `Q4_K_M` is now `np=1` exact again after the landed post-replay guard fix
+
+Representative exact `np=1` results:
+
+- 9B `UD-Q4_K_XL`: `175.91 -> 159.01 tok/s` (`0.904x`)
+- 9B `q8_0`: `150.53 -> 150.31 tok/s` (`0.999x`)
+- 27B `UD-Q4_K_XL`: `72.35 -> 62.27 tok/s` (`0.861x`)
+- 35B-A3B `Q4_K_M`: `228.26 -> 170.72 tok/s` (`0.748x`)
+- 35B-A3B `Q5_K_M`: `221.34 -> 167.90 tok/s` (`0.759x`)
+- 35B-A3B `UD-Q4_K_XL`: `202.80 -> 129.34 tok/s` (`0.638x`)
+
+Representative speed-positive `np=2` results:
+
+- 9B `q8_0`, `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+- 9B `q8_0`, `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+
+Representative profile summaries from the new per-step instrumentation:
+
+- 9B `UD-Q4_K_XL`, `primary np=1`:
+  - acceptance `12/15 (0.800)`
+  - `draft ~= 21.2 ms`
+  - `accept ~= 75.5 ms`
+  - `replay ~= 30.8 ms`
+- 9B `q8_0`, `primary np=1`:
+  - acceptance `12/15 (0.800)`
+  - `draft ~= 23.6 ms`
+  - `accept ~= 99.6 ms`
+  - `replay ~= 8.6 ms`
+- 27B `UD-Q4_K_XL`, `bad np=2`:
+  - acceptance `140/184 (0.761)`
+  - `draft ~= 127.7 ms`
+  - `accept ~= 958.1 ms`
+  - `replay ~= 395.1 ms`
+
+Important quantization-side follow-up found after the sweep:
+
+- the `Qwen3.5-35B-A3B Q4_K_M` `bad np=1` exactness failure was not just a generic runtime bug, but it also was not explained by quantization alone
+- all A3B MTP GGUFs preserve the same MTP metadata and tensor set
+- the only differing MTP tensor across the tested A3B quants is:
+  - `blk.40.nextn.eh_proj.weight`
+- that tensor is:
+  - `Q4_K` in the failing `Q4_K_M` GGUF
+  - `Q5_K` in the passing `Q5_K_M` GGUF
+  - `Q8_0` in the passing `UD-Q4_K_XL` GGUF
+- BF16-vs-quant audit on that tensor showed:
+  - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
+  - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
+  - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.9999`
+- checked-in balanced recommendation for that tensor is `Q5_K`
+- checked-in strict recommendation for that tensor is `Q8_0`
+- the balanced `Q4_K_M` rebuild is now the canonical GGUF on disk
+- the remaining exactness issue was isolated to the first speculative step after replay on the hybrid/recurrent path
+- the current branch now fixes that conservatively by forcing one plain verifier step immediately after replay on hybrid/recurrent native-MTP slots
+
+Please:
+1. Identify the most likely remaining bottlenecks in the current implementation.
+2. Propose upstream-friendly optimization steps in priority order.
+3. Keep the plan benchmark-gated after each step against:
+   - greedy baseline
+   - the immediately previous native-MTP step
+4. Explicitly call out which ideas are likely not worth doing yet.
+5. Distinguish:
+   - dense-model generic work that could improve 9B and 27B
+   - work that may help MoE correctness or stability but is unlikely to rescue speed
+   - work that is runtime-side versus work that is really quantization-side
+6. Use the provided local file excerpts and docs as the source of truth for this private branch.
+7. If you need public upstream context, fetch it surgically from public `ggml-org/llama.cpp` only for exact files or symbols that matter. Do not broaden into a full-repo read.
+
+CONSTRAINTS:
+- Prefer small-to-medium scoped steps over large speculative rewrites.
+- Preserve the current validated correctness contract:
+  - `np=1` exactness matters
+  - `np>1` on hybrid/recurrent native-MTP is stability-focused, not strict batch-invariant exactness
+- Focus on runtime/server/graph overhead before suggesting deeper kernel or scheduler redesign.
+- Stay close to something that could plausibly be upstreamed in pieces.
+
+================
+File: repomix/work/02_CONTEXT_NOTES.md
+================
+CONTEXT_NOTES:
+
+Branch and diff base:
+
+- Current branch: `feat/native-mtp-upstream-prep`
+- Public-upstream diff base used for comparison: `d6f3030047f85a98b009189e76f441fe818ea44d`
+- Relative to `upstream/master`, this private branch currently changes `32` files with about `3651` insertions and `68` deletions.
+
+What this private mirror has that public upstream master may not:
+
+- HF -> GGUF conversion support for Qwen 3.5 native MTP / NextN tensors
+- GGUF metadata and loader plumbing for `nextn_predict_layers`
+- public native-MTP APIs in `include/llama.h`
+- `llama_mtp` runtime state and draft path in `src/llama-mtp.*` and `src/llama-context.cpp`
+- Qwen 3.5 dense and Qwen 3.5 MoE native-MTP graph builders
+- server integration for `--spec-type mtp`
+- benchmark harness `scripts/validate_mtp_cuda.py`
+- docs for model prep, benchmarking, and optimization planning
+
+Key local files to treat as most relevant:
+
+- `include/llama.h`
+- `src/llama-mtp.h`
+- `src/llama-mtp.cpp`
+- `src/llama-context.h`
+- `src/llama-context.cpp`
+- `src/llama-graph.h`
+- `src/llama-graph.cpp`
+- `src/models/qwen35.cpp`
+- `src/models/qwen35moe.cpp`
+- `tools/server/server-context.cpp`
+- `scripts/validate_mtp_cuda.py`
+- `docs/development/native-mtp-benchmarks.md`
+- `docs/development/native-mtp-optimization-plan.md`
+- `docs/development/native-mtp-model-prep.md`
+
+Current runtime facts:
+
+- Current native runtime only drafts `1` continuation token per step even if metadata reports more predictor layers.
+- `np=1` is the correctness-clean contract.
+- `np>1` on the current hybrid/recurrent path is stability-only.
+- The backend-resident seed path already exists; reopening seed transport as a standalone project is probably low value unless new evidence says otherwise.
+
+Latest full benchmark sweep summary:
+
+- The current 3-repeat matrix includes the landed hybrid/recurrent post-replay guard fix.
+- No checked model or quant is net-positive on `np=1`.
+- Only `Qwen3.5-9B q8_0` showed repeatable net-positive speedups, and only on the easier `np=2` cases.
+- `Qwen3.5-9B UD-Q4_K_XL` remained slower everywhere despite decent short-case acceptance.
+- `Qwen3.5-27B UD-Q4_K_XL` was slower everywhere.
+- `Qwen3.5-35B-A3B` was slower on every checked quant.
+- Current branch state after the replay fix:
+  - `Qwen3.5-35B-A3B Q4_K_M` is `np=1` exact again on the checked `primary`, `good`, and `bad` CUDA cases
+  - it is still substantially slower than baseline, so the correctness fix did not make it speed-positive
+
+Quantization-side and replay-side follow-up after the sweep:
+
+- The A3B `Q4_K_M` `bad np=1` exactness failure is not a generic native-MTP runtime failure, but it is also no longer explainable by quantization alone.
+- A direct BF16-vs-quant audit was added in `scripts/audit_mtp_quantization.py`.
+- On the current A3B GGUFs:
+  - all MTP norm tensors already remain `F32`
+  - the only quantized MTP tensor is `blk.40.nextn.eh_proj.weight`
+  - `Q4_K_M` stores it as `Q4_K`
+  - `Q5_K_M` stores it as `Q5_K`
+  - `UD-Q4_K_XL` stores it as `Q8_0`
+- Measured against the BF16 GGUF:
+  - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
+  - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
+  - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.9999`
+- Checked-in override files now exist for the A3B `Q4_K_M` recipe:
+  - balanced: promote only `blk.40.nextn.eh_proj.weight` to `Q5_K`
+  - strict: promote it to `Q8_0`
+- The balanced A3B `Q4_K_M` rebuild has now been performed and promoted to the canonical GGUF filename on disk.
+- The previous pre-balanced file was then removed to recover `/mnt/models` space.
+- Important runtime-facing caveat after rebuilding:
+  - the balanced A3B `Q4_K_M` GGUF still failed the narrow `bad np=1` exactness validation
+  - so this quantization fix was necessary but not sufficient for that case
+- Replay isolation after rebuilding narrowed the remaining issue further:
+  - disabling the greedy accept fast path still did not fix the divergence
+  - the model is taking the hybrid recurrent-backup restore path, not `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`
+  - the first replayed verifier logits after restore were still correct:
+    - replayed token `271` at `pos=10`
+    - top-1 next token `248068` with probability `~0.91`
+    - that matches the greedy baseline continuation at that point
+  - the divergence starts on the first speculative step after replay, not on the replayed next-token state itself
+  - a one-step debug cooldown after replay restored exactness on both:
+    - the short traced repro
+    - the full `bad np=1` CUDA validation case
+- Current best local reading for A3B `Q4_K_M`:
+  - quant quality was part of the problem
+  - the remaining correctness gap was in the first speculative verifier batch after replay on the hybrid/MoE path
+- Fix now landed locally:
+  - hybrid/recurrent native-MTP slots always force one plain verifier step immediately after replay
+  - this restored `np=1` exactness on the checked A3B `Q4_K_M` cases
+  - 9B and 27B dense references stayed exact on the same spot-check matrix
+  - A3B `np=2` stayed stability-clean in a smoke run
+- `Qwen3.5-27B-MTP-UD-Q4_K_XL` already stores its `blk.64.nextn.eh_proj.weight` as `Q8_0`, so there is no obvious MTP-head under-quantization issue there.
+- `Qwen3.5-9B` no longer had a BF16 GGUF on disk, so only a surrogate audit against the shipped `q8_0` GGUF was possible.
+- That surrogate audit still showed the key operational fact:
+  - both shipped 9B quants already keep the MTP head at `Q8_0`
+  - so there was no balanced MTP-head update to apply on 9B
+
+Representative results:
+
+- 9B `UD-Q4_K_XL`, `primary np=1`: `175.91 -> 159.01 tok/s` (`0.904x`)
+- 9B `q8_0`, `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
+- 9B `q8_0`, `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+- 27B `UD-Q4_K_XL`, `primary np=1`: `72.35 -> 62.27 tok/s` (`0.861x`)
+- 35B-A3B `Q4_K_M`, `primary np=1`: `228.26 -> 170.72 tok/s` (`0.748x`)
+
+Representative profile readings from new per-step instrumentation:
+
+- 9B `UD-Q4_K_XL`, `primary np=1`:
+  - acceptance `12/15 (0.800)`
+  - `draft 21.212 ms`
+  - `accept 75.516 ms`
+  - `replay 30.801 ms`
+  - mean step total `8503.1 us`
+- 9B `q8_0`, `primary np=1`:
+  - acceptance `12/15 (0.800)`
+  - `draft 23.585 ms`
+  - `accept 99.580 ms`
+  - `replay 8.597 ms`
+  - mean step total `8785.1 us`
+- 27B `UD-Q4_K_XL`, `bad np=2`:
+  - acceptance `140/184 (0.761)`
+  - `draft 127.729 ms`
+  - `accept 958.105 ms`
+  - `replay 395.062 ms`
+  - mean step total `7962.4 us`
+
+Interpretation we already believe locally:
+
+- the remaining blocker is runtime economics, not merely model support
+- accept cost is still the recurring hot-path tax
+- replay remains a major bad-prompt cliff, especially on 27B
+- 9B `q8_0` proves the approach can win on easier `np=2` cases, but the margin is narrow and the `np=1` win has disappeared in the 3-repeat median
+- MoE support is currently more of a functionality milestone than a speed milestone
+
+Recent local-only additions on top of the earlier private native-MTP work:
+
+- `tools/server/server-context.cpp` now emits per-step lines:
+  - `native MTP step: step=... drafted=... accepted=... replay=... draft=... us snapshot=... us accept=... us restore=... us replay_us=... total=... us`
+- `scripts/validate_mtp_cuda.py` now parses:
+  - aggregate `native MTP profile: ...`
+  - per-step `native MTP step: ...`
+  - step-level acceptance and timing summaries into JSON
+- docs were updated to include the full 2026-04-10 multi-model matrix and the new optimization reading
+
+What to optimize for:
+
+- real end-to-end tok/s, not isolated micro-timing wins
+- small benchmark-gated steps
+- maintainable changes that could be upstreamed incrementally
+- generic dense-path improvements before model-specific tricks
+
+What is probably not worth prioritizing:
+
+- another large seed-transport project
+- recursive multi-token native drafting before the single-token path is broadly speed-positive
+- large model-specific fused-kernel work before server/runtime control-path costs are better understood
+- MoE-specific speed tuning as the main line of work right now
+
+What should not be misattributed:
+
+- do not treat the A3B `Q4_K_M` exactness failure as proof that the runtime rollback/accept path is generically wrong
+- do not treat it as “just a broken GGUF” either
+- the current evidence is:
+  - quant quality needed to be fixed first
+  - restore+replay can rebuild the correct immediate next-token state
+  - the first speculative step after replay was the remaining correctness fault line
+  - the current branch addresses that with a conservative post-replay plain-step guard on hybrid/recurrent slots
+
+================
+File: repomix/work/00_BROWSER_INSTRUCTIONS.md
+================
+# Repository Bridge Instructions (Read First)
+
+You are an AI assistant running in a browser. You received a Repomix-packed context file for a repository.
+
+## Mission
+1) Read **DELIVERABLE_TYPE** + **USER_REQUEST** (included below).
+2) Use the provided repository context to produce exactly **one** deliverable the user can paste back into Codex CLI.
+3) Stay implementation-oriented. Prefer minimal, high-signal changes.
+
+## Inputs you will find in this pack
+- `repomix/work/01_REQUEST.md`
+  - `DELIVERABLE_TYPE`: one of PLAN | REVIEW | RESULT | BRAINSTORM
+  - `USER_REQUEST`: verbatim user text
+  - optional constraints (time, stack, risk tolerance, etc.)
+- Repo context: selected source files and configs
+- Optional `repomix/work/02_CONTEXT_NOTES.md` (short excerpts only)
+
+## Hard rules
+- Produce **exactly one** final deliverable section: `DELIVERABLE_FOR_CODEX_CLI`.
+- Do not output multiple alternative deliverables.
+- Do not include filler, long summaries, or generic explanations.
+- When referencing code, always include **file paths** and (if possible) **symbols** (functions/classes).
+- If something is missing from context, state the smallest assumption needed and continue.
+
+---
+
+## Required output format (always the same skeleton)
+
+### 1) Understanding
+- 2–4 bullets restating the request in your own words
+- Assumptions (only if necessary)
+- Success criteria (how we know it’s done)
+
+### 2) Repo Map (relevant only)
+- 5–15 bullets: the most relevant files/dirs and why
+
+### 3) Key Findings
+- Concrete observations with file paths and symbols
+- Call out constraints, conflicts, sharp edges
+
+### 4) Approach (brief)
+- Recommended approach + tradeoffs (short)
+- If DELIVERABLE_TYPE=REVIEW, focus on critique + improvements
+- If DELIVERABLE_TYPE=BRAINSTORM, focus on options + decision points
+
+### 5) DELIVERABLE_FOR_CODEX_CLI (THIS MUST BE LAST)
+Produce content depending on `DELIVERABLE_TYPE`:
+
+#### If DELIVERABLE_TYPE = PLAN
+Provide:
+- Steps (numbered, granular)
+- Files to edit/create (exact paths)
+- Change summary per file (what to add/remove)
+- Commands to run (tests/build/lint/run)
+- Validation checklist
+- Risks / gotchas (brief)
+
+#### If DELIVERABLE_TYPE = REVIEW
+Provide:
+- Overall assessment (1–3 bullets)
+- Priority-ordered issues (P0/P1/P2) with file paths/symbols
+- Concrete recommendations (what to change, where)
+- Optional: a minimal “next plan” (<= 8 steps)
+- Validation / regression risks
+
+#### If DELIVERABLE_TYPE = RESULT
+Provide:
+- The final artifact(s) that Codex should apply (e.g., patch-like edits, file contents, or exact snippets)
+- For each file: path + “insert/replace” instructions (unambiguous)
+- Commands to run
+- Validation checklist
+
+#### If DELIVERABLE_TYPE = BRAINSTORM
+Provide:
+- 2–4 viable options (with tradeoffs)
+- A recommended option + why
+- A short “decision checklist” (what to decide / confirm)
+- A minimal next step plan (<= 6 steps)
+
+End after `DELIVERABLE_FOR_CODEX_CLI`. No extra text.
+
+================
+File: repomix/work/03_CODE_EXCERPTS.md
+================
+# Code Excerpts
+
+These are short excerpts of local changes that do not exist in public upstream master at the stated merge-base. They are meant to orient the browser model before it reads the included source files.
+
+## 1. Public API surface for native MTP and greedy output-token handling
+
+File: `include/llama.h`
+
+```cpp
+// model capability / metadata
+LLAMA_API bool llama_model_has_native_mtp(const struct llama_model * model);
+LLAMA_API uint32_t llama_model_n_native_mtp_predict(const struct llama_model * model);
+
+// native draft entrypoints
+LLAMA_API int32_t llama_native_mtp_draft_batch(...);
+LLAMA_API int32_t llama_native_mtp_draft(...);
+
+// output-transfer controls used by the server fast path
+LLAMA_API void llama_set_output_tokens(struct llama_context * ctx, bool output_tokens);
+LLAMA_API void llama_set_output_logits(struct llama_context * ctx, bool output_logits);
+LLAMA_API llama_token llama_get_output_token_ith(struct llama_context * ctx, int32_t i);
+
+// hybrid/recurrent memory helpers used for rollback / replay
+LLAMA_API bool llama_memory_seq_rm_attn(...);
+LLAMA_API bool llama_memory_seq_rm_recr(...);
+LLAMA_API bool llama_memory_seq_cp_recr(...);
+```
+
+Why it matters:
+
+- the current server fast path depends on direct greedy verifier-token access and optional logits suppression
+- rollback / replay for the hybrid-recurrent native-MTP path relies on the split memory helpers
+
+## 2. New runtime state for backend-resident seed capture
+
+File: `src/llama-mtp.h`
+
+```cpp
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    uint32_t                   n_embd         = 0;
+    uint64_t                   generation     = 0;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+    ...
+};
+
+struct llama_mtp_state {
+    llama_mtp_desc desc;
+    ...
+    llama_mtp_seed_mode         seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    uint64_t                    backend_seed_generation_next = 1;
+    llama_mtp_backend_seed_state seed_backend;
+    ...
+    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+};
+```
+
+Why it matters:
+
+- the branch already removed a full backend -> host -> backend seed round-trip
+- future work should generally build on this path instead of reopening seed transport from scratch
+
+## 3. Backend capture path in decode
+
+File: `src/llama-context.cpp`
+
+```cpp
+static bool mtp_capture_seed_rows_backend(
+        ggml_tensor * tensor,
+        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+        llama_mtp_state & dst,
+        ggml_backend_sched_t sched,
+        size_t row_size) {
+    ...
+    if (!dst.ensure_backend_seed_storage(backend, buft)) {
+        return false;
+    }
+    ...
+    for (const auto & [seq_id, src_row] : src_rows) {
+        ggml_backend_tensor_copy_async(backend, backend, src_row, dst.seed_backend.seed_cache_rows[seq_id]);
+        dst.mark_seed(seq_id);
+    }
+    ...
+}
+```
+
+Why it matters:
+
+- this is part of the already-landed structural cleanup
+- it improved architecture cleanliness but did not by itself make the broad CUDA speedups appear
+
+## 4. Qwen 3.5 dense and MoE builders are wired for native MTP
+
+Files:
+
+- `src/models/qwen35.cpp`
+- `src/models/qwen35moe.cpp`
+
+Relevant shape of the implementation:
+
+```cpp
+// Qwen3Next uses a single Q projection that outputs query + gate
+ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+...
+ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, ...);
+gate = ggml_cont_2d(ctx0, gate, ...);
+...
+cur = build_attn(inp, ..., Qcur, Kcur, Vcur, ..., kq_scale, il);
+...
+cur = ggml_mul(ctx0, cur, gate_sigmoid);
+```
+
+Why it matters:
+
+- this private branch already has working model-side graph support for both dense `qwen35` and MoE `qwen35moe`
+- the main remaining problem is not “support the model family” but “make the runtime economics work”
+
+## 5. Server accept / rollback / replay hot path with new per-step profiling
+
+File: `tools/server/server-context.cpp`
+
+```cpp
+bool use_output_tokens = false;
+bool disable_output_logits = true;
+...
+if (!server_native_mtp_can_use_output_fast_path(it_slot->smpl.get(), it_slot->uses_native_mtp()) ||
+    std::find(it_slot->i_batch_dft.begin(), it_slot->i_batch_dft.end(), batch_idx) == it_slot->i_batch_dft.end()) {
+    disable_output_logits = false;
+    continue;
+}
+use_output_tokens = true;
+...
+llama_set_output_tokens(ctx, use_output_tokens);
+llama_set_output_logits(ctx, !disable_output_logits);
+
+const int ret = llama_decode(ctx, batch_view);
+...
+if (slot.uses_native_mtp()) {
+    result.step = ++slot.native_mtp_step;
+    result.t_accept_us = ggml_time_us() - t_accept_start;
+    slot.native_mtp_profile.n_accept += 1;
+    slot.native_mtp_profile.t_accept_us += result.t_accept_us;
+}
+...
+const bool restore_ok =
+    (!has_partial_state || llama_memory_seq_rm_attn(llama_get_memory(ctx), slot.id, spec_result.n_prompt_base, -1)) &&
+    (use_recurrent_backup
+        ? llama_memory_seq_cp_recr(llama_get_memory(ctx), slot.native_mtp_backup_id, slot.id, -1, -1)
+        : slot.restore_native_mtp_state());
+...
+const bool replay_ok = replay_native_mtp_prefix_batch(native_replay_slots);
+...
+if (slot.uses_native_mtp_post_replay_guard()) {
+    slot.native_mtp_skip_next_draft = std::max(slot.native_mtp_skip_next_draft, 1);
+}
+...
+if (slot.uses_native_mtp_post_replay_guard() && slot.native_mtp_skip_next_draft > 0) {
+    slot.native_mtp_skip_next_draft -= 1;
+    n_draft_max = 0;
+}
+...
+SLT_INF(slot,
+        "native MTP step:"
+        " step=%d"
+        " drafted=%zu"
+        " accepted=%zu"
+        " replay=%d"
+        " draft=%" PRId64 " us"
+        " snapshot=%" PRId64 " us"
+        " accept=%" PRId64 " us"
+        " restore=%" PRId64 " us"
+        " replay_us=%" PRId64
+        " total=%" PRId64 " us\n",
+        ...);
+```
+
+Why it matters:
+
+- this is where the current control-path economics are most visible
+- the branch already has a direct greedy accept fast path plus optional logits suppression, but accept and replay still dominate on many cases
+- the current branch now also carries a conservative correctness guard for hybrid/recurrent replay: force one plain verifier step immediately after replay
+
+## 6. Graph input support for native-MTP seed transport
+
+File: `src/llama-graph.h`
+
+```cpp
+class llm_graph_input_mtp_seed : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_seed(
+            uint32_t n_embd,
+            uint32_t n_mtp,
+            llama_mtp_seed_mode mode,
+            const float * seed,
+            ggml_tensor * seed_backend,
+            uint64_t seed_generation);
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * t_seed = nullptr; // F32 [n_embd, n_mtp]
+    ...
+};
+```
+
+Why it matters:
+
+- graph reuse and input reuse for the MTP seed path are already explicit concerns in this branch
+- if the next plan proposes graph-level work, it should account for the existing seed-input abstraction rather than treating the graph layer as unchanged upstream code
+
+## 7. Harness support for step-level acceptance and timing summaries
+
+File: `scripts/validate_mtp_cuda.py`
+
+```python
+STEP_RE = re.compile(
+    r"native MTP step:"
+    r" step=(?P<step>\\d+)"
+    r" drafted=(?P<drafted>\\d+)"
+    r" accepted=(?P<accepted>\\d+)"
+    r" replay=(?P<replay>[01])"
+    r" draft=(?P<draft_us>\\d+)\\s+us"
+    r" snapshot=(?P<snapshot_us>\\d+)\\s+us"
+    r" accept=(?P<accept_us>\\d+)\\s+us"
+    r" restore=(?P<restore_us>\\d+)\\s+us"
+    r" replay_us=(?P<replay_us>\\d+)"
+    r" total=(?P<total_us>\\d+)\\s+us"
+)
+```
+
+Why it matters:
+
+- the benchmark harness can now report both aggregate phase totals and per-step acceptance/runtime summaries
+- the next optimization plan should assume this level of measurement exists and use it as the gate
+
+## 8. New MTP quant audit and checked-in override files
+
+Files:
+
+- `scripts/audit_mtp_quantization.py`
+- `scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt`
+- `scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt`
+
+Relevant behavior:
+
+```text
+reference: /mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-bf16-fixed.gguf
+
+blk.40.nextn.eh_proj.weight
+  q4  Q4_K  rel_rmse ~= 0.0759  cosine ~= 0.9971
+  q5  Q5_K  rel_rmse ~= 0.0417  cosine ~= 0.9991
+  q8  Q8_0  rel_rmse ~= 0.0086  cosine ~= 0.9999
+  balanced -> q5:Q5_K
+  strict   -> q8:Q8_0
+```
+
+Checked-in balanced override:
+
+```text
+^blk\.40\.nextn\.eh_proj\.weight$=Q5_K
+```
+
+Why it matters:
+
+- the external review should not waste time blaming the A3B `Q4_K_M` exactness failure on the runtime alone
+- there is now a concrete quantization-side explanation and a small checked-in remedy
+- but the current balanced remedy is not a full fix:
+  - the rebuilt balanced A3B `Q4_K_M` GGUF still fails the narrow `bad np=1` exactness check
+  - so the external review should treat this as a partially-reduced quantization problem, not a fully-closed issue
+
+================
+File: scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt
+================
+^blk\.40\.nextn\.eh_proj\.weight$=Q5_K
+
+================
+File: scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt
+================
+^blk\.40\.nextn\.eh_proj\.weight$=Q8_0
+
+================
+File: scripts/audit_mtp_quantization.py
+================
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+try:
+    import numpy as np
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "numpy is required; run this with ./.venv-tests/bin/python or an environment that has numpy installed"
+    ) from exc
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "gguf-py"))
+
+import gguf
+from gguf.constants import GGMLQuantizationType
+from gguf.gguf_reader import GGUFReader
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    name: str
+    rel_rmse_max: float
+    cosine_min: float
+
+
+@dataclass
+class TensorCandidateMetrics:
+    label: str
+    path: str
+    tensor_name: str
+    type_name: str
+    n_bytes: int
+    mae: float
+    rmse: float
+    rel_rmse: float
+    max_abs: float
+    cosine: float
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Audit native-MTP GGUF tensor quality against a BF16/F16/F32 reference and emit tensor override recommendations."
+    )
+    parser.add_argument("--reference", required=True, help="Reference GGUF path, ideally BF16/F16/F32.")
+    parser.add_argument(
+        "--candidate",
+        dest="candidates",
+        action="append",
+        required=True,
+        help="Candidate in label=path form. May be specified multiple times.",
+    )
+    parser.add_argument(
+        "--baseline",
+        help="Candidate label to treat as the base quant when writing override files.",
+    )
+    parser.add_argument(
+        "--match-regex",
+        default=r"\.nextn\.",
+        help="Regex used to select MTP tensors from the reference GGUF.",
+    )
+    parser.add_argument(
+        "--balanced-rel-rmse",
+        type=float,
+        default=0.05,
+        help="Balanced recommendation threshold for relative RMSE.",
+    )
+    parser.add_argument(
+        "--balanced-cosine",
+        type=float,
+        default=0.999,
+        help="Balanced recommendation threshold for cosine similarity.",
+    )
+    parser.add_argument(
+        "--strict-rel-rmse",
+        type=float,
+        default=0.02,
+        help="Strict recommendation threshold for relative RMSE.",
+    )
+    parser.add_argument(
+        "--strict-cosine",
+        type=float,
+        default=0.9999,
+        help="Strict recommendation threshold for cosine similarity.",
+    )
+    parser.add_argument("--write-json", help="Write the full audit report to this JSON file.")
+    parser.add_argument(
+        "--write-balanced-type-file",
+        help="Write a llama-quantize --tensor-type-file for the balanced recommendation.",
+    )
+    parser.add_argument(
+        "--write-strict-type-file",
+        help="Write a llama-quantize --tensor-type-file for the strict recommendation.",
+    )
+    return parser.parse_args()
+
+
+def parse_candidate(spec: str) -> tuple[str, Path]:
+    label, sep, raw_path = spec.partition("=")
+    if sep == "" or not label or not raw_path:
+        raise SystemExit(f"invalid --candidate value {spec!r}; expected label=path")
+    return label, Path(raw_path)
+
+
+def qtype_name(value: int) -> str:
+    try:
+        return GGMLQuantizationType(value).name
+    except ValueError:
+        return str(value)
+
+
+def load_tensor_map(path: Path, name_re: re.Pattern[str]) -> tuple[GGUFReader, dict[str, object]]:
+    reader = GGUFReader(str(path))
+    tensors = {tensor.name: tensor for tensor in reader.tensors if name_re.search(tensor.name)}
+    return reader, tensors
+
+
+def dequantize_tensor(tensor: object) -> np.ndarray:
+    qtype = GGMLQuantizationType(int(tensor.tensor_type))
+    return gguf.dequantize(tensor.data, qtype).astype(np.float32, copy=False)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a_flat = a.reshape(-1)
+    b_flat = b.reshape(-1)
+    denom = float(np.linalg.norm(a_flat) * np.linalg.norm(b_flat))
+    if denom == 0.0:
+        return 1.0 if float(np.linalg.norm(a_flat - b_flat)) == 0.0 else 0.0
+    return float(np.dot(a_flat, b_flat) / denom)
+
+
+def compute_metrics(
+    label: str,
+    path: Path,
+    tensor_name: str,
+    tensor: object,
+    reference_arr: np.ndarray,
+) -> TensorCandidateMetrics:
+    arr = dequantize_tensor(tensor)
+    if arr.shape != reference_arr.shape:
+        raise SystemExit(
+            f"shape mismatch for {tensor_name}: reference {reference_arr.shape} vs {label} {arr.shape}"
+        )
+    diff = arr - reference_arr
+    rmse = float(math.sqrt(float(np.mean(diff * diff))))
+    ref_rms = float(math.sqrt(float(np.mean(reference_arr * reference_arr))))
+    rel_rmse = 0.0 if ref_rms == 0.0 else rmse / ref_rms
+    return TensorCandidateMetrics(
+        label=label,
+        path=str(path),
+        tensor_name=tensor_name,
+        type_name=qtype_name(int(tensor.tensor_type)),
+        n_bytes=int(tensor.n_bytes),
+        mae=float(np.mean(np.abs(diff))),
+        rmse=rmse,
+        rel_rmse=rel_rmse,
+        max_abs=float(np.max(np.abs(diff))),
+        cosine=cosine_similarity(arr, reference_arr),
+    )
+
+
+def passes_thresholds(metrics: TensorCandidateMetrics, thresholds: Thresholds) -> bool:
+    return metrics.rel_rmse <= thresholds.rel_rmse_max and metrics.cosine >= thresholds.cosine_min
+
+
+def pick_recommendation(
+    metrics_by_tensor: dict[str, list[TensorCandidateMetrics]],
+    thresholds: Thresholds,
+) -> tuple[dict[str, TensorCandidateMetrics], list[str]]:
+    picks: dict[str, TensorCandidateMetrics] = {}
+    warnings: list[str] = []
+    for tensor_name, candidates in metrics_by_tensor.items():
+        passing = [candidate for candidate in candidates if passes_thresholds(candidate, thresholds)]
+        if passing:
+            choice = min(passing, key=lambda item: (item.n_bytes, item.rel_rmse, -item.cosine))
+            picks[tensor_name] = choice
+            continue
+        choice = min(candidates, key=lambda item: (item.rel_rmse, -item.cosine, item.n_bytes))
+        picks[tensor_name] = choice
+        warnings.append(
+            f"{thresholds.name}: no candidate met thresholds for {tensor_name}; using best available {choice.label}:{choice.type_name}"
+        )
+    return picks, warnings
+
+
+def write_type_file(
+    output_path: Path,
+    baseline_label: str,
+    metrics_by_tensor: dict[str, list[TensorCandidateMetrics]],
+    recommendation: dict[str, TensorCandidateMetrics],
+) -> None:
+    baseline_by_tensor = {
+        tensor_name: next(candidate for candidate in candidates if candidate.label == baseline_label)
+        for tensor_name, candidates in metrics_by_tensor.items()
+    }
+    lines: list[str] = []
+    for tensor_name in sorted(recommendation):
+        baseline = baseline_by_tensor[tensor_name]
+        picked = recommendation[tensor_name]
+        if baseline.type_name == picked.type_name:
+            continue
+        lines.append(f"^{re.escape(tensor_name)}$={picked.type_name}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def print_report(
+    reference_path: Path,
+    metrics_by_tensor: dict[str, list[TensorCandidateMetrics]],
+    balanced: dict[str, TensorCandidateMetrics],
+    strict: dict[str, TensorCandidateMetrics],
+    warnings: list[str],
+) -> None:
+    print(f"reference: {reference_path}")
+    print(f"mtp_tensors: {len(metrics_by_tensor)}")
+    for tensor_name in sorted(metrics_by_tensor):
+        print(f"\n{tensor_name}")
+        print("  candidate         type    bytes      rel_rmse   cosine      mae         max_abs")
+        for item in sorted(metrics_by_tensor[tensor_name], key=lambda metric: (metric.n_bytes, metric.label)):
+            print(
+                f"  {item.label:<16} {item.type_name:<7} {item.n_bytes:>9} "
+                f"{item.rel_rmse:>10.6f} {item.cosine:>10.6f} {item.mae:>11.8f} {item.max_abs:>11.8f}"
+            )
+        print(f"  balanced -> {balanced[tensor_name].label}:{balanced[tensor_name].type_name}")
+        print(f"  strict   -> {strict[tensor_name].label}:{strict[tensor_name].type_name}")
+    if warnings:
+        print("\nwarnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+
+def main() -> None:
+    args = parse_args()
+    thresholds_balanced = Thresholds(
+        name="balanced",
+        rel_rmse_max=args.balanced_rel_rmse,
+        cosine_min=args.balanced_cosine,
+    )
+    thresholds_strict = Thresholds(
+        name="strict",
+        rel_rmse_max=args.strict_rel_rmse,
+        cosine_min=args.strict_cosine,
+    )
+
+    candidate_specs = [parse_candidate(spec) for spec in args.candidates]
+    candidate_labels = [label for label, _ in candidate_specs]
+    if len(candidate_labels) != len(set(candidate_labels)):
+        raise SystemExit("candidate labels must be unique")
+    if args.baseline and args.baseline not in set(candidate_labels):
+        raise SystemExit(f"baseline label {args.baseline!r} is not present in --candidate")
+
+    name_re = re.compile(args.match_regex)
+    reference_path = Path(args.reference)
+    _, reference_tensors = load_tensor_map(reference_path, name_re)
+    if not reference_tensors:
+        raise SystemExit(f"no tensors matched {args.match_regex!r} in {reference_path}")
+
+    candidate_maps: dict[str, dict[str, object]] = {}
+    for label, path in candidate_specs:
+        _, tensors = load_tensor_map(path, name_re)
+        missing = sorted(set(reference_tensors) - set(tensors))
+        if missing:
+            raise SystemExit(f"{label} is missing tensors present in reference: {missing}")
+        candidate_maps[label] = tensors
+
+    ref_arrays = {name: dequantize_tensor(tensor) for name, tensor in reference_tensors.items()}
+    metrics_by_tensor: dict[str, list[TensorCandidateMetrics]] = {}
+    for tensor_name in sorted(reference_tensors):
+        rows: list[TensorCandidateMetrics] = []
+        reference_arr = ref_arrays[tensor_name]
+        for label, path in candidate_specs:
+            rows.append(compute_metrics(label, path, tensor_name, candidate_maps[label][tensor_name], reference_arr))
+        metrics_by_tensor[tensor_name] = rows
+
+    balanced, warnings_balanced = pick_recommendation(metrics_by_tensor, thresholds_balanced)
+    strict, warnings_strict = pick_recommendation(metrics_by_tensor, thresholds_strict)
+    warnings = warnings_balanced + warnings_strict
+
+    if args.write_balanced_type_file:
+        if not args.baseline:
+            raise SystemExit("--baseline is required when writing override files")
+        write_type_file(Path(args.write_balanced_type_file), args.baseline, metrics_by_tensor, balanced)
+    if args.write_strict_type_file:
+        if not args.baseline:
+            raise SystemExit("--baseline is required when writing override files")
+        write_type_file(Path(args.write_strict_type_file), args.baseline, metrics_by_tensor, strict)
+
+    print_report(reference_path, metrics_by_tensor, balanced, strict, warnings)
+
+    if args.write_json:
+        report = {
+            "reference": str(reference_path),
+            "match_regex": args.match_regex,
+            "thresholds": {
+                "balanced": asdict(thresholds_balanced),
+                "strict": asdict(thresholds_strict),
+            },
+            "tensors": {
+                tensor_name: [asdict(item) for item in items] for tensor_name, items in metrics_by_tensor.items()
+            },
+            "recommendations": {
+                "balanced": {tensor_name: asdict(item) for tensor_name, item in balanced.items()},
+                "strict": {tensor_name: asdict(item) for tensor_name, item in strict.items()},
+            },
+            "warnings": warnings,
+        }
+        output_path = Path(args.write_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
+
+================
+File: docs/development/native-mtp-model-prep.md
+================
+# Native MTP Model Prep
+
+This note captures the workflow and sharp edges we hit while preparing real models for native-MTP testing in this private mirror.
+
+## Storage Rules
+
+- Store downloads and generated GGUFs under `/mnt/models`.
+- Use the Ubuntu-native ext4 drive only.
+- Do not use `/home` for large model files.
+- Do not use Windows-mounted paths under `/media`.
+
+## What To Verify Before Download
+
+For any candidate model, first confirm that the original HF checkpoint actually contains MTP / NextN weights.
+
+Check:
+
+- `config.json` for MTP-related fields such as `mtp_num_hidden_layers`
+- `model.safetensors.index.json` for `mtp.*` tensors
+- model card / config naming only as a hint, not as proof
+
+If the HF checkpoint does not contain MTP tensors, it is not a useful native-MTP target for this runtime.
+
+## What To Verify Before Reusing A Community GGUF
+
+Do not assume community GGUFs preserve MTP.
+
+Before downloading a large GGUF, inspect the header / tensor listing and verify that it contains:
+
+- `*.nextn_predict_layers` metadata
+- `blk.*.nextn.*` tensors
+
+If those are missing, the GGUF is usable as a plain model but not for the native-MTP path in this repo.
+
+This already happened with multiple Qwen3.5-35B-A3B community GGUFs:
+
+- `unsloth`
+- `lmstudio-community`
+- `bartowski`
+- `AesSedai`
+
+They loaded as normal models but dropped the MTP metadata / tensors needed by this implementation.
+
+## Preferred Conversion Path
+
+If the HF checkpoint contains MTP tensors and community GGUFs do not preserve them, build a GGUF locally from the official HF weights using this private mirror.
+
+Typical conversion command:
+
+```bash
+env PYTHONPATH=gguf-py .venv-tests/bin/python convert_hf_to_gguf.py \
+  /mnt/models/hf/<MODEL_DIR> \
+  --outfile /mnt/models/GGUF/<MODEL_NAME>-MTP-bf16.gguf \
+  --outtype bf16
+```
+
+After conversion, verify the GGUF directly before spending time on quantization.
+
+Expected signals:
+
+- architecture is the expected native-MTP arch
+- `*.nextn_predict_layers` exists
+- `blk.*.nextn.eh_proj.weight`
+- `blk.*.nextn.enorm.weight`
+- `blk.*.nextn.hnorm.weight`
+- any shared-head or dedicated-embedding tensors expected by the model
+
+## Quantization Guidance
+
+### Dense models
+
+For dense models, prefer a high-quality dynamic quant pattern rather than a naive all-`Q4_K_M` conversion.
+
+Practical approach:
+
+- follow Unsloth Dynamic 2.0 style mappings
+- use a donor quant layout when possible
+- build an imatrix first
+- then quantize with explicit tensor overrides
+- treat native-MTP tensors as a separate quality gate, not as “just another small tail tensor”
+
+### MoE models
+
+Be more careful with MoE models.
+
+Plain metadata-only donor cloning is not enough if it ignores 3D expert tensors.
+
+Lessons from `Qwen3.5-35B-A3B`:
+
+- a naive `quant_clone` style path can miss MoE-specific expert tensors
+- that can silently produce the wrong quantization plan
+- use a MoE-aware tensor-type map that includes all relevant expert tensors
+
+## MTP Tensor Quality Pass
+
+For the current `qwen35` and `qwen35moe` native-MTP models, the MTP-specific tensor set is small:
+
+- `*.nextn.eh_proj.weight`
+- `*.nextn.enorm.weight`
+- `*.nextn.hnorm.weight`
+- `*.nextn.shared_head_norm.weight`
+
+In the GGUFs prepared so far:
+
+- the three `*.norm.weight` tensors already stay `F32`
+- the only quantized MTP tensor is `*.nextn.eh_proj.weight`
+
+That makes MTP quality tuning much simpler than a full-model dynamic quant pass: the main question is how aggressively `*.nextn.eh_proj.weight` can be quantized before native-MTP exactness or acceptance degrades.
+
+Use the repo-local audit script to compare candidate quants against a BF16 reference and emit a `llama-quantize --tensor-type-file` override:
+
+```bash
+./.venv-tests/bin/python scripts/audit_mtp_quantization.py \
+  --reference /mnt/models/GGUF/<MODEL>-MTP-bf16.gguf \
+  --candidate q4=/mnt/models/GGUF/<MODEL>-MTP-Q4_K_M.gguf \
+  --candidate q5=/mnt/models/GGUF/<MODEL>-MTP-Q5_K_M.gguf \
+  --candidate q8=/mnt/models/GGUF/<MODEL>-MTP-UD-Q4_K_XL.gguf \
+  --baseline q4 \
+  --write-balanced-type-file /tmp/<MODEL>-mtp-balanced.tensor-types.txt \
+  --write-strict-type-file /tmp/<MODEL>-mtp-strict.tensor-types.txt
+```
+
+Current default thresholds in the script:
+
+- balanced:
+  - `rel_rmse <= 0.05`
+  - `cosine >= 0.999`
+- strict:
+  - `rel_rmse <= 0.02`
+  - `cosine >= 0.9999`
+
+Interpretation:
+
+- balanced is the recommended default for “best quality / size tradeoff”
+- strict is for exactness-first experiments where a few extra MiB on the MTP head are acceptable
+
+If the audit recommends a promotion, quantize from BF16 with the generated override file:
+
+```bash
+build/bin/llama-quantize \
+  --imatrix /mnt/models/imatrix/<MODEL>.gguf \
+  --tensor-type-file /tmp/<MODEL>-mtp-balanced.tensor-types.txt \
+  /mnt/models/GGUF/<MODEL>-MTP-bf16.gguf \
+  /mnt/models/GGUF/<MODEL>-MTP-Q4_K_M-mtp-balanced.gguf \
+  Q4_K_M
+```
+
+Checked-in example override files:
+
+- [scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt](../../scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt)
+- [scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt](../../scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt)
+
+## Validation Contract
+
+After quantization, validate both correctness and runtime behavior.
+
+Use:
+
+```bash
+python3 scripts/validate_mtp_cuda.py \
+  --binary build-cuda-server/bin/llama-server \
+  --model /mnt/models/GGUF/<MODEL>.gguf \
+  --prompt 'Write one short sentence about Berlin.' \
+  --seed 42 \
+  --n-predict 12 \
+  --ctx-size 4096 \
+  --batch-size 128 \
+  --ubatch-size 128 \
+  --threads 4 \
+  --threads-batch 4 \
+  --ngl 99 \
+  --flash-attn on \
+  --startup-timeout 240 \
+  --draft-max 1 \
+  --port-base 18880
+```
+
+Interpret results carefully:
+
+- `np=1` exactness matters
+- `np>1` on the current hybrid/recurrent native-MTP runtime is stability-focused, not strict batch-invariant exactness
+- enable `--mtp-profile` when you need per-step acceptance and draft/accept/replay timing in the JSON output
+- draft activity should still be non-zero
+- speedup is workload-dependent and not guaranteed
+
+## Cleanup Rules
+
+After a model has been successfully quantized and validated:
+
+- keep the final GGUF(s)
+- keep the HF source tree until you are done with all derived quants you may need
+- delete redundant BF16 GGUF intermediates
+- delete stale experimental quants that are no longer needed
+
+This matters because `/mnt/models` can fill up quickly during BF16 and multi-quant experiments.
+
+## What We Learned So Far
+
+- The native runtime currently works on:
+  - `qwen35`
+  - `qwen35moe`
+- `Qwen3.5-9B` custom GGUF + quant path worked and preserved MTP correctly.
+- `Qwen3.5-27B` custom GGUF + quant path also worked and stayed `np=1` exact on the checked CUDA cases, but it was still speed-negative.
+- `Qwen3.5-35B-A3B` custom GGUF + quant path also worked functionally.
+- `Qwen3.5-35B-A3B Q4_K_M` showed that “MTP tensors preserved” is not enough by itself:
+  - it was still slow
+  - and it diverged from greedy baseline on the checked `bad np=1` CUDA case
+- A direct BF16-vs-quant MTP audit showed why `Qwen3.5-35B-A3B Q4_K_M` is special:
+  - all three `*.nextn.*norm.weight` tensors were already `F32`
+  - the only differing MTP tensor across the A3B quants was `blk.40.nextn.eh_proj.weight`
+  - `Q4_K_M` stored that tensor as `Q4_K`
+  - `Q5_K_M` stored it as `Q5_K`
+  - `UD-Q4_K_XL` stored it as `Q8_0`
+  - relative to BF16, the measured error on that tensor was:
+    - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
+    - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
+    - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.99996`
+  - the balanced recommendation is therefore to promote that tensor to at least `Q5_K` in the A3B `Q4_K_M` recipe
+- `Qwen3.5-27B-MTP-UD-Q4_K_XL` already stores `blk.64.nextn.eh_proj.weight` as `Q8_0`, so there is no obvious MTP-head under-quantization issue there.
+- `Qwen3.5-9B` no longer had a BF16 GGUF under `/mnt/models/GGUF` during this pass, so only a surrogate audit against the existing `q8_0` file was possible.
+- That surrogate audit still answered the important deployment question:
+  - both shipped 9B quants already store `blk.32.nextn.eh_proj.weight` as `Q8_0`
+  - so there is no pending balanced MTP-head promotion to apply on 9B
+- We rebuilt `Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf` with the balanced override and promoted:
+  - `blk.40.nextn.eh_proj.weight: Q4_K -> Q5_K`
+- That balanced rebuild is now the canonical `Q4_K_M` GGUF on disk.
+- The older pre-balanced backup was removed after the swap to recover disk space under `/mnt/models`.
+- Important caveat:
+  - the balanced rebuild improved the MTP tensor quality as intended
+  - but a narrow `bad np=1` validation still failed exactness
+  - so “balanced” is the right size/quality policy for the GGUF set, but it is not enough by itself to make A3B `Q4_K_M` a correctness-clean native-MTP target
+- Isolation result:
+  - disabling the greedy native-MTP accept fast path with a temporary debug gate did not fix the `bad np=1` divergence
+  - tracing showed `Qwen3.5-35B-A3B` is using the hybrid recurrent-backup restore path, not `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`
+  - the first replayed verifier logits after restore were still correct:
+    - replayed token `271` at `pos=10`
+    - replay top-1 next token `248068` with `p ~= 0.91`
+    - that matches the greedy baseline continuation at that point
+  - the divergence appeared on the first speculative step after replay:
+    - without any extra guard, native MTP continued `[271, 248068, 271, ...]`
+    - greedy baseline continued `[271, 248068, 198, ...]`
+  - a one-step temporary cooldown after replay restored exactness on both:
+    - the short traced repro
+    - the full `bad np=1` validation case
+  - that narrows the remaining A3B `Q4_K_M` issue further:
+    - restore+replay can rebuild a correct immediate next-token state
+    - the first speculative verifier batch after replay is the piece that breaks exactness on this model/quant
+- Fix now landed in the server:
+  - hybrid/recurrent native-MTP slots now always force one plain verifier step immediately after a replay
+  - that restored `np=1` exactness for the canonical A3B `Q4_K_M` GGUF on the checked `primary`, `good`, and `bad` CUDA cases
+  - the same guard stayed exact on the checked 9B and 27B dense references, and A3B `np=2` remained stability-clean in a smoke run
+  - the tradeoff is conservative: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
+- For MoE, the main issue was not “MTP is unsupported”; the main issue was preserving MTP tensors correctly and then accepting that runtime speedup may still be poor.
+- Community GGUFs cannot be trusted to preserve MTP unless verified explicitly.
+- A model or quant can be a valid native-MTP functionality target without being a speed-positive target.
+- Every new quant still needs a real `np=1` exactness check; do not assume exactness transfers automatically across quants of the same model family.
+
+## Paste-Ready Prompt For External AI
+
+```text
+Please help me prepare a Qwen 3 27B model for native-MTP testing in my private llama.cpp mirror.
+
+Important constraints:
+- All downloads and generated model files must go under /mnt/models.
+- Use the Ubuntu-native ext4 drive only.
+- Do not use /home for large files.
+- Do not use Windows-mounted paths under /media.
+- Do not assume community GGUFs preserve MTP.
+
+What I need from you:
+1. First identify the exact HF model that “Qwen 3 27B” should refer to.
+2. Before downloading any large GGUF, verify whether the official HF checkpoint actually contains MTP / NextN weights:
+   - inspect config.json for fields like mtp_num_hidden_layers
+   - inspect model.safetensors.index.json for mtp.* tensors
+3. Check whether a popular community GGUF already preserves MTP correctly by verifying that its GGUF contains:
+   - *.nextn_predict_layers
+   - blk.*.nextn.* tensors
+4. Only reuse a community GGUF if those MTP fields are truly present.
+5. If community GGUFs strip MTP, then build our own GGUF from the official HF checkpoint using this private mirror’s convert_hf_to_gguf.py.
+6. After conversion, verify the output GGUF contains the expected MTP metadata and tensors before quantizing it.
+7. Produce a high-quality quant, not a naive one-size-fits-all quant:
+   - for dense models, prefer an Unsloth Dynamic 2.0 style dynamic quant layout
+   - build an imatrix first
+   - use explicit tensor overrides where needed
+8. Validate the final GGUF with the local CUDA validator.
+
+Known repo-specific context:
+- This private mirror already has native-MTP conversion/runtime support for qwen35 and qwen35moe.
+- The runtime currently validates np=1 exactness; np>1 on hybrid/recurrent native-MTP is stability-focused, not strict batch-invariant exactness.
+- We previously found that several community Qwen3.5-35B-A3B GGUFs from unsloth, lmstudio-community, bartowski, and AesSedai dropped the MTP metadata/tensors entirely.
+- We successfully built our own MTP-preserving GGUFs for Qwen3.5-9B and Qwen3.5-35B-A3B.
+- For MoE models, naive quant-clone style tensor mapping was not enough because it missed 3D expert tensors.
+
+Please return:
+- the exact candidate model choice
+- whether it truly contains MTP
+- whether an existing GGUF can be reused
+- if not, the exact download / convert / verify / imatrix / quantize / validate plan
+- expected disk usage and cleanup recommendations
+
+If you need extra context from public llama.cpp or model repos, use it surgically rather than reading the whole project.
+```
+
+================
+File: docs/development/native-mtp-optimization-plan.md
+================
+# Native MTP Optimization Plan
+
+This plan is for the current private native-MTP branch, with the goal of turning native MTP into a real end-to-end CUDA win on the dense Qwen 3.5 path while staying maintainable and upstream-friendly.
+
+## Constraints
+
+- judge every kept step by end-to-end tok/s, not internal phase timing alone
+- compare every kept step against:
+  - greedy baseline
+  - the immediately previous native-MTP step
+- keep `np=1` exact against greedy baseline
+- treat `np>1` on hybrid/recurrent native-MTP as stability-only
+- prefer generic runtime improvements over model-specific hacks
+- keep server/runtime layering clean; if a small API is needed, make it generic
+
+## Current Problem
+
+The 2026-04-10 CUDA matrix in [native-mtp-benchmarks.md](native-mtp-benchmarks.md) changed the optimization target from “make 9B UD-Q4 less bad” to “explain why nothing is `np=1` speed-positive and why only 9B Q8 wins on the easier `np=2` cases”.
+
+Current state:
+
+- `Qwen3.5-9B q8_0` is still the only checked model/quant with repeatable net-positive wins, but only on the easier `np=2` cases:
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+  - `primary np=1` is now effectively break-even: `150.53 -> 150.31 tok/s` (`0.999x`)
+- `Qwen3.5-9B UD-Q4_K_XL` stays slightly slower even though short-run acceptance is still strong:
+  - `primary np=1`: `175.91 -> 159.01 tok/s` (`0.904x`)
+  - profile totals there: `draft ~= 21.2 ms`, `accept ~= 75.5 ms`, `replay ~= 30.8 ms`
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere and especially bad on `np=2`:
+  - `primary np=1`: `72.35 -> 62.27 tok/s`
+  - `bad np=2`: `58.64 -> 53.61 tok/s`
+- `Qwen3.5-35B-A3B` is still slower on every checked quant.
+- `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again on the checked CUDA cases after a permanent one-step post-replay guard was added for hybrid/recurrent native-MTP slots, but it is still far from speed-positive.
+
+Interpretation:
+
+- the remaining problem is still runtime economics, not just “does the model expose an MTP head”
+- the current single-token draft can pay off on a favorable dense quant (`9B q8_0`), but the margin is small
+- accept cost is still the first recurring bottleneck on the good path
+- replay is the main bad-prompt cliff on the larger dense path
+- MoE is currently a functionality target, not a speed target
+- the backend-resident seed path already landed and should not be reopened as a standalone project unless later evidence changes
+
+A3B correctness side note:
+
+- the A3B `Q4_K_M` exactness failure is now narrowed beyond quant quality alone:
+  - promoting `blk.40.nextn.eh_proj.weight` from `Q4_K` to `Q5_K` was the right balanced GGUF fix, but it did not clear `bad np=1`
+  - disabling the greedy accept fast path also did not clear it
+  - tracing showed the model is on the hybrid recurrent-backup restore path and that the first replayed verifier logits still match baseline
+  - exactness came back when the first speculative step after replay was skipped once
+- that diagnosis is now codified as the current conservative fix:
+  - hybrid/recurrent native-MTP slots force one plain verifier step immediately after replay
+  - this restores the `np=1` lossless contract on the checked A3B `Q4_K_M` cases without special-casing Qwen or MoE by name
+  - the deeper follow-up, if we want it, is to explain why the first speculative verifier batch after replay is not baseline-equivalent and then remove or relax the guard
+
+## Priority Order
+
+### 1. Harden the benchmark gate
+
+Files:
+
+- `scripts/validate_mtp_cuda.py`
+- `docs/development/native-mtp-benchmarks.md`
+
+Required output from the harness:
+
+- repeated baseline vs native-MTP comparisons
+- JSON output
+- optional `LLAMA_SERVER_MTP_PROFILE=1` parsing
+- per-step `native MTP step:` parsing so acceptance and draft/accept/replay cost can be tracked per speculative step
+- comparison against greedy baseline and, optionally, a previous native-MTP JSON result
+
+Fixed CUDA cases:
+
+- `primary`: dense 9B short exact regression case
+- `good`: known good/stable case
+- `bad`: replay-heavy stability case
+
+This step is mandatory before runtime changes are judged.
+
+Status:
+
+- landed in commit `47ba219dd`
+
+### 2. Reduce accept-path overhead first
+
+Primary target:
+
+- `tools/server/server-context.cpp`
+
+Approach:
+
+- add a guarded fast path for pure greedy verifier handling
+- keep the current generic sampler path unchanged as fallback
+- only use the fast path when:
+  - greedy sampling is active
+  - no grammar is active
+  - no sampler behavior depends on the full generic post-logits pipeline
+
+Likely supporting files:
+
+- `include/llama.h` only if a small generic API is required
+- `src/llama-context.cpp`
+- `src/llama-graph.h`
+- `src/llama-graph.cpp`
+
+Why this is first:
+
+- accept cost is currently the largest recurring bucket and is paid every speculative step
+
+Status:
+
+- landed in commit `5cfd26302`
+- result: small but repeatable `np=1` gain on the dense 9B CUDA gate from direct greedy verifier-token accept, with generic fallback still intact
+
+### 3. Reduce verifier output-transfer cost on the same greedy path
+
+Primary targets:
+
+- `tools/server/server-context.cpp`
+- `src/llama-context.cpp`
+- `include/llama.h`
+
+Approach:
+
+- keep the greedy verifier-token fast path from step 2
+- when a decode chunk consists only of pure-greedy native-MTP verifier outputs, request output tokens but suppress raw-logit downloads for that chunk
+- keep raw logits enabled for all mixed or generic sampling batches
+
+Why this is next:
+
+- after step 2, the remaining accept cost is still dominated by always-paid verifier output handling
+- this keeps the change generic and local, without model-specific hacks
+
+Status:
+
+- landed locally after step 2
+- result: another small but repeatable `np=1` gain on the dense 9B CUDA gate
+- current reading after the wider model sweep:
+  - enough to make `9B q8_0` speed-positive on the easier `np=2` cases
+  - not enough to rescue `9B UD-Q4_K_XL`
+  - nowhere near enough for 27B or the current A3B quants
+### 4. Check draft-path hot reuse before redesigning it
+
+Primary target:
+
+- `src/llama-context.cpp`
+
+Approach:
+
+- instrument MTP graph reuse hits and misses
+- instrument graph allocation frequency in steady state
+- only add a dedicated cached MTP graph result or scheduler if the counters prove the current path is cold in steady state
+
+Do not:
+
+- start a second standalone seed-path project
+- add a dedicated scheduler unless counters show it is necessary
+
+Status:
+
+- attempted with a dedicated MTP scheduler/result cache
+- dropped
+- reason: end-to-end gains did not hold up under repeated benchmarking; the draft bucket barely moved, so the apparent win was noise rather than a real structural improvement
+
+### 5. Add a conservative replay-triggered cooldown
+
+Primary target:
+
+- `tools/server/server-context.cpp`
+
+Approach:
+
+- after a native replay on a slot, skip native MTP on that slot for a small fixed window
+- keep the rule deterministic, simple, and profile-visible
+- do not build an opaque adaptive controller
+
+Purpose:
+
+- reduce bad-prompt thrash without destabilizing the good exact path
+
+Why this is now more urgent:
+
+- 27B `bad np=2` still spent `~395 ms` in replay across 3 repeats, versus only `~128 ms` in draft
+- even on 9B Q8 the bad case is clearly negative, so bad-prompt replay still blocks “broadly positive” behavior
+- the same cooldown shape is also now a correctness diagnostic on A3B:
+  - skipping exactly one post-replay speculative step restored `bad np=1` exactness there
+  - that has now been promoted from a debug probe to the current permanent hybrid/recurrent correctness guard
+
+### 6. Keep only small hot-path cleanups that beat noise
+
+Primary targets:
+
+- `tools/server/server-context.cpp`
+- `src/llama-mtp.h`
+- `src/llama-mtp.cpp`
+
+Examples:
+
+- reuse replay batch storage
+- reduce temporary seq-id churn if it is still measurable
+- drop container churn only if it moves real tok/s
+
+These are cleanup items, not the main strategy.
+
+## Benchmark Gate
+
+Do not keep any optimization unless all of the following remain true:
+
+- `np=1` exact output still matches greedy baseline on the primary case
+- median end-to-end tok/s improves versus the immediately previous native-MTP step on the primary case
+- the same change is also checked against greedy baseline
+- the change does not cause a meaningful regression on the supporting good case
+- `np>1` remains stable: no crash, corruption, or invalid token stream
+
+## Explicitly Deferred
+
+Not worth doing yet:
+
+- another standalone seed-transport project
+- recursive multi-token native drafting
+- model-specific fused kernels before the control-path costs are addressed
+- MoE-specific speed tuning as the main optimization track
+- tiny container cleanup before accept/replay/draft-reuse work
+
+Those are follow-up options only after the dense path is broadly speed-positive beyond the current `9B q8_0` `np=2` niche.
+
+================
+File: scripts/validate_mtp_cuda.py
+================
+#!/usr/bin/env python3
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import signal
+import statistics
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_PROMPT = "Hello"
+DEFAULT_SEED = 12345
+DEFAULT_N_PREDICT = 8
+
+PROFILE_RE = re.compile(
+    r"native MTP profile:"
+    r" draft=\s*(?P<draft_ms>[\d.]+) ms \((?P<draft_calls>\d+) calls\),"
+    r" snapshot=\s*(?P<snapshot_ms>[\d.]+) ms \((?P<snapshot_calls>\d+) saves\),"
+    r" accept=\s*(?P<accept_ms>[\d.]+) ms \((?P<accept_calls>\d+) accepts\),"
+    r" restore=\s*(?P<restore_ms>[\d.]+) ms \((?P<restore_calls>\d+) restores\),"
+    r" replay=\s*(?P<replay_ms>[\d.]+) ms \((?P<replay_calls>\d+) replays\),"
+    r" total=\s*(?P<total_ms>[\d.]+) ms"
+)
+
+ACCEPTANCE_RE = re.compile(
+    r"draft acceptance rate =\s*(?P<ratio>[\d.]+)\s*\(\s*(?P<accepted>\d+)\s+accepted /\s*(?P<generated>\d+)\s+generated\)"
+)
+
+STEP_RE = re.compile(
+    r"native MTP step:"
+    r" step=(?P<step>\d+)"
+    r" drafted=(?P<drafted>\d+)"
+    r" accepted=(?P<accepted>\d+)"
+    r" replay=(?P<replay>[01])"
+    r" draft=(?P<draft_us>\d+)\s+us"
+    r" snapshot=(?P<snapshot_us>\d+)\s+us"
+    r" accept=(?P<accept_us>\d+)\s+us"
+    r" restore=(?P<restore_us>\d+)\s+us"
+    r" replay_us=(?P<replay_us>\d+)"
+    r" total=(?P<total_us>\d+)\s+us"
+)
+
+CASE_PRESETS: dict[str, dict[str, Any]] = {
+    "primary": {
+        "prompt": "Write one short sentence about Berlin.",
+        "seed": 42,
+        "n_predict": 12,
+        "description": "Primary exact CUDA gate for the 9B UD-Q4_K_XL regression case.",
+    },
+    "good": {
+        "prompt": "Write two short sentences about the Moon.",
+        "seed": 31415,
+        "n_predict": 64,
+        "description": "Previously good exact/stable CUDA case.",
+    },
+    "bad": {
+        "prompt": "List three reasons Rust is used for systems programming.",
+        "seed": 777,
+        "n_predict": 64,
+        "description": "Replay-heavy stability case.",
+    },
+}
+
+
+@dataclass(frozen=True)
+class CaseConfig:
+    name: str
+    prompt: str
+    seed: int
+    n_predict: int
+    description: str
+
+
+@dataclass(frozen=True)
+class ScenarioKey:
+    case: str
+    repeat: int
+    mode: str
+    n_parallel: int
+
+
+@dataclass
+class ProfileTotals:
+    draft_ms: float = 0.0
+    draft_calls: int = 0
+    snapshot_ms: float = 0.0
+    snapshot_calls: int = 0
+    accept_ms: float = 0.0
+    accept_calls: int = 0
+    restore_ms: float = 0.0
+    restore_calls: int = 0
+    replay_ms: float = 0.0
+    replay_calls: int = 0
+    total_ms: float = 0.0
+    acceptance_generated: int = 0
+    acceptance_accepted: int = 0
+    steps: list[dict[str, int]] = field(default_factory=list)
+
+    def add_match(self, match: re.Match[str]) -> None:
+        self.draft_ms += float(match.group("draft_ms"))
+        self.draft_calls += int(match.group("draft_calls"))
+        self.snapshot_ms += float(match.group("snapshot_ms"))
+        self.snapshot_calls += int(match.group("snapshot_calls"))
+        self.accept_ms += float(match.group("accept_ms"))
+        self.accept_calls += int(match.group("accept_calls"))
+        self.restore_ms += float(match.group("restore_ms"))
+        self.restore_calls += int(match.group("restore_calls"))
+        self.replay_ms += float(match.group("replay_ms"))
+        self.replay_calls += int(match.group("replay_calls"))
+        self.total_ms += float(match.group("total_ms"))
+
+    def add_acceptance(self, match: re.Match[str]) -> None:
+        self.acceptance_accepted += int(match.group("accepted"))
+        self.acceptance_generated += int(match.group("generated"))
+
+    def add_step(self, match: re.Match[str]) -> None:
+        self.steps.append(
+            {
+                "step": int(match.group("step")),
+                "drafted": int(match.group("drafted")),
+                "accepted": int(match.group("accepted")),
+                "replay": int(match.group("replay")),
+                "draft_us": int(match.group("draft_us")),
+                "snapshot_us": int(match.group("snapshot_us")),
+                "accept_us": int(match.group("accept_us")),
+                "restore_us": int(match.group("restore_us")),
+                "replay_us": int(match.group("replay_us")),
+                "total_us": int(match.group("total_us")),
+            }
+        )
+
+    def per_call(self, total: float, calls: int) -> float | None:
+        return None if calls == 0 else total / calls
+
+    def to_dict(self) -> dict[str, Any]:
+        acceptance_rate = None
+        if self.acceptance_generated > 0:
+            acceptance_rate = self.acceptance_accepted / self.acceptance_generated
+
+        step_count = len(self.steps)
+        step_drafted = sum(step["drafted"] for step in self.steps)
+        step_accepted = sum(step["accepted"] for step in self.steps)
+        step_acceptance_rate = None if step_drafted == 0 else step_accepted / step_drafted
+        step_totals_us = {
+            "draft": sum(step["draft_us"] for step in self.steps),
+            "snapshot": sum(step["snapshot_us"] for step in self.steps),
+            "accept": sum(step["accept_us"] for step in self.steps),
+            "restore": sum(step["restore_us"] for step in self.steps),
+            "replay": sum(step["replay_us"] for step in self.steps),
+            "total": sum(step["total_us"] for step in self.steps),
+        }
+        step_mean_us = {
+            key: None if step_count == 0 else value / step_count
+            for key, value in step_totals_us.items()
+        }
+
+        return {
+            "totals_ms": {
+                "draft": self.draft_ms,
+                "snapshot": self.snapshot_ms,
+                "accept": self.accept_ms,
+                "restore": self.restore_ms,
+                "replay": self.replay_ms,
+                "total": self.total_ms,
+            },
+            "calls": {
+                "draft": self.draft_calls,
+                "snapshot": self.snapshot_calls,
+                "accept": self.accept_calls,
+                "restore": self.restore_calls,
+                "replay": self.replay_calls,
+            },
+            "per_call_ms": {
+                "draft": self.per_call(self.draft_ms, self.draft_calls),
+                "snapshot": self.per_call(self.snapshot_ms, self.snapshot_calls),
+                "accept": self.per_call(self.accept_ms, self.accept_calls),
+                "restore": self.per_call(self.restore_ms, self.restore_calls),
+                "replay": self.per_call(self.replay_ms, self.replay_calls),
+            },
+            "acceptance": {
+                "accepted": self.acceptance_accepted,
+                "generated": self.acceptance_generated,
+                "rate": acceptance_rate,
+            },
+            "step_summary": {
+                "count": step_count,
+                "drafted": step_drafted,
+                "accepted": step_accepted,
+                "replay_steps": sum(step["replay"] for step in self.steps),
+                "acceptance_rate": step_acceptance_rate,
+                "totals_us": step_totals_us,
+                "mean_us": step_mean_us,
+            },
+            "steps": self.steps,
+        }
+
+
+@dataclass
+class ScenarioResult:
+    key: ScenarioKey
+    outputs: list[str]
+    responses: list[dict[str, Any]]
+    log_path: Path
+    predicted_per_second: list[float]
+    profile: ProfileTotals | None
+
+    def mean_tok_s(self) -> float:
+        return statistics.fmean(self.predicted_per_second)
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def wait_for_server(base_url: str, proc: subprocess.Popen[str], timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    last_error = "server did not become healthy"
+
+    while time.time() < deadline:
+        ret = proc.poll()
+        if ret is not None:
+            raise RuntimeError(f"server exited early with code {ret}")
+
+        try:
+            get_json(f"{base_url}/health", timeout=2.0)
+            return
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+            time.sleep(0.25)
+
+    raise RuntimeError(last_error)
+
+
+def stop_server(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def completion_payload(prompt: str, n_predict: int, seed: int) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "temperature": 0,
+        "seed": seed,
+        "cache_prompt": False,
+    }
+
+
+def format_toks(resp: dict[str, Any]) -> str:
+    timings = resp.get("timings", {})
+    predicted = timings.get("predicted_per_second")
+    if predicted is None:
+        return "n/a"
+    return f"{predicted:.2f}"
+
+
+def describe_response(resp: dict[str, Any]) -> str:
+    timings = resp.get("timings", {})
+    extra = []
+    extra.append(f"tok/s={format_toks(resp)}")
+    if "draft_n" in timings and "draft_n_accepted" in timings:
+        extra.append(f"draft={timings['draft_n']}")
+        extra.append(f"accepted={timings['draft_n_accepted']}")
+    extra.append(f"slot={resp.get('id_slot', '?')}")
+    return ", ".join(extra)
+
+
+def parse_case_names(text: str) -> list[str]:
+    names = [item.strip() for item in text.split(",") if item.strip()]
+    if not names:
+        raise ValueError("at least one case must be provided")
+    for name in names:
+        if name != "custom" and name not in CASE_PRESETS:
+            raise ValueError(f"unknown case: {name}")
+    return names
+
+
+def parse_n_parallels(text: str) -> list[int]:
+    values = [int(item.strip()) for item in text.split(",") if item.strip()]
+    if not values:
+        raise ValueError("at least one n_parallel must be provided")
+    return values
+
+
+def get_case_config(name: str, args: argparse.Namespace) -> CaseConfig:
+    if name == "custom":
+        return CaseConfig(
+            name="custom",
+            prompt=args.prompt,
+            seed=args.seed,
+            n_predict=args.n_predict,
+            description="Custom single-case run.",
+        )
+
+    preset = CASE_PRESETS[name]
+    return CaseConfig(
+        name=name,
+        prompt=preset["prompt"],
+        seed=preset["seed"],
+        n_predict=preset["n_predict"],
+        description=preset["description"],
+    )
+
+
+def parse_profile(log_path: Path) -> ProfileTotals | None:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    profile = ProfileTotals()
+    matched = False
+
+    for match in PROFILE_RE.finditer(text):
+        profile.add_match(match)
+        matched = True
+
+    for match in ACCEPTANCE_RE.finditer(text):
+        profile.add_acceptance(match)
+
+    for match in STEP_RE.finditer(text):
+        profile.add_step(match)
+
+    return profile if matched else None
+
+
+def launch_server(
+    binary: Path,
+    model: Path,
+    host: str,
+    port: int,
+    n_parallel: int,
+    mode: str,
+    args: argparse.Namespace,
+    log_dir: Path,
+    log_name: str,
+) -> tuple[subprocess.Popen[str], Path]:
+    cmd = [
+        str(binary),
+        "-m",
+        str(model),
+        "-ngl",
+        args.ngl,
+        "-fa",
+        args.flash_attn,
+        "-c",
+        str(args.ctx_size),
+        "-b",
+        str(args.batch_size),
+        "-ub",
+        str(args.ubatch_size),
+        "-t",
+        str(args.threads),
+        "-tb",
+        str(args.threads_batch),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--no-webui",
+        "--no-warmup",
+        "--perf",
+        "-np",
+        str(n_parallel),
+    ]
+
+    if mode == "mtp":
+        cmd.extend(["--spec-type", "mtp", "--draft-max", str(args.draft_max)])
+
+    log_path = log_dir / f"{log_name}.log"
+    fout = log_path.open("w", encoding="utf-8")
+    env = os.environ.copy()
+    if args.mtp_profile:
+        env["LLAMA_SERVER_MTP_PROFILE"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=fout,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    return proc, log_path
+
+
+def run_requests(case: CaseConfig, base_url: str, n_parallel: int) -> list[dict[str, Any]]:
+    payloads = [
+        completion_payload(prompt=case.prompt, n_predict=case.n_predict, seed=case.seed + i)
+        for i in range(n_parallel)
+    ]
+
+    def do_request(payload: dict[str, Any]) -> dict[str, Any]:
+        return post_json(f"{base_url}/completion", payload, timeout=120.0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as tp:
+        futures = [tp.submit(do_request, payload) for payload in payloads]
+        return [f.result() for f in futures]
+
+
+def run_scenario(
+    binary: Path,
+    model: Path,
+    host: str,
+    port: int,
+    case: CaseConfig,
+    mode: str,
+    n_parallel: int,
+    repeat: int,
+    args: argparse.Namespace,
+    log_dir: Path,
+) -> ScenarioResult:
+    key = ScenarioKey(case=case.name, repeat=repeat, mode=mode, n_parallel=n_parallel)
+    log_name = f"{case.name}-r{repeat}-{mode}-np{n_parallel}"
+    proc, log_path = launch_server(binary, model, host, port, n_parallel, mode, args, log_dir, log_name)
+    base_url = f"http://{host}:{port}"
+
+    try:
+        wait_for_server(base_url, proc, timeout_s=args.startup_timeout)
+        responses = run_requests(case, base_url, n_parallel)
+    finally:
+        stop_server(proc)
+
+    outputs = [resp["content"] for resp in responses]
+    predicted_per_second = [float(resp["timings"]["predicted_per_second"]) for resp in responses]
+    profile = parse_profile(log_path) if args.mtp_profile else None
+
+    return ScenarioResult(
+        key=key,
+        outputs=outputs,
+        responses=responses,
+        log_path=log_path,
+        predicted_per_second=predicted_per_second,
+        profile=profile,
+    )
+
+
+def assert_equal_outputs(lhs: ScenarioResult, rhs: ScenarioResult) -> None:
+    if lhs.outputs != rhs.outputs:
+        raise AssertionError(
+            f"output mismatch for case={lhs.key.case} repeat={lhs.key.repeat} np={lhs.key.n_parallel}: "
+            f"{lhs.key.mode}={lhs.outputs!r} vs {rhs.key.mode}={rhs.outputs!r}"
+        )
+
+
+def require_stable_outputs(res: ScenarioResult) -> None:
+    for idx, out in enumerate(res.outputs):
+        if not out:
+            raise AssertionError(
+                f"scenario case={res.key.case} repeat={res.key.repeat} mode={res.key.mode} np={res.key.n_parallel} "
+                f"returned empty output for req{idx}"
+            )
+
+
+def print_result(res: ScenarioResult) -> None:
+    print(f"{res.key.case} repeat={res.key.repeat} {res.key.mode} np={res.key.n_parallel}")
+    for idx, resp in enumerate(res.responses):
+        print(f"  req{idx}: {describe_response(resp)}")
+        print(f"  req{idx}: content={resp['content']!r}")
+    if res.profile:
+        profile_dict = res.profile.to_dict()
+        print(f"  profile={json.dumps({k: v for k, v in profile_dict.items() if k != 'steps'}, sort_keys=True)}")
+    print(f"  log={res.log_path}")
+
+
+def stats(values: list[float]) -> dict[str, float]:
+    return {
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def aggregate_mode(results: list[ScenarioResult]) -> dict[str, Any]:
+    per_repeat_mean_tok_s = [res.mean_tok_s() for res in results]
+    per_response_tok_s = [tok_s for res in results for tok_s in res.predicted_per_second]
+    draft_counts = [resp.get("timings", {}).get("draft_n", 0) for res in results for resp in res.responses]
+    accepted_counts = [resp.get("timings", {}).get("draft_n_accepted", 0) for res in results for resp in res.responses]
+
+    profile_totals = ProfileTotals()
+    have_profile = False
+    for res in results:
+        if res.profile is None:
+            continue
+        have_profile = True
+        profile_totals.draft_ms += res.profile.draft_ms
+        profile_totals.draft_calls += res.profile.draft_calls
+        profile_totals.snapshot_ms += res.profile.snapshot_ms
+        profile_totals.snapshot_calls += res.profile.snapshot_calls
+        profile_totals.accept_ms += res.profile.accept_ms
+        profile_totals.accept_calls += res.profile.accept_calls
+        profile_totals.restore_ms += res.profile.restore_ms
+        profile_totals.restore_calls += res.profile.restore_calls
+        profile_totals.replay_ms += res.profile.replay_ms
+        profile_totals.replay_calls += res.profile.replay_calls
+        profile_totals.total_ms += res.profile.total_ms
+        profile_totals.acceptance_accepted += res.profile.acceptance_accepted
+        profile_totals.acceptance_generated += res.profile.acceptance_generated
+        profile_totals.steps.extend(res.profile.steps)
+
+    data: dict[str, Any] = {
+        "repeat_count": len(results),
+        "per_repeat_mean_tok_s": per_repeat_mean_tok_s,
+        "tok_s": stats(per_repeat_mean_tok_s),
+        "per_response_tok_s": stats(per_response_tok_s),
+        "draft_n_total": sum(draft_counts),
+        "draft_n_accepted_total": sum(accepted_counts),
+        "draft_acceptance_rate": None if sum(draft_counts) == 0 else sum(accepted_counts) / sum(draft_counts),
+        "logs": [str(res.log_path) for res in results],
+    }
+
+    if have_profile:
+        data["profile"] = profile_totals.to_dict()
+
+    return data
+
+
+def compute_speedup(baseline: dict[str, Any], mtp: dict[str, Any]) -> float | None:
+    baseline_median = baseline["tok_s"]["median"]
+    if baseline_median == 0:
+        return None
+    return mtp["tok_s"]["median"] / baseline_median
+
+
+def compare_against_previous(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    comparisons: dict[str, Any] = {}
+    for case_name, case_data in current["cases"].items():
+        prev_case = previous.get("cases", {}).get(case_name)
+        if prev_case is None:
+            continue
+        case_cmp: dict[str, Any] = {}
+        for np_key, np_data in case_data["n_parallel"].items():
+            prev_np = prev_case.get("n_parallel", {}).get(np_key)
+            if prev_np is None:
+                continue
+            cur_mtp = np_data.get("mtp")
+            prev_mtp = prev_np.get("mtp")
+            if cur_mtp is None or prev_mtp is None:
+                continue
+            prev_median = prev_mtp["tok_s"]["median"]
+            if prev_median == 0:
+                continue
+            case_cmp[np_key] = {
+                "prev_mtp_median_tok_s": prev_median,
+                "cur_mtp_median_tok_s": cur_mtp["tok_s"]["median"],
+                "speedup_vs_prev_mtp": cur_mtp["tok_s"]["median"] / prev_median,
+            }
+        if case_cmp:
+            comparisons[case_name] = case_cmp
+    return comparisons
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate native MTP against baseline llama-server output and throughput."
+    )
+    parser.add_argument("--binary", default="build-cuda/bin/llama-server", help="Path to llama-server")
+    parser.add_argument("--model", required=True, help="Path to GGUF model")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    parser.add_argument("--port-base", type=int, default=18100, help="Base port for spawned servers")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt used for custom case")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base seed for custom case")
+    parser.add_argument("--n-predict", type=int, default=DEFAULT_N_PREDICT, help="Generated tokens per request for custom case")
+    parser.add_argument("--cases", default="custom", help="Comma-separated case names: custom,primary,good,bad")
+    parser.add_argument("--n-parallels", default="1,2", help="Comma-separated list of -np values to run")
+    parser.add_argument("--allow-known-np2-divergence", action="store_true", help="Do not enforce exact equality for n_parallel > 1")
+    parser.add_argument("--repeat", "--repeats", dest="repeats", type=int, default=1, help="Number of repeats per scenario")
+    parser.add_argument("--ctx-size", type=int, default=4096, help="Context size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--ubatch-size", type=int, default=64, help="Ubatch size")
+    parser.add_argument("--threads", type=int, default=8, help="CPU threads")
+    parser.add_argument("--threads-batch", type=int, default=8, help="CPU batch threads")
+    parser.add_argument("--ngl", default="all", help="Value for -ngl")
+    parser.add_argument("--flash-attn", default="on", choices=["on", "off", "auto"], help="Value for -fa")
+    parser.add_argument("--startup-timeout", type=float, default=180.0, help="Seconds to wait for server health")
+    parser.add_argument("--draft-max", type=int, default=1, help="Value for --draft-max in mtp mode")
+    parser.add_argument("--mtp-profile", action="store_true", help="Set LLAMA_SERVER_MTP_PROFILE=1 and parse native MTP phase timing")
+    parser.add_argument("--log-dir", default=None, help="Directory for per-scenario logs")
+    parser.add_argument("--json-out", default=None, help="Write machine-readable summary JSON here")
+    parser.add_argument("--compare-json", default=None, help="Optional previous summary JSON for step-to-step MTP comparison")
+    args = parser.parse_args()
+
+    binary = Path(args.binary).resolve()
+    model = Path(args.model).resolve()
+    if not binary.is_file():
+        raise FileNotFoundError(f"llama-server not found: {binary}")
+    if not model.is_file():
+        raise FileNotFoundError(f"model not found: {model}")
+
+    case_names = parse_case_names(args.cases)
+    n_parallels = parse_n_parallels(args.n_parallels)
+    cases = [get_case_config(name, args) for name in case_names]
+
+    log_dir = Path(args.log_dir).resolve() if args.log_dir else Path(tempfile.mkdtemp(prefix="mtp-cuda-validate-"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"binary={binary}")
+    print(f"model={model}")
+    print(f"logs={log_dir}")
+
+    results: dict[ScenarioKey, ScenarioResult] = {}
+    scenario_counter = 0
+
+    for case in cases:
+        print(f"\n## case={case.name}: {case.description}")
+        for repeat in range(args.repeats):
+            for n_parallel in n_parallels:
+                for mode in ("baseline", "mtp"):
+                    port = args.port_base + scenario_counter
+                    scenario_counter += 1
+                    print(f"\n== running case={case.name} repeat={repeat} {mode} np={n_parallel} on port {port} ==")
+                    res = run_scenario(
+                        binary=binary,
+                        model=model,
+                        host=args.host,
+                        port=port,
+                        case=case,
+                        mode=mode,
+                        n_parallel=n_parallel,
+                        repeat=repeat,
+                        args=args,
+                        log_dir=log_dir,
+                    )
+                    results[res.key] = res
+                    print_result(res)
+
+    print("\n== validating outputs ==")
+    for case in cases:
+        for repeat in range(args.repeats):
+            for n_parallel in n_parallels:
+                baseline = results[ScenarioKey(case.name, repeat, "baseline", n_parallel)]
+                mtp = results[ScenarioKey(case.name, repeat, "mtp", n_parallel)]
+
+                require_stable_outputs(baseline)
+                require_stable_outputs(mtp)
+
+                exact_required = n_parallel == 1 or not args.allow_known_np2_divergence
+                if exact_required:
+                    assert_equal_outputs(baseline, mtp)
+
+                if not any(resp.get("timings", {}).get("draft_n", 0) > 0 for resp in mtp.responses):
+                    raise AssertionError(
+                        f"mtp case={case.name} repeat={repeat} np={n_parallel} did not report any native draft activity"
+                    )
+
+    print("output validation passed")
+
+    summary: dict[str, Any] = {
+        "binary": str(binary),
+        "model": str(model),
+        "config": {
+            "cases": case_names,
+            "n_parallels": n_parallels,
+            "repeats": args.repeats,
+            "allow_known_np2_divergence": args.allow_known_np2_divergence,
+            "ctx_size": args.ctx_size,
+            "batch_size": args.batch_size,
+            "ubatch_size": args.ubatch_size,
+            "threads": args.threads,
+            "threads_batch": args.threads_batch,
+            "ngl": args.ngl,
+            "flash_attn": args.flash_attn,
+            "draft_max": args.draft_max,
+            "mtp_profile": args.mtp_profile,
+            "log_dir": str(log_dir),
+        },
+        "cases": {},
+    }
+
+    for case in cases:
+        case_summary: dict[str, Any] = {
+            "description": case.description,
+            "prompt": case.prompt,
+            "seed": case.seed,
+            "n_predict": case.n_predict,
+            "n_parallel": {},
+        }
+        for n_parallel in n_parallels:
+            mode_runs = {
+                mode: [
+                    results[ScenarioKey(case.name, repeat, mode, n_parallel)]
+                    for repeat in range(args.repeats)
+                ]
+                for mode in ("baseline", "mtp")
+            }
+            np_summary = {
+                mode: aggregate_mode(runs)
+                for mode, runs in mode_runs.items()
+            }
+            np_summary["speedup_vs_baseline"] = compute_speedup(np_summary["baseline"], np_summary["mtp"])
+            np_summary["exact_required"] = n_parallel == 1 or not args.allow_known_np2_divergence
+            case_summary["n_parallel"][str(n_parallel)] = np_summary
+        summary["cases"][case.name] = case_summary
+
+    if args.compare_json:
+        previous = json.loads(Path(args.compare_json).read_text(encoding="utf-8"))
+        summary["comparison_vs_previous"] = compare_against_previous(summary, previous)
+
+    print("\n== summary ==")
+    for case_name, case_summary in summary["cases"].items():
+        print(f"case={case_name}")
+        for np_key, np_summary in case_summary["n_parallel"].items():
+            baseline_median = np_summary["baseline"]["tok_s"]["median"]
+            mtp_median = np_summary["mtp"]["tok_s"]["median"]
+            speedup = np_summary["speedup_vs_baseline"]
+            print(
+                f"  np={np_key}: baseline median tok/s={baseline_median:.2f}, "
+                f"mtp median tok/s={mtp_median:.2f}, "
+                f"speedup={speedup:.3f}x" if speedup is not None else
+                f"  np={np_key}: baseline median tok/s={baseline_median:.2f}, mtp median tok/s={mtp_median:.2f}"
+            )
+
+    if args.json_out:
+        json_path = Path(args.json_out).resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"\njson={json_path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+================
+File: src/llama-mtp.cpp
+================
+#include "llama-mtp.h"
+
+#include "llama-arch.h"
+#include "llama-model.h"
+
+#include <algorithm>
+#include <limits>
+
+static ggml_context_ptr llama_mtp_init_ctx(size_t n_tensors) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ std::max<size_t>(1, n_tensors) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    return ggml_context_ptr { ggml_init(params) };
+}
+
+static bool llm_arch_supports_native_mtp(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool llama_mtp_backend_seed_state::ready() const {
+    return backend != nullptr &&
+        buft != nullptr &&
+        n_embd > 0 &&
+        generation > 0 &&
+        seed_cache_dev != nullptr &&
+        seed_batch_dev != nullptr &&
+        seed_cache_rows.size() == LLAMA_MAX_SEQ &&
+        seed_batch_rows.size() == LLAMA_MAX_SEQ;
+}
+
+bool llama_mtp_backend_seed_state::matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const {
+    return this->backend == backend && this->buft == buft && this->n_embd == n_embd && ready();
+}
+
+void llama_mtp_backend_seed_state::clear_capture_views() {
+    capture_ctxs.clear();
+}
+
+void llama_mtp_backend_seed_state::clear() {
+    clear_capture_views();
+    seed_cache_rows.clear();
+    seed_batch_rows.clear();
+    seed_cache_dev = nullptr;
+    seed_batch_dev = nullptr;
+    buf.reset();
+    ctx_views.reset();
+    ctx_roots.reset();
+    backend = nullptr;
+    buft = nullptr;
+    n_embd = 0;
+    generation = 0;
+}
+
+void llama_mtp_state::clear() {
+    accepted.clear();
+    draft.clear();
+    seed_epoch = 1;
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
+    clear_backend_capture_views();
+}
+
+void llama_mtp_state::reserve(uint32_t n_embd, uint32_t n_pos_per_embd) {
+    clear();
+
+    this->n_embd = n_embd;
+    this->n_pos_per_embd = n_pos_per_embd;
+
+    if (!enabled()) {
+        seed_embd.clear();
+        clear_backend_seed_storage();
+        return;
+    }
+
+    seed_embd.resize((size_t) n_embd * desc.n_draft);
+    seed_by_seq.resize((size_t) LLAMA_MAX_SEQ * n_embd);
+    seed_epoch_by_seq.assign(LLAMA_MAX_SEQ, 0);
+    accepted.reserve(desc.n_draft);
+    draft.reserve(desc.n_draft);
+
+    ubatch_token.resize(LLAMA_MAX_SEQ);
+    ubatch_pos.resize((size_t) LLAMA_MAX_SEQ * n_pos_per_embd);
+    ubatch_n_seq_id.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_id.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_id_unq.resize(LLAMA_MAX_SEQ);
+    ubatch_seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    ubatch_output.resize(LLAMA_MAX_SEQ);
+    temp_seq_ids.resize(LLAMA_MAX_SEQ);
+    temp_seq_used.resize(LLAMA_MAX_SEQ);
+}
+
+void llama_mtp_state::next_seed_epoch() {
+    if (++seed_epoch == 0) {
+        seed_epoch = 1;
+        std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
+    }
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+}
+
+void llama_mtp_state::set_seed_mode(llama_mtp_seed_mode mode) {
+    seed_mode = mode;
+}
+
+bool llama_mtp_state::ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    if (!enabled() || backend == nullptr || buft == nullptr || n_embd == 0) {
+        return false;
+    }
+
+    if (seed_backend.matches(backend, buft, n_embd)) {
+        return true;
+    }
+
+    seed_backend.clear();
+
+    seed_backend.backend = backend;
+    seed_backend.buft = buft;
+    seed_backend.n_embd = n_embd;
+    seed_backend.generation = backend_seed_generation_next++;
+    if (backend_seed_generation_next == 0) {
+        backend_seed_generation_next = 1;
+    }
+
+    seed_backend.ctx_roots = llama_mtp_init_ctx(2);
+    seed_backend.ctx_views = llama_mtp_init_ctx(2*LLAMA_MAX_SEQ);
+    if (!seed_backend.ctx_roots || !seed_backend.ctx_views) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    if (!seed_backend.seed_cache_dev || !seed_backend.seed_batch_dev) {
+        seed_backend.clear();
+        return false;
+    }
+
+    ggml_set_name(seed_backend.seed_cache_dev, "mtp_seed_cache_dev");
+    ggml_set_name(seed_backend.seed_batch_dev, "mtp_seed_batch_dev");
+
+    seed_backend.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(seed_backend.ctx_roots.get(), buft));
+    if (!seed_backend.buf) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_rows.resize(LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_rows.resize(LLAMA_MAX_SEQ);
+
+    for (int32_t i = 0; i < LLAMA_MAX_SEQ; ++i) {
+        const size_t offset_cache = (size_t) i * seed_backend.seed_cache_dev->nb[1];
+        const size_t offset_batch = (size_t) i * seed_backend.seed_batch_dev->nb[1];
+
+        auto * cache_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_cache_dev, n_embd, offset_cache);
+        auto * batch_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_batch_dev, n_embd, offset_batch);
+        if (!cache_row || !batch_row) {
+            seed_backend.clear();
+            return false;
+        }
+
+        ggml_set_name(cache_row, "mtp_seed_cache_row");
+        ggml_set_name(batch_row, "mtp_seed_batch_row");
+
+        if (ggml_backend_view_init(cache_row) != GGML_STATUS_SUCCESS ||
+            ggml_backend_view_init(batch_row) != GGML_STATUS_SUCCESS) {
+            seed_backend.clear();
+            return false;
+        }
+
+        seed_backend.seed_cache_rows[i] = cache_row;
+        seed_backend.seed_batch_rows[i] = batch_row;
+    }
+
+    return true;
+}
+
+void llama_mtp_state::clear_backend_seed_storage() {
+    seed_backend.clear();
+}
+
+void llama_mtp_state::clear_backend_capture_views() {
+    seed_backend.clear_capture_views();
+}
+
+float * llama_mtp_state::seed_row(llama_seq_id seq_id) {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    return seed_by_seq.data() + (size_t) seq_id * n_embd;
+}
+
+const float * llama_mtp_state::seed_row(llama_seq_id seq_id) const {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    return seed_by_seq.data() + (size_t) seq_id * n_embd;
+}
+
+bool llama_mtp_state::has_seed(llama_seq_id seq_id) const {
+    return 0 <= seq_id && seq_id < LLAMA_MAX_SEQ && !seed_epoch_by_seq.empty() && seed_epoch_by_seq[seq_id] == seed_epoch;
+}
+
+void llama_mtp_state::mark_seed(llama_seq_id seq_id) {
+    GGML_ASSERT(0 <= seq_id && seq_id < LLAMA_MAX_SEQ);
+    seed_epoch_by_seq[seq_id] = seed_epoch;
+}
+
+llama_ubatch llama_mtp_state::ubatch_reserve(uint32_t n_seq) {
+    GGML_ASSERT(n_seq <= LLAMA_MAX_SEQ);
+    GGML_ASSERT(n_pos_per_embd > 0);
+
+    std::fill(ubatch_seq_idx.begin(), ubatch_seq_idx.end(), -1);
+
+    return llama_ubatch {
+        /*.b_equal_seqs =*/ true,
+        /*.n_tokens     =*/ n_seq,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ n_seq,
+        /*.n_seqs_unq   =*/ n_seq,
+        /*.n_pos        =*/ n_pos_per_embd,
+        /*.token        =*/ ubatch_token.data(),
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ ubatch_pos.data(),
+        /*.n_seq_id     =*/ ubatch_n_seq_id.data(),
+        /*.seq_id       =*/ ubatch_seq_id.data(),
+        /*.seq_id_unq   =*/ ubatch_seq_id_unq.data(),
+        /*.seq_idx      =*/ ubatch_seq_idx.data(),
+        /*.output       =*/ ubatch_output.data(),
+        /*.data         =*/ nullptr,
+    };
+}
+
+
+llama_mtp_desc llama_mtp_init_desc(const llama_model & model) {
+    llama_mtp_desc res = {
+        /*.supported            =*/ false,
+        /*.n_predict            =*/ model.hparams.nextn_predict_layers,
+        // The current native runtime uses the verifier hidden state to draft one
+        // continuation token per step. Multi-layer MTP heads may expose more
+        // predictor layers in metadata, but recursive multi-token drafting is
+        // not implemented here yet.
+        /*.n_draft              =*/ model.hparams.nextn_predict_layers > 0 ? 1u : 0u,
+        /*.dedicated_embeddings =*/ false,
+    };
+
+    if (!llm_arch_supports_native_mtp(model.arch) || res.n_predict == 0 || model.layers.empty()) {
+        return res;
+    }
+
+    const uint32_t il_mtp = model.hparams.n_layer - res.n_predict;
+    if (il_mtp >= model.layers.size()) {
+        return res;
+    }
+
+    const auto & layer = model.layers[il_mtp];
+
+    const bool has_nextn_inputs =
+        layer.nextn.eh_proj != nullptr &&
+        layer.nextn.enorm   != nullptr &&
+        layer.nextn.hnorm   != nullptr;
+
+    res.dedicated_embeddings = layer.nextn.embed_tokens != nullptr;
+
+    const bool has_nextn_head =
+        res.dedicated_embeddings ||
+        layer.nextn.shared_head_head != nullptr ||
+        model.output != nullptr;
+
+    res.supported = has_nextn_inputs && has_nextn_head;
+
+    return res;
+}
+
+================
+File: src/llama-mtp.h
+================
+#pragma once
+
+#include "llama-batch.h"
+#include "llama.h"
+
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
+#include <cstdint>
+#include <map>
+#include <vector>
+
+struct llama_model;
+struct ggml_context;
+struct ggml_tensor;
+
+struct llama_mtp_desc {
+    bool     supported            = false;
+    uint32_t n_predict            = 0;
+    uint32_t n_draft              = 0;
+    bool     dedicated_embeddings = false;
+};
+
+enum llama_mtp_seed_mode : uint8_t {
+    LLAMA_MTP_SEED_MODE_NONE    = 0,
+    LLAMA_MTP_SEED_MODE_HOST    = 1,
+    LLAMA_MTP_SEED_MODE_BACKEND = 2,
+};
+
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    uint32_t                   n_embd         = 0;
+    uint64_t                   generation     = 0;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+
+    ggml_context_ptr        ctx_roots;
+    ggml_context_ptr        ctx_views;
+    ggml_backend_buffer_ptr buf;
+
+    std::vector<ggml_tensor *>      seed_cache_rows;
+    std::vector<ggml_tensor *>      seed_batch_rows;
+    std::vector<ggml_context_ptr>   capture_ctxs;
+
+    bool ready() const;
+    bool matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const;
+    void clear();
+    void clear_capture_views();
+};
+
+struct llama_mtp_state {
+    llama_mtp_desc desc;
+    uint32_t       n_embd = 0;
+    uint32_t       n_pos_per_embd = 0;
+
+    std::vector<float>       seed_embd;
+    std::vector<llama_token> accepted;
+    std::vector<llama_token> draft;
+    std::vector<float>       seed_by_seq;
+    std::vector<uint32_t>    seed_epoch_by_seq;
+    uint32_t                 seed_epoch = 1;
+    llama_mtp_seed_mode      seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    uint64_t                 backend_seed_generation_next = 1;
+    llama_mtp_backend_seed_state seed_backend;
+
+    std::vector<llama_token>    ubatch_token;
+    std::vector<llama_pos>      ubatch_pos;
+    std::vector<int32_t>        ubatch_n_seq_id;
+    std::vector<llama_seq_id *> ubatch_seq_id;
+    std::vector<llama_seq_id>   ubatch_seq_id_unq;
+    std::vector<int32_t>        ubatch_seq_idx;
+    std::vector<int8_t>         ubatch_output;
+    std::vector<llama_seq_id>   temp_seq_ids;
+    std::vector<uint8_t>        temp_seq_used;
+
+    void clear();
+    void reserve(uint32_t n_embd, uint32_t n_pos_per_embd);
+    void next_seed_epoch();
+    void set_seed_mode(llama_mtp_seed_mode mode);
+    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+    void clear_backend_seed_storage();
+    void clear_backend_capture_views();
+
+    float * seed_row(llama_seq_id seq_id);
+    const float * seed_row(llama_seq_id seq_id) const;
+    bool has_seed(llama_seq_id seq_id) const;
+    void mark_seed(llama_seq_id seq_id);
+    llama_ubatch ubatch_reserve(uint32_t n_seq);
+
+    bool enabled() const {
+        return desc.supported && desc.n_draft > 0;
+    }
+};
+
+llama_mtp_desc llama_mtp_init_desc(const llama_model & model);
+
+================
+File: docs/development/native-mtp-benchmarks.md
+================
+# Native MTP Benchmarks
+
+Bench date: 2026-04-10
+
+This note records the current end-to-end CUDA benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
+
+## Benchmark Protocol
+
+- judge every change by end-to-end tok/s, not phase timing alone
+- compare native MTP against greedy baseline on the same model and prompt
+- require exact `np=1` output match to greedy baseline
+- treat `np>1` as stability-only on the current hybrid/recurrent path
+- ignore small movement unless it repeats across the 3-run median
+- keep per-step native-MTP timing visible with `LLAMA_SERVER_MTP_PROFILE=1`
+
+Authoritative harness:
+
+- [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py)
+
+The harness now parses two native-MTP profile signals:
+
+- aggregate phase totals from `native MTP profile: ...`
+- per-step timing and acceptance from `native MTP step: ...`
+
+## Method
+
+Backend:
+
+- CUDA only on this host
+- GPU: RTX 5090 32 GiB
+- binary: `build-cuda-server/bin/llama-server`
+
+Common settings:
+
+- `ctx-size=4096`
+- `batch-size=128`
+- `ubatch-size=128`
+- `threads=4`
+- `threads-batch=4`
+- `-ngl all`
+- `-fa on`
+- `draft-max=1`
+- repeats: `3`
+- cases: `primary`, `good`, `bad`
+- `-np`: `1`, `2`
+
+Cases:
+
+- `primary`: `Write one short sentence about Berlin.`, seed `42`, `n_predict=12`
+- `good`: `Write two short sentences about the Moon.`, seed `31415`, `n_predict=64`
+- `bad`: `List three reasons Rust is used for systems programming.`, seed `777`, `n_predict=64`
+
+Benchmarked models:
+
+- `/mnt/models/GGUF/Qwen3.5-9B-MTP-UD-Q4_K_XL.gguf`
+- `/mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf`
+- `/mnt/models/GGUF/Qwen3.5-27B-MTP-UD-Q4_K_XL.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q5_K_M-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-UD-Q4_K_XL-fixed.gguf`
+
+## Headline Result
+
+- This 3-repeat matrix includes the landed hybrid/recurrent post-replay guard fix.
+- No checked model or quant is net-positive on `np=1` in the current 3-repeat median.
+- `Qwen3.5-9B q8_0` is still the only checked path with repeatable net-positive wins, but only on the easier `np=2` cases:
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere in the current sweep.
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere, though less catastrophically than in the pre-fix sweep.
+- `Qwen3.5-35B-A3B` is now `np=1` exact across the checked quants, including the balanced `Q4_K_M` GGUF, but remains substantially slower than baseline.
+
+Interpretation:
+
+- the current single-token native-MTP upside is real on the 9B Q8 path
+- no checked path is currently an `np=1` end-to-end win
+- once verifier economics get worse for the model or quant, draft + accept + replay overhead dominates quickly
+- the larger dense and MoE cases are not blocked on “more benchmarking”; they are blocked on control-path economics and, for some quants, acceptance quality / exactness
+
+## Full Matrix
+
+### Primary
+
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `175.91` | `159.01` | `0.904x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `165.77` | `149.86` | `0.904x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `150.53` | `150.31` | `0.999x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `127.85` | `133.26` | `1.042x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `72.35` | `62.27` | `0.861x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `57.34` | `50.05` | `0.873x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `228.26` | `170.72` | `0.748x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `154.35` | `59.16` | `0.383x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `221.34` | `167.90` | `0.759x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `150.87` | `58.45` | `0.387x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `202.80` | `129.34` | `0.638x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `145.57` | `69.83` | `0.480x` | stability-only |
+
+### Good
+
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.94` | `167.83` | `0.857x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.82` | `145.65` | `0.895x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `148.62` | `139.40` | `0.938x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `132.66` | `137.12` | `1.034x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.94` | `61.48` | `0.867x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `59.26` | `55.09` | `0.930x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `243.16` | `163.47` | `0.672x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `170.04` | `74.49` | `0.438x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `234.38` | `174.36` | `0.744x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `180.66` | `93.19` | `0.516x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `220.52` | `151.49` | `0.687x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `160.53` | `94.02` | `0.586x` | stability-only |
+
+### Bad
+
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.39` | `162.72` | `0.833x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.59` | `133.78` | `0.823x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `148.82` | `125.10` | `0.841x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `132.99` | `115.83` | `0.871x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.87` | `63.97` | `0.903x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `58.64` | `53.61` | `0.914x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `251.70` | `177.53` | `0.705x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `190.39` | `108.20` | `0.568x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `243.17` | `174.54` | `0.718x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `186.98` | `111.72` | `0.597x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `224.48` | `174.48` | `0.777x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `167.94` | `128.60` | `0.766x` | stability-only |
+
+## Per-Step Native-MTP Profile
+
+These tables come from the new per-step `native MTP step:` profile parsing. Totals are aggregate MTP-only time across the 3 repeats for the given case and `-np`, while `mean step total us` is the average end-to-end cost of one speculative step after draft/snapshot/accept/restore/replay are combined.
+
+### Primary `np=1`
+
+| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-9B UD-Q4_K_XL | `12/15 (0.800)` | `21.212` | `75.516` | `30.801` | `8503.1` |
+| Qwen3.5-9B Q8_0 | `12/15 (0.800)` | `23.585` | `99.580` | `8.597` | `8785.1` |
+| Qwen3.5-27B UD-Q4_K_XL | `9/15 (0.600)` | `24.823` | `129.636` | `48.043` | `13502.1` |
+| Qwen3.5-35B-A3B Q4_K_M | `12/15 (0.800)` | `17.023` | `54.279` | `13.234` | `5637.1` |
+| Qwen3.5-35B-A3B Q5_K_M | `12/15 (0.800)` | `17.124` | `55.569` | `13.250` | `5730.9` |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | `9/15 (0.600)` | `18.619` | `58.111` | `23.066` | `6654.7` |
+
+Primary `np=1` interpretation:
+
+- 9B Q8 still has the smallest replay bucket on the dense path, but even there the `np=1` median is now effectively break-even rather than a clean win.
+- 9B UD-Q4 has the same short-case acceptance ratio as Q8, but replay is much larger and the end-to-end result stays negative.
+- 27B still shows the same dense scaling problem: lower acceptance and a much more expensive accept+replay path.
+- The A3B quants are exact again on `np=1`, and their replay bucket on this short case is modest, but baseline decode is so fast that even modest speculative overhead stays net negative.
+
+### Bad `np=2`
+
+| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-9B UD-Q4_K_XL | `126/182 (0.692)` | `91.303` | `581.841` | `143.500` | `4463.2` |
+| Qwen3.5-9B Q8_0 | `126/184 (0.685)` | `117.090` | `663.657` | `82.937` | `4644.1` |
+| Qwen3.5-27B UD-Q4_K_XL | `140/184 (0.761)` | `127.729` | `958.105` | `395.062` | `7962.4` |
+| Qwen3.5-35B-A3B Q4_K_M | `141/183 (0.770)` | `316.863` | `394.586` | `185.392` | `4822.4` |
+| Qwen3.5-35B-A3B Q5_K_M | `147/183 (0.803)` | `314.705` | `389.498` | `174.579` | `4725.2` |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | `158/183 (0.863)` | `316.775` | `387.955` | `122.578` | `4496.7` |
+
+Bad `np=2` interpretation:
+
+- 27B remains the clearest dense regression: even with better acceptance than the 9B bad cases, accept and replay are still too expensive.
+- The A3B quants are not primarily limited by replay alone; they are already so fast in baseline mode that even moderate draft + accept overhead is too expensive.
+- The balanced `Q4_K_M` GGUF is no longer a correctness outlier after the post-replay guard, but its throughput is still materially below baseline.
+
+## Current Conclusions
+
+- The current native-MTP implementation is now benchmark-clean for:
+  - `Qwen3.5-9B`, `Qwen3.5-27B`, and the checked `Qwen3.5-35B-A3B` quants on `np=1` correctness
+  - `Qwen3.5-35B-A3B Q4_K_M` after the post-replay guard fix
+  - `Qwen3.5-9B q8_0` as the only current net-positive path, but only on the easier `np=2` cases
+- The current implementation is not yet benchmark-good for:
+  - any checked `np=1` end-to-end win
+  - broad dense-model speedups across quants
+  - 27B throughput
+  - MoE throughput
+  - `Qwen3.5-35B-A3B Q4_K_M` throughput even after the exactness fix
+
+Practical reading:
+
+- if the target is “ship a native-MTP case that is actually faster today”, the only clean answer from this matrix is still `Qwen3.5-9B q8_0`, and only on the easier `np=2` cases
+- if the target is “make native MTP broadly speed-positive”, the next optimization work has to reduce real control-path cost, especially accept and replay, while preserving the `np=1` exactness contract
+
+## Raw Artifacts
+
+Per-model JSON summaries:
+
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q4_k_m.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q5_k_m.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-ud-q4.json`
+
+Each JSON also points at its per-scenario log directory under `/tmp`.
+
+## Related Notes
+
+- [native-mtp-optimization-plan.md](native-mtp-optimization-plan.md)
+- [native-mtp-model-prep.md](native-mtp-model-prep.md)
+
+
+
+
+================================================================
+End of Codebase
+================================================================

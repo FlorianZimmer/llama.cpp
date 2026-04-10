@@ -1,242 +1,206 @@
 # Native MTP Benchmarks
 
+Bench date: 2026-04-10
+
+This note records the current end-to-end CUDA benchmark state for native MTP on the prepared Qwen 3.5 GGUFs under `/mnt/models`.
+
 ## Benchmark Protocol
 
-The native-MTP optimization path should be benchmark-gated by end-to-end tok/s, not by internal phase timing alone.
-
-Required gate for any kept optimization:
-
-- compare against greedy baseline on the same model and case
-- compare against the immediately previous native-MTP step
+- judge every change by end-to-end tok/s, not phase timing alone
+- compare native MTP against greedy baseline on the same model and prompt
 - require exact `np=1` output match to greedy baseline
-- treat `np>1` on hybrid/recurrent native-MTP as stability-only, not strict exactness
-- ignore sub-1% movement unless it repeats consistently
+- treat `np>1` as stability-only on the current hybrid/recurrent path
+- ignore small movement unless it repeats across the 3-run median
+- keep per-step native-MTP timing visible with `LLAMA_SERVER_MTP_PROFILE=1`
 
-Current dense-CUDA primary gate:
+Authoritative harness:
 
-- model: `/mnt/models/GGUF/Qwen3.5-9B-MTP-UD-Q4_K_XL.gguf`
-- case: `primary`
-- prompt: `Write one short sentence about Berlin.`
-- seed: `42`
-- `n_predict=12`
-- `-np 1`
-- `draft-max=1`
-- `threads=4`
-- `threads-batch=4`
+- [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py)
 
-Supporting CUDA gates:
+The harness now parses two native-MTP profile signals:
 
-- `good`: Moon exact/stable case
-- `bad`: Rust replay-heavy stability case
-
-The authoritative harness for this protocol is [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py), which now supports repeated runs, structured JSON output, optional profile parsing, and relaxed `np>1` validation for the documented hybrid/recurrent limitation.
-
-## Current Optimization Status
-
-Dense 9B CUDA optimization steps on top of the upstream-prep native-MTP path:
-
-| Step | Change | Primary `np=1` result | Status |
-| --- | --- | --- | --- |
-| 0 | Benchmark gate only | baseline `175.31`, mtp `162.54` | reference |
-| 1 | Greedy verifier-accept fast path | baseline `175.55`, mtp `164.12` | kept |
-| 2 | Dedicated MTP scheduler/result cache | no repeatable win | dropped |
-| 3 | Skip raw-logit downloads on token-only greedy verifier chunks | baseline `171.32`, mtp `167.04` on the primary gate; `np=2` short primary about break-even/slightly positive | kept |
-
-Notes:
-
-- Step 1 reduced accept-path overhead by bypassing the generic sampler path when direct greedy verifier tokens were already available.
-- The dedicated MTP scheduler experiment did not materially move the draft bucket under repeated measurement, so it was not kept.
-- Step 3 keeps the change generic: the server can disable raw-logit output only for decode chunks that are fully covered by the token-only native-MTP greedy path.
-
-Bench date: 2026-04-09
-
-Model:
-
-- `/mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf`
-
-Commit used for the code under test:
-
-- `01de729d4` (`native MTP: document np>1 exactness limits`)
-
-Backend availability on this host:
-
-- Benchmarked: CPU, CUDA
-- Not benchmarked here: Vulkan, HIP, SYCL, Metal
-
-Those other backends were not built or not available on this Linux machine, so the numbers below only cover the backends that were actually runnable in this environment.
-
-## PR-Ready Summary
-
-Native MTP for Qwen 3.5 is now wired end-to-end in llama.cpp: HF to GGUF conversion, model loading, runtime execution in a single verifier context, server integration, tests, and benchmark coverage. The current implementation is validated on the exact `-np 1` path and on some `-np 2` workloads, with measured speedups on both CPU and CUDA for exact cases.
-
-The main known limitation is still the documented hybrid/recurrent `-np > 1` exactness gap. On near-tie tokens, verifier numerics can change with batch shape across multiple live sequences, so native `mtp` can diverge from baseline greedy decode even when rollback and replay logic restore the correct model state after rejected drafts. That limitation is documented rather than hidden behind an incorrect exactness guarantee.
-
-On this host and model, CPU exact cases landed around `1.20x` to `1.53x`, while CUDA exact cases landed around `1.02x` to `1.23x`. The representative stress case remains CUDA Rust `np=2`, which still demonstrates the known exactness limitation and can also be slightly slower than baseline.
+- aggregate phase totals from `native MTP profile: ...`
+- per-step timing and acceptance from `native MTP step: ...`
 
 ## Method
+
+Backend:
+
+- CUDA only on this host
+- GPU: RTX 5090 32 GiB
+- binary: `build-cuda-server/bin/llama-server`
 
 Common settings:
 
 - `ctx-size=4096`
 - `batch-size=128`
 - `ubatch-size=128`
-- `draft-max=1`
-- baseline = normal greedy decode
-- mtp = `--spec-type mtp`
-
-Backend-specific settings:
-
-- CPU:
-  - binary: `build-server/bin/llama-server`
-  - `-ngl 0`
-  - `-fa off`
-  - chosen config: `threads=32`, `threads-batch=32`
-- CUDA:
-  - binary: `build-cuda-server/bin/llama-server`
-  - `-ngl all`
-  - `-fa on`
-  - chosen config: `threads=4`, `threads-batch=4`
-
-The chosen per-backend configs came from a small tuning pass on the exact Berlin `np=2` case.
-
-## Tuning Pass
-
-CPU, Berlin, `np=2`, `n_predict=48`:
-
-- `t=8 tb=8`: exact, baseline `6.40 / 6.40 tok/s`, mtp `9.56 / 9.56 tok/s`
-- `t=16 tb=16`: not exact, baseline `8.62 / 8.62 tok/s`, mtp `10.85 / 10.51 tok/s`
-- `t=32 tb=32`: exact, baseline `7.56 / 7.70 tok/s`, mtp `11.41 / 11.41 tok/s`
-
-CUDA, Berlin, `np=2`, `n_predict=48`:
-
-- `t=4 tb=4`: exact, baseline `127.96 / 132.01 tok/s`, mtp `160.56 / 161.00 tok/s`
-- `t=8 tb=8`: exact, baseline `128.09 / 132.20 tok/s`, mtp `130.84 / 136.37 tok/s`
-- `t=12 tb=12`: exact, baseline `131.72 / 131.42 tok/s`, mtp `133.20 / 138.94 tok/s`
-
-## Full Matrix
-
-### CPU
-
-Config:
-
-- `build-server/bin/llama-server`
-- `-ngl 0`
-- `-fa off`
-- `threads=32`
-- `threads-batch=32`
-
-| Case | `-np` | Exact | Baseline tok/s | MTP tok/s | Speedup |
-| --- | ---: | --- | --- | --- | --- |
-| Berlin, seed 42, `n_predict=48` | 1 | yes | `8.08` | `12.40` | `1.53x` |
-| Berlin, seed 42, `n_predict=48` | 2 | yes | `7.77 / 7.77` | `11.22 / 11.22` | `1.44x` mean |
-| Moon, seed 31415, `n_predict=64` | 1 | yes | `7.61` | `10.20` | `1.34x` |
-| Moon, seed 31415, `n_predict=64` | 2 | yes | `7.55 / 7.55` | `9.79 / 9.80` | `1.30x` mean |
-| Rust, seed 777, `n_predict=64` | 1 | yes | `8.28` | `9.96` | `1.20x` |
-| Rust, seed 777, `n_predict=64` | 2 | yes on this run | `7.49 / 7.49` | `9.31 / 9.31` | `1.24x` mean |
-
-Observed CPU range:
-
-- exact cases measured here: `1.20x` to `1.53x`
-
-### CUDA
-
-Config:
-
-- `build-cuda-server/bin/llama-server`
-- `-ngl all`
-- `-fa on`
 - `threads=4`
 - `threads-batch=4`
+- `-ngl all`
+- `-fa on`
+- `draft-max=1`
+- repeats: `3`
+- cases: `primary`, `good`, `bad`
+- `-np`: `1`, `2`
 
-| Case | `-np` | Exact | Baseline tok/s | MTP tok/s | Speedup |
-| --- | ---: | --- | --- | --- | --- |
-| Berlin, seed 42, `n_predict=48` | 1 | yes | `148.69` | `173.37` | `1.17x` |
-| Berlin, seed 42, `n_predict=48` | 2 | yes | `128.29 / 132.26` | `160.44 / 160.88` | `1.23x` mean |
-| Moon, seed 31415, `n_predict=64` | 1 | yes | `148.65` | `151.79` | `1.02x` |
-| Moon, seed 31415, `n_predict=64` | 2 | yes | `131.10 / 131.32` | `141.07 / 140.74` | `1.07x` mean |
-| Rust, seed 777, `n_predict=64` | 1 | yes | `148.45` | `146.60` | `0.99x` |
-| Rust, seed 777, `n_predict=64` | 2 | no | `128.61 / 131.33` | `127.63 / 127.84` | `0.98x` mean |
+Cases:
 
-Observed CUDA range:
+- `primary`: `Write one short sentence about Berlin.`, seed `42`, `n_predict=12`
+- `good`: `Write two short sentences about the Moon.`, seed `31415`, `n_predict=64`
+- `bad`: `List three reasons Rust is used for systems programming.`, seed `777`, `n_predict=64`
 
-- exact cases measured here: `1.02x` to `1.23x`
-- known stress failure here: Rust, `np=2`
+Benchmarked models:
 
-## Takeaways
-
-- CPU showed the largest upside on this host for the selected exact configurations, roughly `+20%` to `+53%`.
-- CUDA improved clearly on the short/medium exact cases, but the gain was smaller, roughly `+2%` to `+23%`.
-- The known hybrid/recurrent `np > 1` exactness limitation is still real on CUDA. The Rust `np=2` case remained a representative failure and was also slightly slower than baseline.
-- On exact workloads, native MTP is already useful on both CPU and CUDA with this model, but the benefit is workload-dependent and should not be treated as a universal speedup.
-- The current native-MTP runtime is intentionally single-step even when GGUF metadata can represent more than one predictor layer. Extending it to recursive multi-step drafting should be possible within the current architecture, but it is follow-up runtime/model work rather than something already proven by the current branch.
-
-## Qwen3.5-35B-A3B MoE Check
-
-The native MTP path also works functionally on `Qwen3.5-35B-A3B`, but it did not show a speedup on this host after fixing the GGUF conversion bug in the shared MTP RMSNorm tensors.
-
-Checked models:
-
-- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-bf16-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-9B-MTP-UD-Q4_K_XL.gguf`
+- `/mnt/models/GGUF/Qwen3.5-9B-MTP-q8_0.gguf`
+- `/mnt/models/GGUF/Qwen3.5-27B-MTP-UD-Q4_K_XL.gguf`
 - `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf`
 - `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q5_K_M-fixed.gguf`
-- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-UD-Q4_K_XL.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-UD-Q4_K_XL-fixed.gguf`
 
-Representative CUDA results:
+## Headline Result
 
-| Case | `-np` | Baseline tok/s | MTP tok/s | Draft / accepted | Outcome |
-| --- | ---: | --- | --- | --- | --- |
-| Berlin, Q5_K_M fixed, `n_predict=48` | 1 | `234.11` | `172.16` | `15 / 13` | correct, slower |
-| Moon, Q5_K_M fixed, `n_predict=48` | 1 | `234.60` | `179.24` | `13 / 11` | correct, slower |
-| Berlin, UD Q4_K_XL, `n_predict=12` | 1 | `200.75` | `124.36` | `7 / 4` | correct, slower |
+- This 3-repeat matrix includes the landed hybrid/recurrent post-replay guard fix.
+- No checked model or quant is net-positive on `np=1` in the current 3-repeat median.
+- `Qwen3.5-9B q8_0` is still the only checked path with repeatable net-positive wins, but only on the easier `np=2` cases:
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere in the current sweep.
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere, though less catastrophically than in the pre-fix sweep.
+- `Qwen3.5-35B-A3B` is now `np=1` exact across the checked quants, including the balanced `Q4_K_M` GGUF, but remains substantially slower than baseline.
 
 Interpretation:
 
-- this is no longer a GGUF metadata/tensor preservation issue;
-- the zero-acceptance cliff was caused by the converter bug and disappeared after the fix;
-- the remaining slowdown appears to be a runtime economics issue: `Qwen3.5-35B-A3B` is already a fast active-parameter MoE model on this GPU, and with only one native predictor layer the saved verifier work is too small to amortize the extra draft + accept path cost;
-- so the MoE path is still worth keeping as functionality, but this model should not currently be presented as a speed-positive native-MTP case.
+- the current single-token native-MTP upside is real on the 9B Q8 path
+- no checked path is currently an `np=1` end-to-end win
+- once verifier economics get worse for the model or quant, draft + accept + replay overhead dominates quickly
+- the larger dense and MoE cases are not blocked on “more benchmarking”; they are blocked on control-path economics and, for some quants, acceptance quality / exactness
 
-## Speedup Backlog
+## Full Matrix
 
-The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
+### Primary
 
-### Priority 1: Backend-resident MTP seed path
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `175.91` | `159.01` | `0.904x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `165.77` | `149.86` | `0.904x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `150.53` | `150.31` | `0.999x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `127.85` | `133.26` | `1.042x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `72.35` | `62.27` | `0.861x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `57.34` | `50.05` | `0.873x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `228.26` | `170.72` | `0.748x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `154.35` | `59.16` | `0.383x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `221.34` | `167.90` | `0.759x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `150.87` | `58.45` | `0.387x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `202.80` | `129.34` | `0.638x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `145.57` | `69.83` | `0.480x` | stability-only |
 
-- expected gain: roughly `+5%` to `+15%` on good CUDA workloads if implemented cleanly
-- scope: medium to high
-- reason: the native MTP path still copies the verifier hidden row back to host memory and then uploads it again as the MTP seed input
-- current status: explored, but not landed; the first view-based device-copy prototype was not stable enough for `np=1/2`, so the current tree keeps the safer host-backed path
+### Good
 
-### Priority 2: Adaptive native-MTP backoff on replay-heavy prompts
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.94` | `167.83` | `0.857x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.82` | `145.65` | `0.895x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `148.62` | `139.40` | `0.938x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `132.66` | `137.12` | `1.034x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.94` | `61.48` | `0.867x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `59.26` | `55.09` | `0.930x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `243.16` | `163.47` | `0.672x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `170.04` | `74.49` | `0.438x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `234.38` | `174.36` | `0.744x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `180.66` | `93.19` | `0.516x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `220.52` | `151.49` | `0.687x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `160.53` | `94.02` | `0.586x` | stability-only |
 
-- expected gain: large on bad prompts, little or no change on good prompts
-- scope: medium
-- reason: once snapshotting was removed, replay became the dominant bad-case overhead on rejection-heavy prompts like the Rust stress case
-- risk: any adaptive policy has to stay understandable and upstream-friendly; it should not silently trade correctness or make the server behavior hard to reason about
+### Bad
 
-### Priority 3: Replay-path reduction
+| Model | `-np` | Baseline tok/s | MTP tok/s | Speedup | `np=1` exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `195.39` | `162.72` | `0.833x` | yes |
+| Qwen3.5-9B UD-Q4_K_XL | 2 | `162.59` | `133.78` | `0.823x` | stability-only |
+| Qwen3.5-9B Q8_0 | 1 | `148.82` | `125.10` | `0.841x` | yes |
+| Qwen3.5-9B Q8_0 | 2 | `132.99` | `115.83` | `0.871x` | stability-only |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `70.87` | `63.97` | `0.903x` | yes |
+| Qwen3.5-27B UD-Q4_K_XL | 2 | `58.64` | `53.61` | `0.914x` | stability-only |
+| Qwen3.5-35B-A3B Q4_K_M | 1 | `251.70` | `177.53` | `0.705x` | yes |
+| Qwen3.5-35B-A3B Q4_K_M | 2 | `190.39` | `108.20` | `0.568x` | stability-only |
+| Qwen3.5-35B-A3B Q5_K_M | 1 | `243.17` | `174.54` | `0.718x` | yes |
+| Qwen3.5-35B-A3B Q5_K_M | 2 | `186.98` | `111.72` | `0.597x` | stability-only |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 1 | `224.48` | `174.48` | `0.777x` | yes |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | 2 | `167.94` | `128.60` | `0.766x` | stability-only |
 
-- expected gain: modest on exact/easy prompts, more meaningful on prompts with lower draft acceptance
-- scope: medium to high
-- reason: replay is now the second largest remaining native-MTP overhead on many CUDA runs
-- examples: cheaper replay batching, less redundant verifier work after rejection, or avoiding replay entirely on cases where the state can be proven equivalent
+## Per-Step Native-MTP Profile
 
-### Priority 4: Small server hot-path cleanup
+These tables come from the new per-step `native MTP step:` profile parsing. Totals are aggregate MTP-only time across the 3 repeats for the given case and `-np`, while `mean step total us` is the average end-to-end cost of one speculative step after draft/snapshot/accept/restore/replay are combined.
 
-- expected gain: low
-- scope: small
-- reason: there are still per-step container/setup costs in the server loop, but the current profile says they are not the main bottleneck anymore
+### Primary `np=1`
 
-## Raw Logs
+| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-9B UD-Q4_K_XL | `12/15 (0.800)` | `21.212` | `75.516` | `30.801` | `8503.1` |
+| Qwen3.5-9B Q8_0 | `12/15 (0.800)` | `23.585` | `99.580` | `8.597` | `8785.1` |
+| Qwen3.5-27B UD-Q4_K_XL | `9/15 (0.600)` | `24.823` | `129.636` | `48.043` | `13502.1` |
+| Qwen3.5-35B-A3B Q4_K_M | `12/15 (0.800)` | `17.023` | `54.279` | `13.234` | `5637.1` |
+| Qwen3.5-35B-A3B Q5_K_M | `12/15 (0.800)` | `17.124` | `55.569` | `13.250` | `5730.9` |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | `9/15 (0.600)` | `18.619` | `58.111` | `23.066` | `6654.7` |
 
-Representative logs from the full matrix are under:
+Primary `np=1` interpretation:
 
-- `/tmp/mtp-bench-cpu-*`
-- `/tmp/mtp-bench-cuda-*`
-- summary JSON: `/tmp/mtp-bench-results.json`
+- 9B Q8 still has the smallest replay bucket on the dense path, but even there the `np=1` median is now effectively break-even rather than a clean win.
+- 9B UD-Q4 has the same short-case acceptance ratio as Q8, but replay is much larger and the end-to-end result stays negative.
+- 27B still shows the same dense scaling problem: lower acceptance and a much more expensive accept+replay path.
+- The A3B quants are exact again on `np=1`, and their replay bucket on this short case is modest, but baseline decode is so fast that even modest speculative overhead stays net negative.
+
+### Bad `np=2`
+
+| Model | Acceptance | Draft ms | Accept ms | Replay ms | Mean step total us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-9B UD-Q4_K_XL | `126/182 (0.692)` | `91.303` | `581.841` | `143.500` | `4463.2` |
+| Qwen3.5-9B Q8_0 | `126/184 (0.685)` | `117.090` | `663.657` | `82.937` | `4644.1` |
+| Qwen3.5-27B UD-Q4_K_XL | `140/184 (0.761)` | `127.729` | `958.105` | `395.062` | `7962.4` |
+| Qwen3.5-35B-A3B Q4_K_M | `141/183 (0.770)` | `316.863` | `394.586` | `185.392` | `4822.4` |
+| Qwen3.5-35B-A3B Q5_K_M | `147/183 (0.803)` | `314.705` | `389.498` | `174.579` | `4725.2` |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | `158/183 (0.863)` | `316.775` | `387.955` | `122.578` | `4496.7` |
+
+Bad `np=2` interpretation:
+
+- 27B remains the clearest dense regression: even with better acceptance than the 9B bad cases, accept and replay are still too expensive.
+- The A3B quants are not primarily limited by replay alone; they are already so fast in baseline mode that even moderate draft + accept overhead is too expensive.
+- The balanced `Q4_K_M` GGUF is no longer a correctness outlier after the post-replay guard, but its throughput is still materially below baseline.
+
+## Current Conclusions
+
+- The current native-MTP implementation is now benchmark-clean for:
+  - `Qwen3.5-9B`, `Qwen3.5-27B`, and the checked `Qwen3.5-35B-A3B` quants on `np=1` correctness
+  - `Qwen3.5-35B-A3B Q4_K_M` after the post-replay guard fix
+  - `Qwen3.5-9B q8_0` as the only current net-positive path, but only on the easier `np=2` cases
+- The current implementation is not yet benchmark-good for:
+  - any checked `np=1` end-to-end win
+  - broad dense-model speedups across quants
+  - 27B throughput
+  - MoE throughput
+  - `Qwen3.5-35B-A3B Q4_K_M` throughput even after the exactness fix
+
+Practical reading:
+
+- if the target is “ship a native-MTP case that is actually faster today”, the only clean answer from this matrix is still `Qwen3.5-9B q8_0`, and only on the easier `np=2` cases
+- if the target is “make native MTP broadly speed-positive”, the next optimization work has to reduce real control-path cost, especially accept and replay, while preserving the `np=1` exactness contract
+
+## Raw Artifacts
+
+Per-model JSON summaries:
+
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q4_k_m.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q5_k_m.json`
+- `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-ud-q4.json`
+
+Each JSON also points at its per-scenario log directory under `/tmp`.
 
 ## Related Notes
 
-For model selection, GGUF preservation checks, quantization guidance, and a reusable external-AI prep prompt, see:
-
+- [native-mtp-optimization-plan.md](native-mtp-optimization-plan.md)
 - [native-mtp-model-prep.md](native-mtp-model-prep.md)

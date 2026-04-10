@@ -1,6 +1,6 @@
 # Native MTP Optimization Plan
 
-This plan is for the current private native-MTP branch, with the goal of recovering end-to-end CUDA throughput on the dense 9B `UD-Q4_K_XL` quant while staying maintainable and upstream-friendly.
+This plan is for the current private native-MTP branch, with the goal of turning native MTP into a real end-to-end CUDA win on the dense Qwen 3.5 path while staying maintainable and upstream-friendly.
 
 ## Constraints
 
@@ -15,22 +15,43 @@ This plan is for the current private native-MTP branch, with the goal of recover
 
 ## Current Problem
 
-On the dense 9B `UD-Q4_K_XL` CUDA case, native MTP is functionally correct but slower than baseline on the primary short exact run:
+The 2026-04-10 CUDA matrix in [native-mtp-benchmarks.md](native-mtp-benchmarks.md) changed the optimization target from “make 9B UD-Q4 less bad” to “explain why nothing is `np=1` speed-positive and why only 9B Q8 wins on the easier `np=2` cases”.
 
-- baseline `np=1`: about `175 tok/s`
-- native MTP `np=1`: about `161.5 tok/s`
-- acceptance: about `5 / 6`
-- measured overhead on that run:
-  - `draft ~= 12.1 ms`
-  - `accept ~= 32.2 ms`
-  - `replay ~= 10.5 ms`
+Current state:
+
+- `Qwen3.5-9B q8_0` is still the only checked model/quant with repeatable net-positive wins, but only on the easier `np=2` cases:
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+  - `primary np=1` is now effectively break-even: `150.53 -> 150.31 tok/s` (`0.999x`)
+- `Qwen3.5-9B UD-Q4_K_XL` stays slightly slower even though short-run acceptance is still strong:
+  - `primary np=1`: `175.91 -> 159.01 tok/s` (`0.904x`)
+  - profile totals there: `draft ~= 21.2 ms`, `accept ~= 75.5 ms`, `replay ~= 30.8 ms`
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere and especially bad on `np=2`:
+  - `primary np=1`: `72.35 -> 62.27 tok/s`
+  - `bad np=2`: `58.64 -> 53.61 tok/s`
+- `Qwen3.5-35B-A3B` is still slower on every checked quant.
+- `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again on the checked CUDA cases after a permanent one-step post-replay guard was added for hybrid/recurrent native-MTP slots, but it is still far from speed-positive.
 
 Interpretation:
 
-- the path is overhead-limited, not acceptance-limited
-- the accept path is the first real bottleneck to attack
-- replay is the next real cliff on bad prompts
-- the backend-resident seed path already landed and should not be reopened as a standalone optimization project unless later evidence changes
+- the remaining problem is still runtime economics, not just “does the model expose an MTP head”
+- the current single-token draft can pay off on a favorable dense quant (`9B q8_0`), but the margin is small
+- accept cost is still the first recurring bottleneck on the good path
+- replay is the main bad-prompt cliff on the larger dense path
+- MoE is currently a functionality target, not a speed target
+- the backend-resident seed path already landed and should not be reopened as a standalone project unless later evidence changes
+
+A3B correctness side note:
+
+- the A3B `Q4_K_M` exactness failure is now narrowed beyond quant quality alone:
+  - promoting `blk.40.nextn.eh_proj.weight` from `Q4_K` to `Q5_K` was the right balanced GGUF fix, but it did not clear `bad np=1`
+  - disabling the greedy accept fast path also did not clear it
+  - tracing showed the model is on the hybrid recurrent-backup restore path and that the first replayed verifier logits still match baseline
+  - exactness came back when the first speculative step after replay was skipped once
+- that diagnosis is now codified as the current conservative fix:
+  - hybrid/recurrent native-MTP slots force one plain verifier step immediately after replay
+  - this restores the `np=1` lossless contract on the checked A3B `Q4_K_M` cases without special-casing Qwen or MoE by name
+  - the deeper follow-up, if we want it, is to explain why the first speculative verifier batch after replay is not baseline-equivalent and then remove or relax the guard
 
 ## Priority Order
 
@@ -46,6 +67,7 @@ Required output from the harness:
 - repeated baseline vs native-MTP comparisons
 - JSON output
 - optional `LLAMA_SERVER_MTP_PROFILE=1` parsing
+- per-step `native MTP step:` parsing so acceptance and draft/accept/replay cost can be tracked per speculative step
 - comparison against greedy baseline and, optionally, a previous native-MTP JSON result
 
 Fixed CUDA cases:
@@ -113,7 +135,11 @@ Why this is next:
 Status:
 
 - landed locally after step 2
-- result: another small but repeatable `np=1` gain on the dense 9B CUDA gate, plus break-even/slightly positive behavior on the short primary `np=2` case
+- result: another small but repeatable `np=1` gain on the dense 9B CUDA gate
+- current reading after the wider model sweep:
+  - enough to make `9B q8_0` speed-positive on the easier `np=2` cases
+  - not enough to rescue `9B UD-Q4_K_XL`
+  - nowhere near enough for 27B or the current A3B quants
 ### 4. Check draft-path hot reuse before redesigning it
 
 Primary target:
@@ -153,6 +179,14 @@ Purpose:
 
 - reduce bad-prompt thrash without destabilizing the good exact path
 
+Why this is now more urgent:
+
+- 27B `bad np=2` still spent `~395 ms` in replay across 3 repeats, versus only `~128 ms` in draft
+- even on 9B Q8 the bad case is clearly negative, so bad-prompt replay still blocks “broadly positive” behavior
+- the same cooldown shape is also now a correctness diagnostic on A3B:
+  - skipping exactly one post-replay speculative step restored `bad np=1` exactness there
+  - that has now been promoted from a debug probe to the current permanent hybrid/recurrent correctness guard
+
 ### 6. Keep only small hot-path cleanups that beat noise
 
 Primary targets:
@@ -189,4 +223,4 @@ Not worth doing yet:
 - MoE-specific speed tuning as the main optimization track
 - tiny container cleanup before accept/replay/draft-reuse work
 
-Those are follow-up options only if the single-token dense 9B path becomes speed-positive first.
+Those are follow-up options only after the dense path is broadly speed-positive beyond the current `9B q8_0` `np=2` niche.

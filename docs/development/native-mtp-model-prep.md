@@ -77,6 +77,7 @@ Practical approach:
 - use a donor quant layout when possible
 - build an imatrix first
 - then quantize with explicit tensor overrides
+- treat native-MTP tensors as a separate quality gate, not as “just another small tail tensor”
 
 ### MoE models
 
@@ -89,6 +90,65 @@ Lessons from `Qwen3.5-35B-A3B`:
 - a naive `quant_clone` style path can miss MoE-specific expert tensors
 - that can silently produce the wrong quantization plan
 - use a MoE-aware tensor-type map that includes all relevant expert tensors
+
+## MTP Tensor Quality Pass
+
+For the current `qwen35` and `qwen35moe` native-MTP models, the MTP-specific tensor set is small:
+
+- `*.nextn.eh_proj.weight`
+- `*.nextn.enorm.weight`
+- `*.nextn.hnorm.weight`
+- `*.nextn.shared_head_norm.weight`
+
+In the GGUFs prepared so far:
+
+- the three `*.norm.weight` tensors already stay `F32`
+- the only quantized MTP tensor is `*.nextn.eh_proj.weight`
+
+That makes MTP quality tuning much simpler than a full-model dynamic quant pass: the main question is how aggressively `*.nextn.eh_proj.weight` can be quantized before native-MTP exactness or acceptance degrades.
+
+Use the repo-local audit script to compare candidate quants against a BF16 reference and emit a `llama-quantize --tensor-type-file` override:
+
+```bash
+./.venv-tests/bin/python scripts/audit_mtp_quantization.py \
+  --reference /mnt/models/GGUF/<MODEL>-MTP-bf16.gguf \
+  --candidate q4=/mnt/models/GGUF/<MODEL>-MTP-Q4_K_M.gguf \
+  --candidate q5=/mnt/models/GGUF/<MODEL>-MTP-Q5_K_M.gguf \
+  --candidate q8=/mnt/models/GGUF/<MODEL>-MTP-UD-Q4_K_XL.gguf \
+  --baseline q4 \
+  --write-balanced-type-file /tmp/<MODEL>-mtp-balanced.tensor-types.txt \
+  --write-strict-type-file /tmp/<MODEL>-mtp-strict.tensor-types.txt
+```
+
+Current default thresholds in the script:
+
+- balanced:
+  - `rel_rmse <= 0.05`
+  - `cosine >= 0.999`
+- strict:
+  - `rel_rmse <= 0.02`
+  - `cosine >= 0.9999`
+
+Interpretation:
+
+- balanced is the recommended default for “best quality / size tradeoff”
+- strict is for exactness-first experiments where a few extra MiB on the MTP head are acceptable
+
+If the audit recommends a promotion, quantize from BF16 with the generated override file:
+
+```bash
+build/bin/llama-quantize \
+  --imatrix /mnt/models/imatrix/<MODEL>.gguf \
+  --tensor-type-file /tmp/<MODEL>-mtp-balanced.tensor-types.txt \
+  /mnt/models/GGUF/<MODEL>-MTP-bf16.gguf \
+  /mnt/models/GGUF/<MODEL>-MTP-Q4_K_M-mtp-balanced.gguf \
+  Q4_K_M
+```
+
+Checked-in example override files:
+
+- [scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt](../../scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-balanced.tensor-types.txt)
+- [scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt](../../scripts/mtp_quant_overrides/qwen35moe-a3b-q4_k_m-strict.tensor-types.txt)
 
 ## Validation Contract
 
@@ -119,6 +179,7 @@ Interpret results carefully:
 
 - `np=1` exactness matters
 - `np>1` on the current hybrid/recurrent native-MTP runtime is stability-focused, not strict batch-invariant exactness
+- enable `--mtp-profile` when you need per-step acceptance and draft/accept/replay timing in the JSON output
 - draft activity should still be non-zero
 - speedup is workload-dependent and not guaranteed
 
@@ -139,10 +200,60 @@ This matters because `/mnt/models` can fill up quickly during BF16 and multi-qua
   - `qwen35`
   - `qwen35moe`
 - `Qwen3.5-9B` custom GGUF + quant path worked and preserved MTP correctly.
+- `Qwen3.5-27B` custom GGUF + quant path also worked and stayed `np=1` exact on the checked CUDA cases, but it was still speed-negative.
 - `Qwen3.5-35B-A3B` custom GGUF + quant path also worked functionally.
+- `Qwen3.5-35B-A3B Q4_K_M` showed that “MTP tensors preserved” is not enough by itself:
+  - it was still slow
+  - and it diverged from greedy baseline on the checked `bad np=1` CUDA case
+- A direct BF16-vs-quant MTP audit showed why `Qwen3.5-35B-A3B Q4_K_M` is special:
+  - all three `*.nextn.*norm.weight` tensors were already `F32`
+  - the only differing MTP tensor across the A3B quants was `blk.40.nextn.eh_proj.weight`
+  - `Q4_K_M` stored that tensor as `Q4_K`
+  - `Q5_K_M` stored it as `Q5_K`
+  - `UD-Q4_K_XL` stored it as `Q8_0`
+  - relative to BF16, the measured error on that tensor was:
+    - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
+    - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
+    - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.99996`
+  - the balanced recommendation is therefore to promote that tensor to at least `Q5_K` in the A3B `Q4_K_M` recipe
+- `Qwen3.5-27B-MTP-UD-Q4_K_XL` already stores `blk.64.nextn.eh_proj.weight` as `Q8_0`, so there is no obvious MTP-head under-quantization issue there.
+- `Qwen3.5-9B` no longer had a BF16 GGUF under `/mnt/models/GGUF` during this pass, so only a surrogate audit against the existing `q8_0` file was possible.
+- That surrogate audit still answered the important deployment question:
+  - both shipped 9B quants already store `blk.32.nextn.eh_proj.weight` as `Q8_0`
+  - so there is no pending balanced MTP-head promotion to apply on 9B
+- We rebuilt `Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf` with the balanced override and promoted:
+  - `blk.40.nextn.eh_proj.weight: Q4_K -> Q5_K`
+- That balanced rebuild is now the canonical `Q4_K_M` GGUF on disk.
+- The older pre-balanced backup was removed after the swap to recover disk space under `/mnt/models`.
+- Important caveat:
+  - the balanced rebuild improved the MTP tensor quality as intended
+  - but a narrow `bad np=1` validation still failed exactness
+  - so “balanced” is the right size/quality policy for the GGUF set, but it is not enough by itself to make A3B `Q4_K_M` a correctness-clean native-MTP target
+- Isolation result:
+  - disabling the greedy native-MTP accept fast path with a temporary debug gate did not fix the `bad np=1` divergence
+  - tracing showed `Qwen3.5-35B-A3B` is using the hybrid recurrent-backup restore path, not `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`
+  - the first replayed verifier logits after restore were still correct:
+    - replayed token `271` at `pos=10`
+    - replay top-1 next token `248068` with `p ~= 0.91`
+    - that matches the greedy baseline continuation at that point
+  - the divergence appeared on the first speculative step after replay:
+    - without any extra guard, native MTP continued `[271, 248068, 271, ...]`
+    - greedy baseline continued `[271, 248068, 198, ...]`
+  - a one-step temporary cooldown after replay restored exactness on both:
+    - the short traced repro
+    - the full `bad np=1` validation case
+  - that narrows the remaining A3B `Q4_K_M` issue further:
+    - restore+replay can rebuild a correct immediate next-token state
+    - the first speculative verifier batch after replay is the piece that breaks exactness on this model/quant
+- Fix now landed in the server:
+  - hybrid/recurrent native-MTP slots now always force one plain verifier step immediately after a replay
+  - that restored `np=1` exactness for the canonical A3B `Q4_K_M` GGUF on the checked `primary`, `good`, and `bad` CUDA cases
+  - the same guard stayed exact on the checked 9B and 27B dense references, and A3B `np=2` remained stability-clean in a smoke run
+  - the tradeoff is conservative: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
 - For MoE, the main issue was not “MTP is unsupported”; the main issue was preserving MTP tensors correctly and then accepting that runtime speedup may still be poor.
 - Community GGUFs cannot be trusted to preserve MTP unless verified explicitly.
-- A model can be a valid native-MTP functionality target without being a speed-positive target.
+- A model or quant can be a valid native-MTP functionality target without being a speed-positive target.
+- Every new quant still needs a real `np=1` exactness check; do not assume exactness transfers automatically across quants of the same model family.
 
 ## Paste-Ready Prompt For External AI
 

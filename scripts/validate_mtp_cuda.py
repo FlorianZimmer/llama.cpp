@@ -12,7 +12,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,20 @@ PROFILE_RE = re.compile(
 
 ACCEPTANCE_RE = re.compile(
     r"draft acceptance rate =\s*(?P<ratio>[\d.]+)\s*\(\s*(?P<accepted>\d+)\s+accepted /\s*(?P<generated>\d+)\s+generated\)"
+)
+
+STEP_RE = re.compile(
+    r"native MTP step:"
+    r" step=(?P<step>\d+)"
+    r" drafted=(?P<drafted>\d+)"
+    r" accepted=(?P<accepted>\d+)"
+    r" replay=(?P<replay>[01])"
+    r" draft=(?P<draft_us>\d+)\s+us"
+    r" snapshot=(?P<snapshot_us>\d+)\s+us"
+    r" accept=(?P<accept_us>\d+)\s+us"
+    r" restore=(?P<restore_us>\d+)\s+us"
+    r" replay_us=(?P<replay_us>\d+)"
+    r" total=(?P<total_us>\d+)\s+us"
 )
 
 CASE_PRESETS: dict[str, dict[str, Any]] = {
@@ -89,6 +103,7 @@ class ProfileTotals:
     total_ms: float = 0.0
     acceptance_generated: int = 0
     acceptance_accepted: int = 0
+    steps: list[dict[str, int]] = field(default_factory=list)
 
     def add_match(self, match: re.Match[str]) -> None:
         self.draft_ms += float(match.group("draft_ms"))
@@ -107,6 +122,22 @@ class ProfileTotals:
         self.acceptance_accepted += int(match.group("accepted"))
         self.acceptance_generated += int(match.group("generated"))
 
+    def add_step(self, match: re.Match[str]) -> None:
+        self.steps.append(
+            {
+                "step": int(match.group("step")),
+                "drafted": int(match.group("drafted")),
+                "accepted": int(match.group("accepted")),
+                "replay": int(match.group("replay")),
+                "draft_us": int(match.group("draft_us")),
+                "snapshot_us": int(match.group("snapshot_us")),
+                "accept_us": int(match.group("accept_us")),
+                "restore_us": int(match.group("restore_us")),
+                "replay_us": int(match.group("replay_us")),
+                "total_us": int(match.group("total_us")),
+            }
+        )
+
     def per_call(self, total: float, calls: int) -> float | None:
         return None if calls == 0 else total / calls
 
@@ -114,6 +145,23 @@ class ProfileTotals:
         acceptance_rate = None
         if self.acceptance_generated > 0:
             acceptance_rate = self.acceptance_accepted / self.acceptance_generated
+
+        step_count = len(self.steps)
+        step_drafted = sum(step["drafted"] for step in self.steps)
+        step_accepted = sum(step["accepted"] for step in self.steps)
+        step_acceptance_rate = None if step_drafted == 0 else step_accepted / step_drafted
+        step_totals_us = {
+            "draft": sum(step["draft_us"] for step in self.steps),
+            "snapshot": sum(step["snapshot_us"] for step in self.steps),
+            "accept": sum(step["accept_us"] for step in self.steps),
+            "restore": sum(step["restore_us"] for step in self.steps),
+            "replay": sum(step["replay_us"] for step in self.steps),
+            "total": sum(step["total_us"] for step in self.steps),
+        }
+        step_mean_us = {
+            key: None if step_count == 0 else value / step_count
+            for key, value in step_totals_us.items()
+        }
 
         return {
             "totals_ms": {
@@ -143,6 +191,16 @@ class ProfileTotals:
                 "generated": self.acceptance_generated,
                 "rate": acceptance_rate,
             },
+            "step_summary": {
+                "count": step_count,
+                "drafted": step_drafted,
+                "accepted": step_accepted,
+                "replay_steps": sum(step["replay"] for step in self.steps),
+                "acceptance_rate": step_acceptance_rate,
+                "totals_us": step_totals_us,
+                "mean_us": step_mean_us,
+            },
+            "steps": self.steps,
         }
 
 
@@ -285,6 +343,9 @@ def parse_profile(log_path: Path) -> ProfileTotals | None:
     for match in ACCEPTANCE_RE.finditer(text):
         profile.add_acceptance(match)
 
+    for match in STEP_RE.finditer(text):
+        profile.add_step(match)
+
     return profile if matched else None
 
 
@@ -420,7 +481,8 @@ def print_result(res: ScenarioResult) -> None:
         print(f"  req{idx}: {describe_response(resp)}")
         print(f"  req{idx}: content={resp['content']!r}")
     if res.profile:
-        print(f"  profile={json.dumps(res.profile.to_dict(), sort_keys=True)}")
+        profile_dict = res.profile.to_dict()
+        print(f"  profile={json.dumps({k: v for k, v in profile_dict.items() if k != 'steps'}, sort_keys=True)}")
     print(f"  log={res.log_path}")
 
 
@@ -458,6 +520,7 @@ def aggregate_mode(results: list[ScenarioResult]) -> dict[str, Any]:
         profile_totals.total_ms += res.profile.total_ms
         profile_totals.acceptance_accepted += res.profile.acceptance_accepted
         profile_totals.acceptance_generated += res.profile.acceptance_generated
+        profile_totals.steps.extend(res.profile.steps)
 
     data: dict[str, Any] = {
         "repeat_count": len(results),

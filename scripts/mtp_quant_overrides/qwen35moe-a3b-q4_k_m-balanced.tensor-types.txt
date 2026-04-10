@@ -1,0 +1,1 @@
+^blk\.40\.nextn\.eh_proj\.weight$=Q5_K
