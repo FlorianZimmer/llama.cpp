@@ -10,6 +10,52 @@
 
 LLM inference in C/C++
 
+## Fork Status
+
+This fork includes an experimental native multi-token prediction (`mtp`) line of work for dense Qwen 3.5 models.
+That work is currently on hold.
+
+The important practical result is:
+
+- the native-MTP path works correctly on the prepared dense Qwen 3.5 models under the current `np=1` single-user contract;
+- exactness and end-to-end validation pass on the kept dense path;
+- the measured speedup is narrow and model-dependent rather than broad.
+
+What currently survives repeated end-to-end benchmarking:
+
+- `Qwen3.5-9B q8_0` shows a real `np=1` gain with the current one-token native-MTP path;
+- `Qwen3.5-9B UD-Q4_K_XL` improves versus the earlier native-MTP branch state, but is still not a broad win over greedy baseline;
+- `Qwen3.5-27B UD-Q4_K_XL` also improves versus earlier native-MTP branch states, but still loses to greedy baseline and remains regression-only coverage.
+
+Why this work is paused:
+
+- the current runtime is intentionally limited to one drafted token per verifier step, so the draft-side work does not amortize enough on the harder dense targets;
+- the obvious server-local wins are already mostly exhausted, including the accept fast path and logit-suppression path;
+- the remaining cost is structural: speculative state is still managed through restore / replay behavior instead of an explicit forked branch-state design inside `libllama`;
+- that means accepted work is not committed as cheaply as it is in systems built around deeper speculative state management.
+
+What we learned from this branch:
+
+- native MTP in llama.cpp is functionally viable for dense Qwen 3.5 under a narrow exact `np=1` setup;
+- small qwen35-local graph optimizations can recover and extend a real gain on `Qwen3.5-9B q8_0`;
+- the same one-token design does not scale into a broad dense speedup story for `UD-Q4_K_XL` or `27B`;
+- replay guards, scheduler/cache ideas, verifier-fast-path hunting, and model-prep / quant-rescue passes did not unlock a broader result and should not be reopened as easy wins.
+
+Why this does not yet reach the speedup ceiling suggested by a "perfect" native-MTP implementation, or parity with runtimes such as vLLM and SGLang:
+
+- this fork does not yet have explicit speculative branch-state storage below the server loop;
+- it does not yet commit accepted speculative state through a deeper draft / verify / commit runtime path;
+- it does not yet use true multi-token native drafting beyond the current one-token contract.
+
+Those are the next real levers, but they are deeper runtime projects rather than small local optimizations.
+For now, the native-MTP work remains in the fork as a working, benchmarked experiment that is useful in a narrow dense-Qwen setup and paused elsewhere until that deeper runtime work is worth doing.
+
+Related notes:
+
+- [docs/speculative.md](docs/speculative.md)
+- [docs/development/native-mtp-optimization-plan.md](docs/development/native-mtp-optimization-plan.md)
+- [docs/development/native-mtp-benchmarks.md](docs/development/native-mtp-benchmarks.md)
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
