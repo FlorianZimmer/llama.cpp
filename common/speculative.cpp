@@ -499,6 +499,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     bool            mtp_only_ctx;
     std::shared_ptr<common_speculative_mtp_shared_state> shared_state;
     common_sampler * smpl;
+    llama_sampler  * smpl_backend;
     llama_batch batch;
     llama_tokens prompt_dft;
     std::vector<float> hidden_batch;
@@ -529,16 +530,22 @@ struct common_speculative_state_mtp : public common_speculative_state {
         , owns_ctx_dft(owns_ctx_dft)
         , mtp_only_ctx(mtp_only_ctx) {
         this->shared_state = std::move(shared_state);
-        common_params_sampling params;
-        params.no_perf = false;
-        params.backend_sampling = true;
-        params.top_k = 1;
-        params.samplers = {
+        common_params_sampling params_cpu;
+        params_cpu.no_perf = false;
+        params_cpu.top_k = 1;
+        params_cpu.samplers = {
             COMMON_SAMPLER_TYPE_TOP_K,
         };
 
-        smpl = common_sampler_init(llama_get_model(ctx_dft), params);
-        llama_set_sampler(ctx_dft, seq_id, common_sampler_get(smpl));
+        smpl = common_sampler_init(llama_get_model(ctx_dft), params_cpu);
+
+        auto params_backend = llama_sampler_chain_default_params();
+        params_backend.no_perf = false;
+
+        smpl_backend = llama_sampler_chain_init(params_backend);
+        llama_sampler_chain_add(smpl_backend, llama_sampler_init_greedy());
+        llama_set_sampler(ctx_dft, seq_id, smpl_backend);
+
         batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
     }
 
@@ -549,6 +556,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_free(ctx_dft);
         }
         common_sampler_free(smpl);
+        llama_sampler_free(smpl_backend);
         llama_batch_free(batch);
     }
 
@@ -705,8 +713,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
             ready_epoch = ++shared_state->output_epoch;
         }
 
-        common_sampler_reset(smpl);
-
         const llama_token backend_token = llama_get_sampled_token_ith(ctx_dft, ready_output_idx);
         if (backend_token != LLAMA_TOKEN_NULL) {
             if (params.p_min <= 1.0f) {
@@ -714,6 +720,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
             }
             return;
         }
+
+        common_sampler_reset(smpl);
 
         const llama_token token = common_sampler_sample(smpl, ctx_dft, ready_output_idx, true);
         const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1116,8 +1124,9 @@ static llama_context * common_speculative_create_mtp_context(
 
     llama_set_mtp_output(ctx_tgt, true);
 
-    auto cparams_mtp = llama_context_default_params();
-    const uint32_t n_batch_mtp = std::max<uint32_t>(2, params.n_max + 1);
+    auto cparams_mtp = params.cparams_dft;
+    const uint32_t mtp_depth = std::max<uint32_t>(1, (uint32_t) llama_model_mtp_depth_max(model_tgt));
+    const uint32_t n_batch_mtp = std::max<uint32_t>(2, std::min<uint32_t>(std::max<int32_t>(1, params.n_max), mtp_depth) + 1);
     const uint32_t n_batch_total = n_batch_mtp*std::max<uint32_t>(1, n_seq_max);
 
     cparams_mtp.n_ctx           = params.n_ctx > 0 ? params.n_ctx : llama_n_ctx(ctx_tgt);
@@ -1139,7 +1148,10 @@ static llama_context * common_speculative_create_mtp_context(
         return nullptr;
     }
 
-    llama_set_mtp_output(ctx_mtp, params.n_max > 1);
+    // The current native MTP runtime only consumes logits from the sidecar context.
+    // Exporting hidden states here adds an extra device-to-host copy on GPU backends
+    // without enabling additional draft depth.
+    llama_set_mtp_output(ctx_mtp, false);
 
     return ctx_mtp;
 }
@@ -1285,7 +1297,7 @@ common_speculative_verifier::common_speculative_verifier(llama_context * ctx_tgt
     , mem_tgt(llama_get_memory(ctx_tgt))
     , seq_id(seq_id)
     , can_seq_rm_partial(mem_tgt && llama_memory_can_seq_rm_partial(mem_tgt))
-    , use_full_state(false)
+    , use_full_state(!can_seq_rm_partial)
     , batch_replay(llama_batch_init(std::max<int32_t>(1, (int32_t) llama_n_batch(ctx_tgt)), 0, 1)) {
 }
 

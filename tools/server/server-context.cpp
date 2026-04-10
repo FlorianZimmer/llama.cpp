@@ -700,6 +700,8 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+        } else if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            params_base.speculative.cparams_dft = common_context_params_to_llama(params_base);
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -781,7 +783,10 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
-        const bool use_shared_mtp =
+        // The current shared native-MTP sidecar path is not exact across slots yet.
+        // Keep multi-slot server validation on the per-slot runtime until the
+        // planned single-context native-MTP implementation replaces it.
+        const bool use_shared_mtp = false &&
             can_spec &&
             params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP &&
             params_base.n_parallel > 1 &&
@@ -2120,9 +2125,18 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        const char * LLAMA_SERVER_SPEC_DEBUG = getenv("LLAMA_SERVER_SPEC_DEBUG");
+        const int spec_debug = LLAMA_SERVER_SPEC_DEBUG ? atoi(LLAMA_SERVER_SPEC_DEBUG) : 0;
+
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            if (slot.can_speculate() && slot_batched != nullptr) {
+                // Keep native speculative verification single-slot until the
+                // single-context runtime replaces the current per-slot sidecar path.
                 continue;
             }
 
@@ -2163,6 +2177,11 @@ private:
                     common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                     slot.prompt.tokens.push_back(slot.sampled);
                 } else {
+                    if (spec_debug > 0) {
+                        SLT_INF(slot, "spec draft sampled=%d draft='%s'\n",
+                                slot.sampled, common_detokenize(ctx, draft, true).c_str());
+                    }
+
                     // The server keeps slot.sampled outside slot.prompt.tokens, so the verifier's
                     // base position must account for the sampled token that will be prepended to
                     // the speculative target batch.
@@ -3034,6 +3053,11 @@ private:
                     continue;
                 }
 
+                if (spec_debug > 0) {
+                    SLT_INF(slot, "spec accept ids='%s' n_draft=%zu n_accept_draft=%zu\n",
+                            common_detokenize(ctx, ids, true).c_str(), n_draft, n_accept_draft);
+                }
+
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += n_accept_draft;
 
@@ -3080,7 +3104,11 @@ private:
 
             bool use_batched_verifier_finish = speculative_slots_batch.size() > 1;
             for (auto * slot : speculative_slots_batch) {
-                if (llama_memory_can_seq_rm_partial(llama_get_memory(slot->ctx))) {
+                // Batched verifier replay requires a restorable full-state snapshot for
+                // every speculative sequence in the batch. Falling back to the per-slot
+                // verifier finish path preserves correctness for contexts that only
+                // support per-sequence restore.
+                if (llama_memory_can_seq_rm_partial(llama_get_memory(slot->ctx)) || !slot->spec_verifier->uses_full_state()) {
                     use_batched_verifier_finish = false;
                     break;
                 }
@@ -3112,26 +3140,30 @@ private:
                     continue;
                 }
 
-                llama_batch batch_replay_all = llama_batch_init(std::max<int32_t>(1, (int32_t) llama_n_batch(ctx)), 0, 1);
-                common_batch_clear(batch_replay_all);
-
                 for (size_t is = 0; is < speculative_slots_batch.size(); ++is) {
                     auto & slot = *speculative_slots_batch[is];
                     auto & ids = speculative_ids_batch[is];
 
                     speculative_n_past_batch[is] = slot.spec_verifier->n_past_after(ids);
-                    slot.spec_verifier->append_replay(ids, batch_replay_all);
+                    llama_batch batch_replay_one = llama_batch_init(std::max<int32_t>(1, (int32_t) llama_n_batch(ctx)), 0, 1);
+                    common_batch_clear(batch_replay_one);
+                    slot.spec_verifier->append_replay(ids, batch_replay_one);
+
+                    if (batch_replay_one.n_tokens > 0 && llama_decode(ctx, batch_replay_one) != 0) {
+                        llama_batch_free(batch_replay_one);
+                        for (auto * slot_fail : speculative_slots_batch) {
+                            slot_fail->release();
+                        }
+                        restored = false;
+                        break;
+                    }
+
+                    llama_batch_free(batch_replay_one);
                 }
 
-                if (batch_replay_all.n_tokens > 0 && llama_decode(ctx, batch_replay_all) != 0) {
-                    llama_batch_free(batch_replay_all);
-                    for (auto * slot : speculative_slots_batch) {
-                        slot->release();
-                    }
+                if (!restored) {
                     continue;
                 }
-
-                llama_batch_free(batch_replay_all);
             }
 
             for (size_t is = 0; is < speculative_slots_batch.size(); ++is) {

@@ -36,6 +36,9 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
+    mtp_runtime.supported = model.supports_mtp();
+    mtp_runtime.depth_max = hparams.nextn_predict_layers;
+
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
@@ -434,9 +437,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     if (mtp_only) {
-        const bool need_dummy_mtp_hidden = mtp_input_hidden.empty();
+        const bool need_dummy_mtp_hidden = mtp_runtime.input_hidden.empty();
         if (need_dummy_mtp_hidden) {
-            mtp_input_hidden.assign(std::max<uint32_t>(1, n_tokens)*model.hparams.n_embd_out(), 0.0f);
+            mtp_runtime.input_hidden.assign(std::max<uint32_t>(1, n_tokens)*model.hparams.n_embd_out(), 0.0f);
         }
 
         auto * gf = graph_reserve(
@@ -472,7 +475,7 @@ void llama_context::sched_reserve() {
                 __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 
         if (need_dummy_mtp_hidden) {
-            mtp_input_hidden.clear();
+            mtp_runtime.input_hidden.clear();
         }
         return;
     }
@@ -1170,11 +1173,11 @@ void llama_context::set_warmup(bool value) {
 void llama_context::set_mtp_output(bool enabled) {
     LLAMA_LOG_DEBUG("%s: enabled = %d\n", __func__, enabled);
 
-    if (mtp_output_enabled == enabled) {
+    if (mtp_runtime.output_enabled == enabled) {
         return;
     }
 
-    mtp_output_enabled = enabled;
+    mtp_runtime.output_enabled = enabled;
 }
 
 void llama_context::set_mtp_input_hidden(const float * hidden, size_t n_embd) {
@@ -1188,11 +1191,11 @@ void llama_context::set_mtp_input_hiddens(const float * hidden, size_t n_tokens,
     }
 
     const size_t n_total = n_tokens*n_embd_exp;
-    if (mtp_input_hidden.size() != n_total) {
-        mtp_input_hidden.resize(n_total);
+    if (mtp_runtime.input_hidden.size() != n_total) {
+        mtp_runtime.input_hidden.resize(n_total);
     }
 
-    std::memcpy(mtp_input_hidden.data(), hidden, n_total*sizeof(float));
+    std::memcpy(mtp_runtime.input_hidden.data(), hidden, n_total*sizeof(float));
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2048,7 +2051,7 @@ int llama_context::decode_mtp(const llama_batch & batch_inp) {
         ~mtp_input_clear_guard() {
             mtp_input_hidden.clear();
         }
-    } clear_guard { mtp_input_hidden };
+    } clear_guard { mtp_runtime.input_hidden };
 
     if (!memory) {
         LLAMA_LOG_ERROR("%s: cannot run MTP decode without a memory-backed context\n", __func__);
@@ -2086,10 +2089,10 @@ int llama_context::decode_mtp(const llama_batch & batch_inp) {
         return -1;
     }
 
-    if (!mtp_input_hidden.empty()) {
+    if (!mtp_runtime.input_hidden.empty()) {
         const size_t n_expected = (size_t) batch_inp.n_tokens*hparams.n_embd_out();
-        if (mtp_input_hidden.size() != n_expected) {
-            LLAMA_LOG_ERROR("%s: invalid MTP hidden input buffer, got %zu floats, expected %zu\n", __func__, mtp_input_hidden.size(), n_expected);
+        if (mtp_runtime.input_hidden.size() != n_expected) {
+            LLAMA_LOG_ERROR("%s: invalid MTP hidden input buffer, got %zu floats, expected %zu\n", __func__, mtp_runtime.input_hidden.size(), n_expected);
             return -1;
         }
     }
@@ -2226,6 +2229,36 @@ int llama_context::decode_mtp(const llama_batch & batch_inp) {
         output_ids[out_ids[i]] = i;
     }
 
+    bool sorted_output = true;
+    for (int64_t i = 0; i < n_outputs; ++i) {
+        if (out_ids[i] != i) {
+            sorted_output = false;
+            break;
+        }
+    }
+
+    if (!sorted_output && n_outputs > 1) {
+        for (uint32_t i = 0; i < n_outputs - 1; ++i) {
+            uint32_t j_min = i;
+            for (uint32_t j = i + 1; j < n_outputs; ++j) {
+                if (out_ids[j] < out_ids[j_min]) {
+                    j_min = j;
+                }
+            }
+            if (j_min == i) {
+                continue;
+            }
+
+            std::swap(out_ids[i], out_ids[j_min]);
+            output_swaps.push_back({ i, j_min });
+        }
+
+        std::fill(output_ids.begin(), output_ids.end(), -1);
+        for (uint32_t i = 0; i < n_outputs; ++i) {
+            output_ids[out_ids[i]] = i;
+        }
+    }
+
     t_mtp_eval_us += ggml_time_us() - t_mtp_eval_start_us;
 
     return 0;
@@ -2246,7 +2279,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd_out = hparams.n_embd_out();
 
     bool has_logits = true;
-    bool has_mtp_hidden = mtp_output_enabled;
+    bool has_mtp_hidden = mtp_runtime.output_enabled;
     bool has_embd   = cparams.embeddings;
 
     // TODO: hacky enc-dec support
@@ -2530,7 +2563,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.mtp_hidden_input =*/ mtp_input_hidden.empty() ? nullptr : mtp_input_hidden.data(),
+        /*.mtp_hidden_input =*/ mtp_runtime.input_hidden.empty() ? nullptr : mtp_runtime.input_hidden.data(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

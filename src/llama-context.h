@@ -351,10 +351,15 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
-    bool mtp_output_enabled = false;
 
-    // input hidden state for the next llama_decode_mtp() call
-    std::vector<float> mtp_input_hidden;
+    struct native_mtp_runtime_state {
+        bool supported = false;
+        uint32_t depth_max = 0;
+        bool output_enabled = false;
+
+        // input hidden state for the next llama_decode_mtp() call
+        std::vector<float> input_hidden;
+    } mtp_runtime;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <cstdio>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -587,6 +588,15 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        const char * LLAMA_GRAPH_REUSE_DEBUG = getenv("LLAMA_GRAPH_REUSE_DEBUG");
+        const int debug = LLAMA_GRAPH_REUSE_DEBUG ? atoi(LLAMA_GRAPH_REUSE_DEBUG) : 0;
+
+        auto log_mismatch = [&](const char * reason) {
+            if (debug > 1) {
+                fprintf(stderr, "%s: graph reuse mismatch: %s\n", __func__, reason);
+            }
+        };
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -614,19 +624,29 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            if (debug > 1) {
+                fprintf(stderr,
+                        "%s: graph reuse mismatch: ubatch layout old(eq=%d tok=%u seq_tok=%u seq=%u seq_unq=%u token=%d embd=%d) new(eq=%d tok=%u seq_tok=%u seq=%u seq_unq=%u token=%d embd=%d)\n",
+                        __func__,
+                        ubatch.equal_seqs(), ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, ubatch.token != nullptr, ubatch.embd != nullptr,
+                        other.ubatch.equal_seqs(), other.ubatch.n_tokens, other.ubatch.n_seq_tokens, other.ubatch.n_seqs, other.ubatch.n_seqs_unq, other.ubatch.token != nullptr, other.ubatch.embd != nullptr);
+            }
             return false;
         }
 
         if (n_outputs != other.n_outputs) {
+            log_mismatch("n_outputs");
             return false;
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            log_mismatch("samplers");
             return false;
         }
 
         if (samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
+                log_mismatch("sampler ubatch ownership");
                 return false;
             }
 
@@ -634,19 +654,42 @@ struct llm_graph_params {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (ubatch.output[i]    != other.ubatch.output[i] ||
                     ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                    log_mismatch("sampler outputs");
                     return false;
                 }
             }
         }
 
-        return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+        if (cparams.embeddings != other.cparams.embeddings) {
+            log_mismatch("embeddings flag");
+            return false;
+        }
+        if (cparams.causal_attn != other.cparams.causal_attn) {
+            log_mismatch("causal_attn flag");
+            return false;
+        }
+        if (arch != other.arch) {
+            log_mismatch("arch");
+            return false;
+        }
+        if (gtype != other.gtype) {
+            log_mismatch("graph type");
+            return false;
+        }
+        if (cvec != other.cvec) {
+            log_mismatch("control vectors");
+            return false;
+        }
+        if (loras != other.loras) {
+            log_mismatch("loras");
+            return false;
+        }
+        if (cross != other.cross) {
+            log_mismatch("cross attention state");
+            return false;
+        }
+
+        return true;
     }
 };
 
