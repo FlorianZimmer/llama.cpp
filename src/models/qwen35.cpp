@@ -14,11 +14,14 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
         const int il = n_layer - hparams.nextn_predict_layers;
         const auto & layer = model.layers[il];
+        const bool exact_single_token_mtp =
+                params.ubatch.n_seq_tokens == 1 &&
+                params.ubatch.n_tokens == params.ubatch.n_seqs;
 
         ggml_tensor * hidden_states = build_inp_mtp_seed();
         ggml_tensor * inputs_embeds = build_inp_embd(layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd);
-        ggml_tensor * inp_pos       = build_inp_pos();
-        auto * inp_attn             = build_attn_inp_no_cache();
+        ggml_tensor * inp_pos       = exact_single_token_mtp ? nullptr : build_inp_pos();
+        auto * inp_attn             = exact_single_token_mtp ? nullptr : build_attn_inp_no_cache();
 
         inputs_embeds = build_norm(inputs_embeds, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
         hidden_states = build_norm(hidden_states, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
@@ -259,25 +262,54 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
         sections = sections_local;
     }
 
+    const bool exact_single_token = ubatch.n_seq_tokens == 1 && ubatch.n_tokens == ubatch.n_seqs;
+
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+
+    if (exact_single_token) {
+        // Exact under the current native-MTP draft contract: the no-cache path
+        // sees one drafted token per sequence, so each attention stream has
+        // length 1 and softmax(QK^T) collapses to the identity. The attention
+        // output is therefore V, with KV heads repeated across query groups
+        // when GQA is active. Fall back to the generic path for any wider batch.
+        if (n_head_kv != n_head) {
+            GGML_ASSERT(n_head % n_head_kv == 0);
+
+            Vcur = ggml_reshape_4d(ctx0, Vcur, n_embd_head, 1, n_head_kv, n_tokens);
+
+            ggml_tensor * v_repeat = ggml_new_tensor_4d(
+                    ctx0, GGML_TYPE_F32, n_embd_head, n_head / n_head_kv, n_head_kv, n_tokens);
+
+            Vcur = ggml_repeat(ctx0, Vcur, v_repeat);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head, n_tokens);
+        }
+
+        cur = ggml_cont_2d(ctx0, Vcur, n_embd_head * n_head, n_tokens);
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+
+        return cur;
+    }
+
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    GGML_ASSERT(inp_pos != nullptr);
 
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -288,6 +320,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
             ext_factor, attn_factor, beta_fast, beta_slow);
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    GGML_ASSERT(inp != nullptr);
 
     cur = build_attn(inp, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));

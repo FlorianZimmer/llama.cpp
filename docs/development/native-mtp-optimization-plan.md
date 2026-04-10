@@ -22,31 +22,51 @@ Removed from this V1 prep branch:
 
 Current dense rerun artifacts:
 
-- `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
-- `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-q8_0-np2.json` (`np=2` stability-only spot-check)
 
 Current branch result:
 
 - `Qwen3.5-9B q8_0`
-  - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
-  - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
-  - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
+  - `primary np=1`: `150.36 -> 170.02 tok/s` (`1.131x`)
+  - `good np=1`: `148.65 -> 155.14 tok/s` (`1.044x`)
+  - `bad np=1`: `148.66 -> 149.06 tok/s` (`1.003x`)
 - `Qwen3.5-9B UD-Q4_K_XL`
-  - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
-  - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
-  - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
+  - `primary np=1`: `176.82 -> 177.07 tok/s` (`1.001x`)
+  - `good np=1`: `195.84 -> 185.13 tok/s` (`0.945x`)
+  - `bad np=1`: `195.79 -> 184.19 tok/s` (`0.941x`)
 - `Qwen3.5-27B UD-Q4_K_XL`
-  - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
-  - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
-  - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
+  - `primary np=1`: `72.22 -> 60.41 tok/s` (`0.837x`)
+  - `good np=1`: `70.94 -> 68.98 tok/s` (`0.972x`)
+  - `bad np=1`: `70.92 -> 66.32 tok/s` (`0.935x`)
 
 Interpretation:
 
-- the only checked `np=1` dense win worth carrying is `9B q8_0`
-- `9B UD-Q4_K_XL` improved but is still not a reliable speed-positive target
-- `27B UD-Q4_K_XL` remains regression coverage, not a near-term speed target
-- the current one-token native-MTP design still has narrow upside and little room for extra recurring overhead
+- the kept qwen35-local step clears the dense V1 bar on `9B q8_0`
+- `9B UD-Q4_K_XL` improved materially versus the previous MTP branch, but it is still not a broad speed-positive target
+- `27B UD-Q4_K_XL` also improved versus the previous MTP branch, but it remains regression-only coverage
+- the current one-token native-MTP design still has narrow upside; this step likely exhausts the remaining low-risk dense-only branch
+
+## What Survived In This Step
+
+Kept local runtime change:
+
+- exact qwen35 single-token native-MTP no-cache attention specialization in `src/models/qwen35.cpp`
+  - keep the gate path, V projection, and output projection
+  - skip `wk`, q/k norm, RoPE, and generic attention when the graph contract is exactly one drafted token per sequence
+  - keep the generic path for any wider no-cache batch shape
+- stop creating dead position / no-cache-attention graph inputs for the exact one-token MTP graph shape
+
+What we did not keep pursuing after this step survived:
+
+- query-half pruning inside `wq`
+- draft-logit output pruning
+
+Reason:
+
+- the local qwen35 step already met the `9B q8_0` `np=1` benchmark bar with a small diff, so widening the branch was not necessary for V1
 
 ## What The Branch Already Ruled Out
 
@@ -79,8 +99,12 @@ Under the same newer harness:
   - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
   - `primary np=1`: `1.081x`
   - `good np=1`: `1.032x`
+- current qwen35 single-token specialization:
+  - `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.131x`
+  - `good np=1`: `1.044x`
 
-So the branch did recover the earlier dense `q8_0` win once the broad replay guard was removed from dense `qwen35`.
+So the branch first recovered the earlier dense `q8_0` win once the broad replay guard was removed from dense `qwen35`, then extended it with a local qwen35 draft-graph specialization.
 
 ## What We Already Tried On Hybrid-State Behavior
 
@@ -101,15 +125,22 @@ We have not yet done the deeper runtime-state design used by systems like vLLM o
 
 That deeper work is outside this V1 prep branch.
 
-## V1 Next-Step Rule
+## V1 Branch Decision
 
-The next branch should stay dense-only and answer one question:
+The dense-only question for this branch was:
 
 - can dense `qwen35` achieve a repeatable `np=1` single-user win of at least about `1.05x` on `9B q8_0` without breaking exactness and without becoming quant-fragile?
 
-Practical stop condition:
+Answer:
 
-- if the next dense-only branch cannot recover a consistent `>= 5%` `np=1` win on `9B q8_0` while keeping exactness, stop and document the current single-token native-MTP ceiling
+- yes, but narrowly
+- the current one-token design is now clearly worth carrying for `Qwen3.5-9B q8_0`
+- the same design is still not broad dense speed-positive support for `UD-Q4_K_XL` or `27B`
+
+Practical stop condition from here:
+
+- do not keep stacking more qwen35-local heuristics on this branch unless a new change can be justified as equally small and equally exact
+- if a future local step does not beat `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`, treat the remaining ceiling as structural and move deeper work to a dedicated follow-up branch
 
 ## Benchmark Gate
 

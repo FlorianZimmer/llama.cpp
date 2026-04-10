@@ -53,34 +53,44 @@ Benchmarked models:
 ## Headline Result
 
 - `Qwen3.5-9B q8_0` is the only checked dense path with a meaningful `np=1` win:
-  - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
-  - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
-  - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
-- `Qwen3.5-9B UD-Q4_K_XL` improved after the dense guard narrowing, but is still not a reliable speed-positive target:
-  - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
-  - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
-  - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
-- `Qwen3.5-27B UD-Q4_K_XL` remains clearly negative and is regression-only for dense V1:
-  - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
-  - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
-  - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
+  - `primary np=1`: `150.36 -> 170.02 tok/s` (`1.131x`)
+  - `good np=1`: `148.65 -> 155.14 tok/s` (`1.044x`)
+  - `bad np=1`: `148.66 -> 149.06 tok/s` (`1.003x`)
+- `Qwen3.5-9B UD-Q4_K_XL` improved versus the previous native-MTP branch, but is still not a reliable broad speed-positive target:
+  - `primary np=1`: `176.82 -> 177.07 tok/s` (`1.001x`)
+  - `good np=1`: `195.84 -> 185.13 tok/s` (`0.945x`)
+  - `bad np=1`: `195.79 -> 184.19 tok/s` (`0.941x`)
+- `Qwen3.5-27B UD-Q4_K_XL` also improved versus the previous native-MTP branch, but remains regression-only for dense V1:
+  - `primary np=1`: `72.22 -> 60.41 tok/s` (`0.837x`)
+  - `good np=1`: `70.94 -> 68.98 tok/s` (`0.972x`)
+  - `bad np=1`: `70.92 -> 66.32 tok/s` (`0.935x`)
 
 ## Dense V1 Branch Result
 
 Artifacts:
 
-- `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
-- `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-next/step02/qwen35-9b-q8_0-np2.json` (`np=2` stability-only)
 
 | Model | `-np` | Primary | Good | Bad | Reading |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3.5-9B Q8_0 | 1 | `1.081x` | `1.032x` | `0.991x` | only active speed target |
-| Qwen3.5-9B Q8_0 | 2 | `1.033x` | `1.104x` | `0.998x` | favorable only on easier prompts |
-| Qwen3.5-9B UD-Q4_K_XL | 1 | `0.957x` | `0.931x` | `0.934x` | supporting regression coverage |
-| Qwen3.5-9B UD-Q4_K_XL | 2 | `1.006x` | `0.694x` | `0.993x` | inconsistent |
-| Qwen3.5-27B UD-Q4_K_XL | 1 | `0.826x` | `0.964x` | `0.929x` | regression-only |
-| Qwen3.5-27B UD-Q4_K_XL | 2 | `0.548x` | `0.515x` | `0.556x` | clearly not viable |
+| Qwen3.5-9B Q8_0 | 1 | `1.131x` | `1.044x` | `1.003x` | active speed target; beats previous MTP result |
+| Qwen3.5-9B Q8_0 | 2 | `1.261x` | `0.576x` | `0.778x` | stability-only; known divergence still dominates harder prompts |
+| Qwen3.5-9B UD-Q4_K_XL | 1 | `1.001x` | `0.945x` | `0.941x` | supporting regression coverage; improved vs previous MTP |
+| Qwen3.5-27B UD-Q4_K_XL | 1 | `0.837x` | `0.972x` | `0.935x` | regression-only; improved vs previous MTP |
+
+## Kept Step
+
+The only new kept runtime change in this bench set is a qwen35-local native-MTP draft-graph specialization in `src/models/qwen35.cpp`:
+
+- exact one-token no-cache attention collapse for the current native-MTP contract
+- keep gate + V + output projection
+- skip `wk`, q/k norm, RoPE, and generic attention on that path
+- keep the generic path for any wider batch shape
+
+This step stayed exact at `np=1`, improved `Qwen3.5-9B q8_0` against both greedy baseline and the immediately previous MTP JSON, and improved both supporting dense regression models relative to the previous MTP JSON.
 
 ## Broad-Guard Regression And Recovery
 
@@ -100,12 +110,17 @@ Same-harness comparison:
   - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
   - `primary np=1`: `1.081x`
   - `good np=1`: `1.032x`
+- current qwen35 single-token specialization:
+  - `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.131x`
+  - `good np=1`: `1.044x`
 
 Interpretation:
 
 - the branch did suffer a real dense regression
 - that regression was caused by applying a conservative replay guard too broadly
 - removing that guard from dense `qwen35` recovered the earlier `9B q8_0` win
+- the kept qwen35-local specialization then widened that recovered `9B q8_0` win further
 
 ## Step Visibility Result
 
@@ -119,13 +134,19 @@ Representative coverage from `/tmp/native-mtp-step-01`:
 
 So the current dense shortfall is not mainly “we are still missing the verifier fast path”.
 
+The kept qwen35-local step preserved that visibility profile on the new `np=1` runs:
+
+- `9B q8_0 primary np=1`: `6/6` pure-fast-path, `6/6` logits-suppressed
+- `9B UD-Q4 primary np=1`: `6/6` pure-fast-path, `6/6` logits-suppressed
+- `27B UD-Q4 primary np=1`: `7/7` pure-fast-path, `7/7` logits-suppressed
+
 ## Current Conclusions
 
-- dense native MTP is only worth carrying today on `Qwen3.5-9B q8_0`
-- dense `Q4` still does not show the consistent `np=1` single-user win needed for a broad feature claim
-- `27B` remains too expensive for the current one-token runtime design
-- the next dense-only branch should be judged against a clear maintenance bar:
-  - if it cannot produce a repeatable `>= 5%` `np=1` win on `9B q8_0`, the current design is probably not worth carrying upstream as a speed feature
+- dense native MTP is worth carrying today on `Qwen3.5-9B q8_0`
+- dense `Q4` improved meaningfully versus the previous MTP branch, but still does not justify a broad feature claim
+- `27B` remains too expensive for the current one-token runtime design even after the local qwen35 step
+- this likely exhausts the remaining low-risk dense-only qwen35 branch:
+  - if a future local step cannot beat `/tmp/native-mtp-next/step02/qwen35-9b-q8_0.json`, the remaining ceiling should be treated as structural
 
 ## Historical Note
 
