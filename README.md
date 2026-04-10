@@ -10,6 +10,29 @@
 
 LLM inference in C/C++
 
+## Fork Status
+
+This fork contains an experimental native multi-token prediction (`mtp`) line of work for Qwen 3.5.
+That work is functional today, but it is currently on hold.
+
+- the kept dense `np=1` path works correctly and stays benchmark-validated;
+- the latest dense-only branch found a real `np=1` gain on `Qwen3.5-9B q8_0`;
+- the broader dense targets did not turn into reliable wins over greedy baseline, including `Qwen3.5-27B UD-Q4_K_XL`.
+
+Why it is paused:
+
+- the current runtime still drafts only one continuation token per verifier step;
+- the obvious server-local fast paths were already mostly exhausted;
+- the remaining gap is structural, because speculative state is still managed through restore / replay behavior instead of deeper branch-state storage and multi-token commit paths.
+
+So the current reading is simple: native MTP in this fork works, but its speedup is too narrow and too constrained to keep pushing as a short local optimization series.
+Reaching the broader gains seen in runtimes such as vLLM or SGLang would require deeper runtime-state work rather than more small heuristics.
+
+Related notes:
+
+- [docs/speculative.md](docs/speculative.md)
+- [docs/development/native-mtp-benchmarks.md](docs/development/native-mtp-benchmarks.md)
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
