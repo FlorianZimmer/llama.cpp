@@ -121,6 +121,32 @@ Observed CUDA range:
 - The known hybrid/recurrent `np > 1` exactness limitation is still real on CUDA. The Rust `np=2` case remained a representative failure and was also slightly slower than baseline.
 - On exact workloads, native MTP is already useful on both CPU and CUDA with this model, but the benefit is workload-dependent and should not be treated as a universal speedup.
 
+## Qwen3.5-35B-A3B MoE Check
+
+The native MTP path also works functionally on `Qwen3.5-35B-A3B`, but it did not show a speedup on this host after fixing the GGUF conversion bug in the shared MTP RMSNorm tensors.
+
+Checked models:
+
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-bf16-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q4_K_M-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-Q5_K_M-fixed.gguf`
+- `/mnt/models/GGUF/Qwen3.5-35B-A3B-MTP-UD-Q4_K_XL.gguf`
+
+Representative CUDA results:
+
+| Case | `-np` | Baseline tok/s | MTP tok/s | Draft / accepted | Outcome |
+| --- | ---: | --- | --- | --- | --- |
+| Berlin, Q5_K_M fixed, `n_predict=48` | 1 | `234.11` | `172.16` | `15 / 13` | correct, slower |
+| Moon, Q5_K_M fixed, `n_predict=48` | 1 | `234.60` | `179.24` | `13 / 11` | correct, slower |
+| Berlin, UD Q4_K_XL, `n_predict=12` | 1 | `200.75` | `124.36` | `7 / 4` | correct, slower |
+
+Interpretation:
+
+- this is no longer a GGUF metadata/tensor preservation issue;
+- the zero-acceptance cliff was caused by the converter bug and disappeared after the fix;
+- the remaining slowdown appears to be a runtime economics issue: `Qwen3.5-35B-A3B` is already a fast active-parameter MoE model on this GPU, and with only one native predictor layer the saved verifier work is too small to amortize the extra draft + accept path cost;
+- so the MoE path is still worth keeping as functionality, but this model should not currently be presented as a speed-positive native-MTP case.
+
 ## Speedup Backlog
 
 The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
@@ -159,3 +185,9 @@ Representative logs from the full matrix are under:
 - `/tmp/mtp-bench-cpu-*`
 - `/tmp/mtp-bench-cuda-*`
 - summary JSON: `/tmp/mtp-bench-results.json`
+
+## Related Notes
+
+For model selection, GGUF preservation checks, quantization guidance, and a reusable external-AI prep prompt, see:
+
+- [native-mtp-model-prep.md](native-mtp-model-prep.md)
