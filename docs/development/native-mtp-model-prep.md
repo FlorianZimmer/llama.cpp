@@ -2,6 +2,23 @@
 
 This note captures the workflow and sharp edges we hit while preparing real models for native-MTP testing in this private mirror.
 
+## Current V1 Scope
+
+For the first upstream-oriented native-MTP series in this private mirror, the recommended scope is:
+
+- keep dense `qwen35` in scope
+- keep `Qwen3.5-9B q8_0` as the only active speed target
+- keep `Qwen3.5-27B` only as supporting dense correctness / regression coverage
+- keep `Qwen3.5-35B-A3B` only as regression coverage for already-landed correctness work
+- defer `qwen35moe` / `Qwen3.5-35B-A3B` as an active speed target
+
+Reason:
+
+- dense Qwen 3.5 is the only family that has shown meaningful native-MTP CUDA wins in this branch
+- A3B / `qwen35moe` required both quantization-side rescue work and runtime replay-guard work just to restore checked `np=1` exactness
+- after that rescue, A3B is still materially slower than baseline on every checked quant
+- so MoE should currently be treated as a functionality / regression target, not as a v1 speed target
+
 ## Storage Rules
 
 - Store downloads and generated GGUFs under `/mnt/models`.
@@ -251,6 +268,9 @@ This matters because `/mnt/models` can fill up quickly during BF16 and multi-qua
   - the same guard stayed exact on the checked 9B and 27B dense references, and A3B `np=2` remained stability-clean in a smoke run
   - the tradeoff is conservative: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
 - For MoE, the main issue was not “MTP is unsupported”; the main issue was preserving MTP tensors correctly and then accepting that runtime speedup may still be poor.
+- For the first upstream-oriented series, that means:
+  - keep the MoE path available locally for regression and future work
+  - but do not treat it as part of the active speed story
 - Community GGUFs cannot be trusted to preserve MTP unless verified explicitly.
 - A model or quant can be a valid native-MTP functionality target without being a speed-positive target.
 - Every new quant still needs a real `np=1` exactness check; do not assume exactness transfers automatically across quants of the same model family.

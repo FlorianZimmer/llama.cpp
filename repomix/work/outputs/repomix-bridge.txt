@@ -30,213 +30,186 @@ Files
 File: repomix/work/01_REQUEST.md
 ================
 USER_GOAL:
-Review the current private native-MTP state in this llama.cpp mirror and produce a concrete next-step optimization plan for getting real net-positive end-to-end speedups on CUDA while staying upstream-friendly and maintainable.
+Review the current private native-MTP state in this llama.cpp mirror and answer two scope-defining questions for the next cycle:
 
-DELIVERABLE_TYPE: PLAN
+1. Should we spend another branch on deeper hybrid replay/guard economics for Qwen 3.5 native MTP, or is that too large/risky for this first upstream-oriented implementation?
+2. Should `Qwen3.5-35B-A3B` / `qwen35moe` stay in the native-MTP scope at all, or should it be removed/deferred because the expected upside is too small relative to the complexity and correctness cost?
+
+DELIVERABLE_TYPE: RESULT
 
 USER_REQUEST:
-Please review this private-mirror native-MTP implementation and produce a pragmatic optimization plan focused on real end-to-end speedups, not internal timing wins alone.
+Please review this private-mirror native-MTP implementation and give a concrete recommendation about branch scope and next actions.
 
-Important benchmark context from the latest full sweep on 2026-04-10:
+The main questions are:
 
-- Models tested:
-  - Qwen3.5-9B `UD-Q4_K_XL`
-  - Qwen3.5-9B `q8_0`
-  - Qwen3.5-27B `UD-Q4_K_XL`
-  - Qwen3.5-35B-A3B `Q4_K_M`
-  - Qwen3.5-35B-A3B `Q5_K_M`
-  - Qwen3.5-35B-A3B `UD-Q4_K_XL`
-- Cases tested: `primary`, `good`, `bad`
-- Parallel counts tested: `np=1`, `np=2`
-- Repeats: `3`
-- Current result:
-  - no checked model or quant is net-positive on `np=1`
-  - Qwen3.5-9B `q8_0` is still the only speed-positive path, but only on the easier `np=2` cases
-  - Qwen3.5-9B `UD-Q4_K_XL` is slower everywhere
-  - Qwen3.5-27B is speed-negative everywhere
-  - Qwen3.5-35B-A3B is speed-negative everywhere
-  - Qwen3.5-35B-A3B `Q4_K_M` is now `np=1` exact again after the landed post-replay guard fix
+1. We already know `Qwen3.5-9B q8_0` used to be clearly faster in an earlier branch state. Did the later correctness work regress that path in a fundamental way, and if so, is it worth targeting deeper hybrid replay/guard economics next?
+2. How do other public MTP-capable inference stacks handle the kinds of issues we ran into here:
+   - verifier fast-path / logits suppression
+   - replay / rollback after rejected drafts
+   - hybrid or recurrent state restoration
+   - dense vs MoE runtime economics
+   - exactness expectations at low draft depth
+3. Is `Qwen3.5-35B-A3B` / `qwen35moe` worth keeping in scope for the first upstreamable native-MTP series, or should it be explicitly deferred or removed for now?
 
-Representative exact `np=1` results:
+Please answer using the included local files as the source of truth for this private branch. For broader comparison, you may use public sources surgically.
 
-- 9B `UD-Q4_K_XL`: `175.91 -> 159.01 tok/s` (`0.904x`)
-- 9B `q8_0`: `150.53 -> 150.31 tok/s` (`0.999x`)
-- 27B `UD-Q4_K_XL`: `72.35 -> 62.27 tok/s` (`0.861x`)
-- 35B-A3B `Q4_K_M`: `228.26 -> 170.72 tok/s` (`0.748x`)
-- 35B-A3B `Q5_K_M`: `221.34 -> 167.90 tok/s` (`0.759x`)
-- 35B-A3B `UD-Q4_K_XL`: `202.80 -> 129.34 tok/s` (`0.638x`)
+Important: do not broaden into a generic literature survey. Focus on public implementations that are directly useful for this decision. Examples of useful targets if relevant:
 
-Representative speed-positive `np=2` results:
+- public upstream `ggml-org/llama.cpp` only where needed to compare with this branch
+- public inference stacks / engines that concretely support MTP or close speculative decoding variants for Qwen-class models, especially where replay/rollback, verifier batching, or MoE support are documented or visible in code
 
-- 9B `q8_0`, `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
-- 9B `q8_0`, `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+What I want back:
 
-Representative profile summaries from the new per-step instrumentation:
+1. A direct answer to whether the next step should be:
+   - a deeper hybrid replay/guard branch
+   - a narrower dense-only cleanup branch
+   - or a stop/defer decision because the remaining ceiling is likely structural for the current one-token native-MTP design
+2. A direct answer to whether `qwen35moe` should stay in scope for the first upstreamable series.
+3. A short comparison against other public MTP-capable stacks:
+   - how they handle replay / verifier / state problems
+   - what they do differently from this branch if anything materially relevant
+   - whether any of those ideas look realistically portable here
+4. A pragmatic recommended path for this private mirror in priority order, with explicit “do now”, “separate later branch”, and “drop/defer” buckets.
 
-- 9B `UD-Q4_K_XL`, `primary np=1`:
-  - acceptance `12/15 (0.800)`
-  - `draft ~= 21.2 ms`
-  - `accept ~= 75.5 ms`
-  - `replay ~= 30.8 ms`
-- 9B `q8_0`, `primary np=1`:
-  - acceptance `12/15 (0.800)`
-  - `draft ~= 23.6 ms`
-  - `accept ~= 99.6 ms`
-  - `replay ~= 8.6 ms`
-- 27B `UD-Q4_K_XL`, `bad np=2`:
-  - acceptance `140/184 (0.761)`
-  - `draft ~= 127.7 ms`
-  - `accept ~= 958.1 ms`
-  - `replay ~= 395.1 ms`
+Critical benchmark context:
 
-Important quantization-side follow-up found after the sweep:
+- This branch already had an earlier faster `Qwen3.5-9B q8_0` state under the current harness, before the permanent replay guard:
+  - from `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `150.83 -> 163.23 tok/s` (`1.082x`)
+  - `good np=1`: `148.88 -> 153.38 tok/s` (`1.030x`)
+  - `primary np=2`: `128.08 -> 138.55 tok/s` (`1.082x`)
+  - `good np=2`: `131.40 -> 145.13 tok/s` (`1.104x`)
+- Current branch state after the permanent hybrid/recurrent post-replay guard:
+  - from `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
+  - `good np=1`: `148.62 -> 139.40 tok/s` (`0.938x`)
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+  - `bad np=1`: `148.82 -> 125.10 tok/s` (`0.841x`)
+  - `bad np=2`: `132.99 -> 115.83 tok/s` (`0.871x`)
 
-- the `Qwen3.5-35B-A3B Q4_K_M` `bad np=1` exactness failure was not just a generic runtime bug, but it also was not explained by quantization alone
-- all A3B MTP GGUFs preserve the same MTP metadata and tensor set
-- the only differing MTP tensor across the tested A3B quants is:
-  - `blk.40.nextn.eh_proj.weight`
-- that tensor is:
-  - `Q4_K` in the failing `Q4_K_M` GGUF
-  - `Q5_K` in the passing `Q5_K_M` GGUF
-  - `Q8_0` in the passing `UD-Q4_K_XL` GGUF
-- BF16-vs-quant audit on that tensor showed:
-  - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
-  - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
-  - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.9999`
-- checked-in balanced recommendation for that tensor is `Q5_K`
-- checked-in strict recommendation for that tensor is `Q8_0`
-- the balanced `Q4_K_M` rebuild is now the canonical GGUF on disk
-- the remaining exactness issue was isolated to the first speculative step after replay on the hybrid/recurrent path
-- the current branch now fixes that conservatively by forcing one plain verifier step immediately after replay on hybrid/recurrent native-MTP slots
+Current branch-wide reading from the full 2026-04-10 matrix:
 
-Please:
-1. Identify the most likely remaining bottlenecks in the current implementation.
-2. Propose upstream-friendly optimization steps in priority order.
-3. Keep the plan benchmark-gated after each step against:
-   - greedy baseline
-   - the immediately previous native-MTP step
-4. Explicitly call out which ideas are likely not worth doing yet.
-5. Distinguish:
-   - dense-model generic work that could improve 9B and 27B
-   - work that may help MoE correctness or stability but is unlikely to rescue speed
-   - work that is runtime-side versus work that is really quantization-side
-6. Use the provided local file excerpts and docs as the source of truth for this private branch.
-7. If you need public upstream context, fetch it surgically from public `ggml-org/llama.cpp` only for exact files or symbols that matter. Do not broaden into a full-repo read.
+- no checked model or quant is net-positive on `np=1`
+- only `Qwen3.5-9B q8_0` remains speed-positive at all, and only on the easier `np=2` cases
+- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-35B-A3B` is slower everywhere
+- `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again after the replay guard fix, but still far from speed-positive
+
+Very important local finding from the new visibility pass:
+
+- speculative accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
+- representative coverage from `/tmp/native-mtp-step-01`:
+  - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+  - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+  - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+- this means the earlier “maybe split pure verifier rows out of mixed chunks” idea is now probably not the main win
+
+Another very important local finding:
+
+- in this branch, `Qwen3.5` dense is currently classified as `hybrid` in libllama too, not just `Qwen3.5-MoE`
+- so the current one-step post-replay guard is already the live policy on the checked 9B and 27B targets, not just on A3B
+- a trial “dense cooldown” branch produced no distinct `cooldown_hits`; it collapsed into the same guard behavior and was dropped
+
+MoE-specific reality check:
+
+- `Qwen3.5-35B-A3B` native MTP is now functionally/correctness-clean on the checked `np=1` cases
+- but it is still materially slower than baseline on every checked quant
+- current local belief is that this may simply not be a good speed target even with a cleaner implementation, because the model is already a fast active-parameter MoE path and the current native-MTP depth is only one token
+
+Please do not just say “more profiling needed”. I want a specific call:
+
+- continue deeper on hybrid replay/guard economics now
+- or stop here and narrow scope for the first upstreamable series
 
 CONSTRAINTS:
-- Prefer small-to-medium scoped steps over large speculative rewrites.
-- Preserve the current validated correctness contract:
-  - `np=1` exactness matters
-  - `np>1` on hybrid/recurrent native-MTP is stability-focused, not strict batch-invariant exactness
-- Focus on runtime/server/graph overhead before suggesting deeper kernel or scheduler redesign.
-- Stay close to something that could plausibly be upstreamed in pieces.
+
+- preserve the already-validated `np=1` exactness contract on the checked dense and A3B cases
+- prefer upstream-friendly conclusions over heroic local-only hacks
+- separate:
+  - “worth doing in this private mirror next”
+  - “worth exploring later in a dedicated branch”
+  - “not worth keeping in scope for v1”
+- if you use public upstream or other public projects, fetch them surgically and explain exactly why they matter
 
 ================
 File: repomix/work/02_CONTEXT_NOTES.md
 ================
 CONTEXT_NOTES:
 
-Branch and diff base:
+Branch / diff context:
 
 - Current branch: `feat/native-mtp-upstream-prep`
-- Public-upstream diff base used for comparison: `d6f3030047f85a98b009189e76f441fe818ea44d`
-- Relative to `upstream/master`, this private branch currently changes `32` files with about `3651` insertions and `68` deletions.
+- Public-upstream diff base previously used for local comparison: `d6f3030047f85a98b009189e76f441fe818ea44d`
+- This is a private mirror. The local docs and included files are the authoritative source for this branch state.
 
-What this private mirror has that public upstream master may not:
+What this branch already adds relative to public upstream:
 
-- HF -> GGUF conversion support for Qwen 3.5 native MTP / NextN tensors
-- GGUF metadata and loader plumbing for `nextn_predict_layers`
-- public native-MTP APIs in `include/llama.h`
-- `llama_mtp` runtime state and draft path in `src/llama-mtp.*` and `src/llama-context.cpp`
-- Qwen 3.5 dense and Qwen 3.5 MoE native-MTP graph builders
+- Qwen 3.5 native-MTP GGUF conversion / metadata / loader plumbing
+- native-MTP runtime state and draft path in `src/llama-mtp.*` and `src/llama-context.cpp`
+- Qwen 3.5 dense and MoE graph builders
 - server integration for `--spec-type mtp`
-- benchmark harness `scripts/validate_mtp_cuda.py`
-- docs for model prep, benchmarking, and optimization planning
+- direct greedy verifier-token access plus raw-logit suppression controls
+- replay / rollback support for hybrid-recurrent paths
+- CUDA benchmark harness and quant-audit tooling
 
-Key local files to treat as most relevant:
+Files that matter most for the current question:
 
-- `include/llama.h`
+- `tools/server/server-context.cpp`
 - `src/llama-mtp.h`
 - `src/llama-mtp.cpp`
-- `src/llama-context.h`
 - `src/llama-context.cpp`
 - `src/llama-graph.h`
 - `src/llama-graph.cpp`
 - `src/models/qwen35.cpp`
 - `src/models/qwen35moe.cpp`
-- `tools/server/server-context.cpp`
+- `src/llama-arch.cpp`
 - `scripts/validate_mtp_cuda.py`
+- `scripts/audit_mtp_quantization.py`
 - `docs/development/native-mtp-benchmarks.md`
 - `docs/development/native-mtp-optimization-plan.md`
 - `docs/development/native-mtp-model-prep.md`
 
 Current runtime facts:
 
-- Current native runtime only drafts `1` continuation token per step even if metadata reports more predictor layers.
+- Native runtime still drafts only `1` continuation token per step even if metadata reports more predictor layers.
 - `np=1` is the correctness-clean contract.
-- `np>1` on the current hybrid/recurrent path is stability-only.
-- The backend-resident seed path already exists; reopening seed transport as a standalone project is probably low value unless new evidence says otherwise.
+- `np>1` on current hybrid/recurrent native-MTP is stability-only.
+- The branch already has:
+  - greedy verifier accept fast path
+  - optional raw-logit suppression on token-only accept batches
+  - backend-resident seed transport
+  - per-step runtime/acceptance profiling
 
-Latest full benchmark sweep summary:
+Important historical benchmark fact:
 
-- The current 3-repeat matrix includes the landed hybrid/recurrent post-replay guard fix.
-- No checked model or quant is net-positive on `np=1`.
-- Only `Qwen3.5-9B q8_0` showed repeatable net-positive speedups, and only on the easier `np=2` cases.
-- `Qwen3.5-9B UD-Q4_K_XL` remained slower everywhere despite decent short-case acceptance.
-- `Qwen3.5-27B UD-Q4_K_XL` was slower everywhere.
-- `Qwen3.5-35B-A3B` was slower on every checked quant.
-- Current branch state after the replay fix:
-  - `Qwen3.5-35B-A3B Q4_K_M` is `np=1` exact again on the checked `primary`, `good`, and `bad` CUDA cases
-  - it is still substantially slower than baseline, so the correctness fix did not make it speed-positive
+- Under the same newer harness, `Qwen3.5-9B q8_0` was clearly faster before the permanent replay guard:
+  - file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `150.83 -> 163.23 tok/s` (`1.082x`)
+  - `good np=1`: `148.88 -> 153.38 tok/s` (`1.030x`)
+  - `primary np=2`: `128.08 -> 138.55 tok/s` (`1.082x`)
+  - `good np=2`: `131.40 -> 145.13 tok/s` (`1.104x`)
 
-Quantization-side and replay-side follow-up after the sweep:
+Current benchmark state after the permanent replay guard:
 
-- The A3B `Q4_K_M` `bad np=1` exactness failure is not a generic native-MTP runtime failure, but it is also no longer explainable by quantization alone.
-- A direct BF16-vs-quant audit was added in `scripts/audit_mtp_quantization.py`.
-- On the current A3B GGUFs:
-  - all MTP norm tensors already remain `F32`
-  - the only quantized MTP tensor is `blk.40.nextn.eh_proj.weight`
-  - `Q4_K_M` stores it as `Q4_K`
-  - `Q5_K_M` stores it as `Q5_K`
-  - `UD-Q4_K_XL` stores it as `Q8_0`
-- Measured against the BF16 GGUF:
-  - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
-  - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
-  - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.9999`
-- Checked-in override files now exist for the A3B `Q4_K_M` recipe:
-  - balanced: promote only `blk.40.nextn.eh_proj.weight` to `Q5_K`
-  - strict: promote it to `Q8_0`
-- The balanced A3B `Q4_K_M` rebuild has now been performed and promoted to the canonical GGUF filename on disk.
-- The previous pre-balanced file was then removed to recover `/mnt/models` space.
-- Important runtime-facing caveat after rebuilding:
-  - the balanced A3B `Q4_K_M` GGUF still failed the narrow `bad np=1` exactness validation
-  - so this quantization fix was necessary but not sufficient for that case
-- Replay isolation after rebuilding narrowed the remaining issue further:
-  - disabling the greedy accept fast path still did not fix the divergence
-  - the model is taking the hybrid recurrent-backup restore path, not `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`
-  - the first replayed verifier logits after restore were still correct:
-    - replayed token `271` at `pos=10`
-    - top-1 next token `248068` with probability `~0.91`
-    - that matches the greedy baseline continuation at that point
-  - the divergence starts on the first speculative step after replay, not on the replayed next-token state itself
-  - a one-step debug cooldown after replay restored exactness on both:
-    - the short traced repro
-    - the full `bad np=1` CUDA validation case
-- Current best local reading for A3B `Q4_K_M`:
-  - quant quality was part of the problem
-  - the remaining correctness gap was in the first speculative verifier batch after replay on the hybrid/MoE path
-- Fix now landed locally:
-  - hybrid/recurrent native-MTP slots always force one plain verifier step immediately after replay
-  - this restored `np=1` exactness on the checked A3B `Q4_K_M` cases
-  - 9B and 27B dense references stayed exact on the same spot-check matrix
-  - A3B `np=2` stayed stability-clean in a smoke run
-- `Qwen3.5-27B-MTP-UD-Q4_K_XL` already stores its `blk.64.nextn.eh_proj.weight` as `Q8_0`, so there is no obvious MTP-head under-quantization issue there.
-- `Qwen3.5-9B` no longer had a BF16 GGUF on disk, so only a surrogate audit against the shipped `q8_0` GGUF was possible.
-- That surrogate audit still showed the key operational fact:
-  - both shipped 9B quants already keep the MTP head at `Q8_0`
-  - so there was no balanced MTP-head update to apply on 9B
+- file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+- `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
+- `good np=1`: `148.62 -> 139.40 tok/s` (`0.938x`)
+- `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+- `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+- `bad np=1`: `148.82 -> 125.10 tok/s` (`0.841x`)
+- `bad np=2`: `132.99 -> 115.83 tok/s` (`0.871x`)
 
-Representative results:
+Current full-matrix reading:
+
+- no checked model or quant is net-positive on `np=1`
+- only `Qwen3.5-9B q8_0` is still speed-positive at all, and only on the easier `np=2` cases
+- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-35B-A3B` is slower everywhere
+
+Representative current results:
 
 - 9B `UD-Q4_K_XL`, `primary np=1`: `175.91 -> 159.01 tok/s` (`0.904x`)
 - 9B `q8_0`, `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
@@ -244,68 +217,66 @@ Representative results:
 - 27B `UD-Q4_K_XL`, `primary np=1`: `72.35 -> 62.27 tok/s` (`0.861x`)
 - 35B-A3B `Q4_K_M`, `primary np=1`: `228.26 -> 170.72 tok/s` (`0.748x`)
 
-Representative profile readings from new per-step instrumentation:
+Representative current profile readings:
 
 - 9B `UD-Q4_K_XL`, `primary np=1`:
   - acceptance `12/15 (0.800)`
   - `draft 21.212 ms`
   - `accept 75.516 ms`
   - `replay 30.801 ms`
-  - mean step total `8503.1 us`
 - 9B `q8_0`, `primary np=1`:
   - acceptance `12/15 (0.800)`
   - `draft 23.585 ms`
   - `accept 99.580 ms`
   - `replay 8.597 ms`
-  - mean step total `8785.1 us`
 - 27B `UD-Q4_K_XL`, `bad np=2`:
   - acceptance `140/184 (0.761)`
   - `draft 127.729 ms`
   - `accept 958.105 ms`
   - `replay 395.062 ms`
-  - mean step total `7962.4 us`
 
-Interpretation we already believe locally:
+Visibility pass result from `/tmp/native-mtp-step-01`:
 
-- the remaining blocker is runtime economics, not merely model support
-- accept cost is still the recurring hot-path tax
-- replay remains a major bad-prompt cliff, especially on 27B
-- 9B `q8_0` proves the approach can win on easier `np=2` cases, but the margin is narrow and the `np=1` win has disappeared in the 3-repeat median
-- MoE support is currently more of a functionality milestone than a speed milestone
+- the branch now logs step-level `fast`, `logits_suppressed`, `forced_plain`, `cooldown`, and `guard` flags
+- speculative accept rows are already almost fully on the intended greedy fast path with logits suppressed
+- representative coverage:
+  - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+  - `9B q8_0 bad np=2`: `182/186`
+  - `9B UD-Q4 good np=2`: `180/186`
+  - `27B UD-Q4 bad np=2`: `180/186`
+- local conclusion from that pass:
+  - the earlier “split pure verifier rows from mixed decode chunks” idea is probably not the main remaining win
+  - remaining losses are mostly verifier/replay economics, not missed fast-path coverage
 
-Recent local-only additions on top of the earlier private native-MTP work:
+Important architectural fact uncovered after that pass:
 
-- `tools/server/server-context.cpp` now emits per-step lines:
-  - `native MTP step: step=... drafted=... accepted=... replay=... draft=... us snapshot=... us accept=... us restore=... us replay_us=... total=... us`
-- `scripts/validate_mtp_cuda.py` now parses:
-  - aggregate `native MTP profile: ...`
-  - per-step `native MTP step: ...`
-  - step-level acceptance and timing summaries into JSON
-- docs were updated to include the full 2026-04-10 multi-model matrix and the new optimization reading
+- `Qwen3.5` dense is also marked `hybrid` in libllama, not just `Qwen3.5-MoE`
+- that means the current one-step post-replay guard is already the live replay policy on 9B and 27B too
+- a trial “dense cooldown” branch produced no distinct `cooldown_hits` and was discarded
 
-What to optimize for:
+Interpretation of the regression:
 
-- real end-to-end tok/s, not isolated micro-timing wins
-- small benchmark-gated steps
-- maintainable changes that could be upstreamed incrementally
-- generic dense-path improvements before model-specific tricks
+- the older `9B q8_0` wins likely regressed because the permanent replay guard applies on dense Qwen 3.5 as well
+- so the current question is not “is there still a missed greedy fast path?”
+- it is closer to:
+  - does dense Qwen 3.5 actually need the same replay guard as A3B?
+  - if yes, is the remaining ceiling structural for one-token native MTP on hybrid Qwen 3.5?
+  - if no, can the guard be narrowed safely without breaking `np=1` exactness?
 
-What is probably not worth prioritizing:
+MoE / A3B context:
 
-- another large seed-transport project
-- recursive multi-token native drafting before the single-token path is broadly speed-positive
-- large model-specific fused-kernel work before server/runtime control-path costs are better understood
-- MoE-specific speed tuning as the main line of work right now
+- `Qwen3.5-35B-A3B Q4_K_M` originally had a real quantization-side weakness in `blk.40.nextn.eh_proj.weight`
+- balanced quant fix promoted that tensor from `Q4_K` to `Q5_K`
+- that was necessary but not sufficient
+- the remaining exactness issue was isolated to the first speculative step after replay
+- current branch fixed that conservatively by forcing one plain verifier step immediately after replay on hybrid/recurrent native-MTP slots
+- A3B is now correctness-clean on the checked `np=1` cases, but still materially slower than baseline on every checked quant
 
-What should not be misattributed:
+Current local belief on scope:
 
-- do not treat the A3B `Q4_K_M` exactness failure as proof that the runtime rollback/accept path is generically wrong
-- do not treat it as “just a broken GGUF” either
-- the current evidence is:
-  - quant quality needed to be fixed first
-  - restore+replay can rebuild the correct immediate next-token state
-  - the first speculative step after replay was the remaining correctness fault line
-  - the current branch addresses that with a conservative post-replay plain-step guard on hybrid/recurrent slots
+- dense Qwen 3.5 still looks like the only plausible speed target
+- MoE Qwen 3.5 looks more like a functionality/correctness burden than a likely speed-positive target for the current one-token design
+- the next meaningful runtime question may be too large for this first upstream-oriented branch because it likely involves deeper hybrid replay/guard behavior rather than another small server-local cleanup
 
 ================
 File: repomix/work/00_BROWSER_INSTRUCTIONS.md
@@ -513,7 +484,7 @@ Why it matters:
 - this private branch already has working model-side graph support for both dense `qwen35` and MoE `qwen35moe`
 - the main remaining problem is not “support the model family” but “make the runtime economics work”
 
-## 5. Server accept / rollback / replay hot path with new per-step profiling
+## 5. Server accept / rollback / replay hot path with new per-step profiling and replay guards
 
 File: `tools/server/server-context.cpp`
 
@@ -530,6 +501,9 @@ use_output_tokens = true;
 ...
 llama_set_output_tokens(ctx, use_output_tokens);
 llama_set_output_logits(ctx, !disable_output_logits);
+
+const bool pure_fast_path_verifier_batch = has_output_rows && use_output_tokens && disable_output_logits;
+const bool logits_suppressed_for_accept = has_output_rows && disable_output_logits;
 
 const int ret = llama_decode(ctx, batch_view);
 ...
@@ -550,6 +524,7 @@ const bool replay_ok = replay_native_mtp_prefix_batch(native_replay_slots);
 ...
 if (slot.uses_native_mtp_post_replay_guard()) {
     slot.native_mtp_skip_next_draft = std::max(slot.native_mtp_skip_next_draft, 1);
+    slot.native_mtp_skip_reason = server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD;
 }
 ...
 if (slot.uses_native_mtp_post_replay_guard() && slot.native_mtp_skip_next_draft > 0) {
@@ -563,6 +538,11 @@ SLT_INF(slot,
         " drafted=%zu"
         " accepted=%zu"
         " replay=%d"
+        " fast=%d"
+        " logits_suppressed=%d"
+        " forced_plain=%d"
+        " cooldown=%d"
+        " guard=%d"
         " draft=%" PRId64 " us"
         " snapshot=%" PRId64 " us"
         " accept=%" PRId64 " us"
@@ -575,7 +555,8 @@ SLT_INF(slot,
 Why it matters:
 
 - this is where the current control-path economics are most visible
-- the branch already has a direct greedy accept fast path plus optional logits suppression, but accept and replay still dominate on many cases
+- the branch already has a direct greedy accept fast path plus optional logits suppression
+- the new visibility pass showed those fast/logit paths are already near-saturated on the dense Qwen 3.5 cases
 - the current branch now also carries a conservative correctness guard for hybrid/recurrent replay: force one plain verifier step immediately after replay
 
 ## 6. Graph input support for native-MTP seed transport
@@ -630,6 +611,29 @@ Why it matters:
 
 - the benchmark harness can now report both aggregate phase totals and per-step acceptance/runtime summaries
 - the next optimization plan should assume this level of measurement exists and use it as the gate
+
+## 9. Qwen 3.5 dense is currently classified as hybrid too
+
+File: `src/llama-arch.cpp`
+
+```cpp
+bool llm_arch_is_hybrid(const llm_arch & arch) {
+    switch (arch) {
+        ...
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+```
+
+Why it matters:
+
+- the current replay guard is not just an A3B / MoE path
+- it already applies to the checked dense Qwen 3.5 models too
+- that is a strong candidate explanation for why `9B q8_0` regressed from the earlier pre-guard speed-positive state
 
 ## 8. New MTP quant audit and checked-in override files
 
@@ -1008,6 +1012,23 @@ File: docs/development/native-mtp-model-prep.md
 
 This note captures the workflow and sharp edges we hit while preparing real models for native-MTP testing in this private mirror.
 
+## Current V1 Scope
+
+For the first upstream-oriented native-MTP series in this private mirror, the recommended scope is:
+
+- keep dense `qwen35` in scope
+- keep `Qwen3.5-9B q8_0` as the only active speed target
+- keep `Qwen3.5-27B` only as supporting dense correctness / regression coverage
+- keep `Qwen3.5-35B-A3B` only as regression coverage for already-landed correctness work
+- defer `qwen35moe` / `Qwen3.5-35B-A3B` as an active speed target
+
+Reason:
+
+- dense Qwen 3.5 is the only family that has shown meaningful native-MTP CUDA wins in this branch
+- A3B / `qwen35moe` required both quantization-side rescue work and runtime replay-guard work just to restore checked `np=1` exactness
+- after that rescue, A3B is still materially slower than baseline on every checked quant
+- so MoE should currently be treated as a functionality / regression target, not as a v1 speed target
+
 ## Storage Rules
 
 - Store downloads and generated GGUFs under `/mnt/models`.
@@ -1257,6 +1278,9 @@ This matters because `/mnt/models` can fill up quickly during BF16 and multi-qua
   - the same guard stayed exact on the checked 9B and 27B dense references, and A3B `np=2` remained stability-clean in a smoke run
   - the tradeoff is conservative: it protects the lossless contract first, and deeper equivalence cleanup can still happen later if we want to recover some of that post-replay throughput
 - For MoE, the main issue was not “MTP is unsupported”; the main issue was preserving MTP tensors correctly and then accepting that runtime speedup may still be poor.
+- For the first upstream-oriented series, that means:
+  - keep the MoE path available locally for regression and future work
+  - but do not treat it as part of the active speed story
 - Community GGUFs cannot be trusted to preserve MTP unless verified explicitly.
 - A model or quant can be a valid native-MTP functionality target without being a speed-positive target.
 - Every new quant still needs a real `np=1` exactness check; do not assume exactness transfers automatically across quants of the same model family.
@@ -1314,6 +1338,23 @@ File: docs/development/native-mtp-optimization-plan.md
 
 This plan is for the current private native-MTP branch, with the goal of turning native MTP into a real end-to-end CUDA win on the dense Qwen 3.5 path while staying maintainable and upstream-friendly.
 
+## Scope Decision
+
+The current local recommendation for the first upstream-oriented series is:
+
+- keep the series dense-only
+- make `Qwen3.5-9B q8_0` the only active speed target
+- keep `Qwen3.5-27B UD-Q4_K_XL` only as supporting dense correctness / regression coverage
+- keep `Qwen3.5-35B-A3B` only as regression coverage for already-landed correctness work
+- explicitly defer `qwen35moe` / `Qwen3.5-35B-A3B` from the first upstreamable native-MTP series
+
+Why:
+
+- the checked dense path is the only place where native MTP has shown meaningful end-to-end CUDA wins at all
+- the current `9B q8_0` regression is now understood well enough to define one last narrow triage branch
+- `Qwen3.5-35B-A3B` required both quant-specific rescue work and replay-guard correctness work, and is still materially speed-negative on every checked quant
+- deeper hybrid replay/guard economics now look larger than a first upstream-oriented cleanup branch
+
 ## Constraints
 
 - judge every kept step by end-to-end tok/s, not internal phase timing alone
@@ -1343,6 +1384,13 @@ Current state:
   - `bad np=2`: `58.64 -> 53.61 tok/s`
 - `Qwen3.5-35B-A3B` is still slower on every checked quant.
 - `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again on the checked CUDA cases after a permanent one-step post-replay guard was added for hybrid/recurrent native-MTP slots, but it is still far from speed-positive.
+- `Qwen3.5-9B q8_0` also regressed materially from the earlier pre-guard state under the same newer harness:
+  - earlier file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - current file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.082x -> 0.999x`
+  - `good np=1`: `1.030x -> 0.938x`
+  - `primary np=2`: `1.082x -> 1.042x`
+  - `good np=2`: `1.104x -> 1.034x`
 
 Interpretation:
 
@@ -1352,6 +1400,18 @@ Interpretation:
 - replay is the main bad-prompt cliff on the larger dense path
 - MoE is currently a functionality target, not a speed target
 - the backend-resident seed path already landed and should not be reopened as a standalone project unless later evidence changes
+- the 2026-04-10 visibility rerun also ruled out a likely server-local win:
+  - on the checked Qwen 3.5 dense gates, speculative accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
+  - representative coverage from `/tmp/native-mtp-step-01`:
+    - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+    - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+    - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+  - that makes a mixed-chunk “split out pure verifier rows” pass unlikely to unlock a large end-to-end win
+- Qwen 3.5 dense is also currently classified as `hybrid` in libllama (`src/llama-arch.cpp`), not just `qwen35moe`
+  - the current one-step post-replay guard is therefore already the live replay policy on the checked 9B and 27B targets too
+  - a separate “dense cooldown” experiment did not create distinct `cooldown_hits`; it collapsed into the same guard behavior and was dropped
+- that means the current remaining question is no longer “is there another small verifier fast path in the server?”
+  - it is much closer to “can the replay guard be narrowed safely on dense Qwen 3.5, or is the current one-token native-MTP ceiling structural on the hybrid path?”
 
 A3B correctness side note:
 
@@ -1367,7 +1427,7 @@ A3B correctness side note:
 
 ## Priority Order
 
-### 1. Harden the benchmark gate
+### 1. Keep the benchmark gate and narrow the active targets
 
 Files:
 
@@ -1384,9 +1444,17 @@ Required output from the harness:
 
 Fixed CUDA cases:
 
-- `primary`: dense 9B short exact regression case
-- `good`: known good/stable case
-- `bad`: replay-heavy stability case
+- active speed target:
+  - `Qwen3.5-9B q8_0`
+  - `primary`: dense short exact regression case
+  - `good`: known good/stable exact case
+  - `bad`: replay-heavy stability case
+- supporting dense coverage:
+  - `Qwen3.5-9B UD-Q4_K_XL`
+  - `Qwen3.5-27B UD-Q4_K_XL`
+- regression-only coverage:
+  - `Qwen3.5-35B-A3B Q4_K_M`
+  - only for `np=1` exactness smoke and `np>1` smoke stability when needed
 
 This step is mandatory before runtime changes are judged.
 
@@ -1475,7 +1543,7 @@ Status:
 - dropped
 - reason: end-to-end gains did not hold up under repeated benchmarking; the draft bucket barely moved, so the apparent win was noise rather than a real structural improvement
 
-### 5. Add a conservative replay-triggered cooldown
+### 5. Replay policy work is now a narrow triage question, not a broad cleanup step
 
 Primary target:
 
@@ -1498,6 +1566,72 @@ Why this is now more urgent:
 - the same cooldown shape is also now a correctness diagnostic on A3B:
   - skipping exactly one post-replay speculative step restored `bad np=1` exactness there
   - that has now been promoted from a debug probe to the current permanent hybrid/recurrent correctness guard
+
+Status:
+
+- replay policy still matters
+- but the current question is no longer “add a second cooldown knob”
+- the only narrow runtime branch that still looks justified is:
+  - test whether the current post-replay guard can be narrowed from broad hybrid classification to the concrete failing restore/state mode without breaking `np=1` exactness
+- if that does not recover a clear repeated `9B q8_0 np=1` win, stop and treat the remaining ceiling as structural for the current one-token native-MTP design
+
+### 5b. Next Branch: Replay-Guard Narrowing Triage
+
+This is the one remaining narrow runtime branch worth trying before stopping.
+
+Target:
+
+- recover the lost dense `9B q8_0 np=1` win if possible
+- without reopening a large hybrid-state redesign
+- without weakening the checked `np=1` exactness contract
+
+Hypothesis:
+
+- the current broad replay guard is likely the main reason `9B q8_0` regressed from the earlier pre-guard speed-positive state
+- dense `Qwen3.5` may not need the same guard scope as the failing A3B replay path
+
+Allowed change shape:
+
+- narrow the guard based on the concrete replay / restore mode or state flags that reproduced the A3B failure
+- do not add a new adaptive controller
+- do not broaden public API surface unless there is no cleaner local path
+
+Minimum validation matrix:
+
+- active speed target:
+  - `Qwen3.5-9B q8_0`: `primary`, `good`, `bad`; `np=1,2`; `repeat=3`
+- supporting dense regression checks:
+  - `Qwen3.5-9B UD-Q4_K_XL`: `primary`, `good`, `bad`; `np=1,2`; `repeat=3`
+  - `Qwen3.5-27B UD-Q4_K_XL`: `primary`, `good`, `bad`; `np=1,2`; `repeat=3`
+- regression-only correctness smoke:
+  - `Qwen3.5-35B-A3B Q4_K_M`: `primary`, `good`, `bad`; `np=1`; `repeat=1`
+
+Success condition:
+
+- `9B q8_0` regains a clear repeated `np=1` win on `primary` and at least no meaningful regression on `good`
+- all checked `np=1` cases remain exact
+
+Failure / stop condition:
+
+- if narrowing the guard does not recover a clear `9B q8_0 np=1` win
+- or if exactness regresses on any checked dense or A3B smoke case
+- stop this runtime-cleanup line and document the ceiling
+
+### 5c. Stop Condition After Visibility
+
+If all of the following remain true after the visibility pass:
+
+- pure-fast-path verifier coverage is already near-saturated
+- logits are already suppressed on almost all speculative accept rows
+- the current replay guard is already the live dense-path policy
+- repeated end-to-end tok/s remains negative on 9B UD-Q4 and 27B
+
+then stop treating server-local batching tweaks as the leading bet.
+
+At that point the next cycle should explicitly choose one of two directions:
+
+- a separate deeper hybrid replay/guard branch, with the expectation of larger libllama-side changes
+- or a documented “structural ceiling” conclusion for current single-token native MTP on Qwen 3.5
 
 ### 6. Keep only small hot-path cleanups that beat noise
 
@@ -1530,12 +1664,39 @@ Do not keep any optimization unless all of the following remain true:
 Not worth doing yet:
 
 - another standalone seed-transport project
+- deeper hybrid replay/guard economics in this first upstream-oriented branch
 - recursive multi-token native drafting
 - model-specific fused kernels before the control-path costs are addressed
 - MoE-specific speed tuning as the main optimization track
+- `qwen35moe` / `Qwen3.5-35B-A3B` as an active speed target for the first upstreamable series
 - tiny container cleanup before accept/replay/draft-reuse work
 
 Those are follow-up options only after the dense path is broadly speed-positive beyond the current `9B q8_0` `np=2` niche.
+
+## V1 Upstream Prep Checklist
+
+Before cutting the first upstream-oriented series from this private mirror:
+
+1. keep the series dense-only in both code claims and benchmark framing
+2. keep `Qwen3.5-9B q8_0` as the only active speed target
+3. keep `Qwen3.5-9B UD-Q4_K_XL` and `Qwen3.5-27B UD-Q4_K_XL` only as supporting dense regression checks
+4. keep `Qwen3.5-35B-A3B Q4_K_M` only as a local `np=1` regression smoke target
+5. run the one remaining narrow triage branch:
+   - test whether the current replay guard can be narrowed safely on dense `qwen35`
+   - keep exact `np=1` matching non-negotiable on all checked dense cases
+6. stop the runtime-cleanup line if that branch does not recover a clear repeated `9B q8_0 np=1` win
+7. prepare the upstream series around the pieces that are already understandable and defensible:
+   - backend seed transport
+   - greedy verifier fast accept
+   - token-only verifier output path
+   - benchmark harness / validation docs
+8. keep deeper hybrid replay economics, multi-token drafting, and `qwen35moe` speed work out of the first series
+
+If the replay-guard narrowing branch fails, the upstream-ready outcome for v1 is:
+
+- dense-only native MTP support with conservative replay behavior
+- explicit documentation that current one-token native MTP has only narrow speed-positive cases on Qwen 3.5
+- MoE support retained locally for regression and future work, but not proposed as part of the first upstreamable speed story
 
 ================
 File: scripts/validate_mtp_cuda.py
@@ -1583,6 +1744,11 @@ STEP_RE = re.compile(
     r" drafted=(?P<drafted>\d+)"
     r" accepted=(?P<accepted>\d+)"
     r" replay=(?P<replay>[01])"
+    r" fast=(?P<fast>[01])"
+    r" logits_suppressed=(?P<logits_suppressed>[01])"
+    r" forced_plain=(?P<forced_plain>[01])"
+    r" cooldown=(?P<cooldown>[01])"
+    r" guard=(?P<guard>[01])"
     r" draft=(?P<draft_us>\d+)\s+us"
     r" snapshot=(?P<snapshot_us>\d+)\s+us"
     r" accept=(?P<accept_us>\d+)\s+us"
@@ -1671,6 +1837,11 @@ class ProfileTotals:
                 "drafted": int(match.group("drafted")),
                 "accepted": int(match.group("accepted")),
                 "replay": int(match.group("replay")),
+                "fast": int(match.group("fast")),
+                "logits_suppressed": int(match.group("logits_suppressed")),
+                "forced_plain": int(match.group("forced_plain")),
+                "cooldown": int(match.group("cooldown")),
+                "guard": int(match.group("guard")),
                 "draft_us": int(match.group("draft_us")),
                 "snapshot_us": int(match.group("snapshot_us")),
                 "accept_us": int(match.group("accept_us")),
@@ -1688,17 +1859,18 @@ class ProfileTotals:
         if self.acceptance_generated > 0:
             acceptance_rate = self.acceptance_accepted / self.acceptance_generated
 
-        step_count = len(self.steps)
-        step_drafted = sum(step["drafted"] for step in self.steps)
-        step_accepted = sum(step["accepted"] for step in self.steps)
+        speculative_steps = [step for step in self.steps if step["forced_plain"] == 0]
+        step_count = len(speculative_steps)
+        step_drafted = sum(step["drafted"] for step in speculative_steps)
+        step_accepted = sum(step["accepted"] for step in speculative_steps)
         step_acceptance_rate = None if step_drafted == 0 else step_accepted / step_drafted
         step_totals_us = {
-            "draft": sum(step["draft_us"] for step in self.steps),
-            "snapshot": sum(step["snapshot_us"] for step in self.steps),
-            "accept": sum(step["accept_us"] for step in self.steps),
-            "restore": sum(step["restore_us"] for step in self.steps),
-            "replay": sum(step["replay_us"] for step in self.steps),
-            "total": sum(step["total_us"] for step in self.steps),
+            "draft": sum(step["draft_us"] for step in speculative_steps),
+            "snapshot": sum(step["snapshot_us"] for step in speculative_steps),
+            "accept": sum(step["accept_us"] for step in speculative_steps),
+            "restore": sum(step["restore_us"] for step in speculative_steps),
+            "replay": sum(step["replay_us"] for step in speculative_steps),
+            "total": sum(step["total_us"] for step in speculative_steps),
         }
         step_mean_us = {
             key: None if step_count == 0 else value / step_count
@@ -1737,10 +1909,19 @@ class ProfileTotals:
                 "count": step_count,
                 "drafted": step_drafted,
                 "accepted": step_accepted,
-                "replay_steps": sum(step["replay"] for step in self.steps),
+                "replay_steps": sum(step["replay"] for step in speculative_steps),
                 "acceptance_rate": step_acceptance_rate,
                 "totals_us": step_totals_us,
                 "mean_us": step_mean_us,
+            },
+            "step_visibility": {
+                "all_steps": len(self.steps),
+                "speculative_steps": step_count,
+                "pure_fast_path_steps": sum(step["fast"] for step in speculative_steps),
+                "logits_suppressed_steps": sum(step["logits_suppressed"] for step in speculative_steps),
+                "forced_plain_steps": sum(step["forced_plain"] for step in self.steps),
+                "cooldown_hits": sum(step["cooldown"] for step in self.steps),
+                "guard_hits": sum(step["guard"] for step in self.steps),
             },
             "steps": self.steps,
         }
@@ -2746,6 +2927,32 @@ Benchmarked models:
 - `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere, though less catastrophically than in the pre-fix sweep.
 - `Qwen3.5-35B-A3B` is now `np=1` exact across the checked quants, including the balanced `Q4_K_M` GGUF, but remains substantially slower than baseline.
 
+## Current Scope Decision
+
+Based on the current branch history and the post-guard regression, the recommended scope for the first upstream-oriented series is:
+
+- active speed target:
+  - `Qwen3.5-9B q8_0`
+- supporting dense correctness / regression coverage:
+  - `Qwen3.5-9B UD-Q4_K_XL`
+  - `Qwen3.5-27B UD-Q4_K_XL`
+- regression-only coverage:
+  - `Qwen3.5-35B-A3B`, especially `Q4_K_M` `np=1`
+- deferred from the first upstreamable series:
+  - `qwen35moe` / `Qwen3.5-35B-A3B` as an active speed target
+
+Why this is now the right scope:
+
+- `Qwen3.5-9B q8_0` is still the only path that has ever shown meaningful CUDA wins in this branch
+- `Qwen3.5-9B q8_0` also regressed materially after the permanent replay guard, under the same newer harness:
+  - pre-guard file: `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - post-guard file: `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.082x -> 0.999x`
+  - `good np=1`: `1.030x -> 0.938x`
+- the visibility pass showed that speculative accept rows are already almost fully on the greedy verifier fast path with logits suppressed
+- so the remaining problem is no longer “recover an easy server fast path”; it is much closer to replay-guard / hybrid-state economics
+- `Qwen3.5-35B-A3B` remains materially speed-negative even after the quant-quality rescue and replay-guard correctness fix
+
 Interpretation:
 
 - the current single-token native-MTP upside is real on the 9B Q8 path
@@ -2862,6 +3069,47 @@ Practical reading:
 
 - if the target is “ship a native-MTP case that is actually faster today”, the only clean answer from this matrix is still `Qwen3.5-9B q8_0`, and only on the easier `np=2` cases
 - if the target is “make native MTP broadly speed-positive”, the next optimization work has to reduce real control-path cost, especially accept and replay, while preserving the `np=1` exactness contract
+- for the first upstream-oriented series, the pragmatic read is narrower:
+  - keep `9B q8_0` as the only active speed target
+  - keep `27B` as supporting dense regression coverage
+  - keep A3B only as correctness / stability regression coverage
+  - do not treat `qwen35moe` as a speed target for v1
+
+## Step-01 Visibility Gate
+
+After the main 2026-04-10 sweep, the branch was rerun with expanded per-step visibility in `native MTP step:` so the validator could count:
+
+- pure fast-path verifier steps
+- logits-suppressed accept steps
+- forced plain post-replay steps
+- guard hits
+
+Dense-gate result:
+
+- speculative accept rows are already almost fully on the intended greedy verifier fast path
+- representative coverage from `/tmp/native-mtp-step-01`:
+  - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+  - `9B q8_0 bad np=2`: `182/186` pure-fast-path, `182/186` logits-suppressed
+  - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+  - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+- A3B `Q4_K_M` smoke remained exact on `primary`, `good`, and `bad` `np=1`
+
+Implication:
+
+- there is little evidence left for a profitable “split pure verifier rows out of mixed decode chunks” optimization on the current Qwen 3.5 path
+- the remaining drag is mostly verifier/replay economics, not a hidden fast-path coverage leak
+
+Follow-up that was tried and discarded:
+
+- a separate dense one-step post-replay cooldown was tested and then dropped
+- reason:
+  - current libllama marks `Qwen3.5-9B` and `Qwen3.5-27B` as `hybrid`, so the existing post-replay guard is already the live policy there
+  - the cooldown trial produced `0` distinct `cooldown_hits` on the q8 gate and no new behavioral separation from the existing guard
+
+Next local branch implied by this result:
+
+- the only remaining narrow runtime branch worth trying is to see whether the replay guard can be narrowed safely for dense `Qwen3.5`
+- if that does not recover a clear repeated `9B q8_0 np=1` win, the current one-token native-MTP design should be treated as having reached its structural ceiling on this hybrid path
 
 ## Raw Artifacts
 
@@ -2870,9 +3118,14 @@ Per-model JSON summaries:
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-ud-q4.json`
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q4_k_m.json`
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-q5_k_m.json`
 - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-35b-a3b-ud-q4.json`
+- `/tmp/native-mtp-step-01/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-step-01/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-step-01/qwen35-27b-ud-q4.json`
+- `/tmp/native-mtp-step-01/qwen35-35b-a3b-q4_k_m-smoke.json`
 
 Each JSON also points at its per-scenario log directory under `/tmp`.
 

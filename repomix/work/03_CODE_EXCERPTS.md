@@ -117,7 +117,7 @@ Why it matters:
 - this private branch already has working model-side graph support for both dense `qwen35` and MoE `qwen35moe`
 - the main remaining problem is not “support the model family” but “make the runtime economics work”
 
-## 5. Server accept / rollback / replay hot path with new per-step profiling
+## 5. Server accept / rollback / replay hot path with new per-step profiling and replay guards
 
 File: `tools/server/server-context.cpp`
 
@@ -134,6 +134,9 @@ use_output_tokens = true;
 ...
 llama_set_output_tokens(ctx, use_output_tokens);
 llama_set_output_logits(ctx, !disable_output_logits);
+
+const bool pure_fast_path_verifier_batch = has_output_rows && use_output_tokens && disable_output_logits;
+const bool logits_suppressed_for_accept = has_output_rows && disable_output_logits;
 
 const int ret = llama_decode(ctx, batch_view);
 ...
@@ -154,6 +157,7 @@ const bool replay_ok = replay_native_mtp_prefix_batch(native_replay_slots);
 ...
 if (slot.uses_native_mtp_post_replay_guard()) {
     slot.native_mtp_skip_next_draft = std::max(slot.native_mtp_skip_next_draft, 1);
+    slot.native_mtp_skip_reason = server_slot::NATIVE_MTP_SKIP_REASON_POST_REPLAY_GUARD;
 }
 ...
 if (slot.uses_native_mtp_post_replay_guard() && slot.native_mtp_skip_next_draft > 0) {
@@ -167,6 +171,11 @@ SLT_INF(slot,
         " drafted=%zu"
         " accepted=%zu"
         " replay=%d"
+        " fast=%d"
+        " logits_suppressed=%d"
+        " forced_plain=%d"
+        " cooldown=%d"
+        " guard=%d"
         " draft=%" PRId64 " us"
         " snapshot=%" PRId64 " us"
         " accept=%" PRId64 " us"
@@ -179,7 +188,8 @@ SLT_INF(slot,
 Why it matters:
 
 - this is where the current control-path economics are most visible
-- the branch already has a direct greedy accept fast path plus optional logits suppression, but accept and replay still dominate on many cases
+- the branch already has a direct greedy accept fast path plus optional logits suppression
+- the new visibility pass showed those fast/logit paths are already near-saturated on the dense Qwen 3.5 cases
 - the current branch now also carries a conservative correctness guard for hybrid/recurrent replay: force one plain verifier step immediately after replay
 
 ## 6. Graph input support for native-MTP seed transport
@@ -234,6 +244,29 @@ Why it matters:
 
 - the benchmark harness can now report both aggregate phase totals and per-step acceptance/runtime summaries
 - the next optimization plan should assume this level of measurement exists and use it as the gate
+
+## 9. Qwen 3.5 dense is currently classified as hybrid too
+
+File: `src/llama-arch.cpp`
+
+```cpp
+bool llm_arch_is_hybrid(const llm_arch & arch) {
+    switch (arch) {
+        ...
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+```
+
+Why it matters:
+
+- the current replay guard is not just an A3B / MoE path
+- it already applies to the checked dense Qwen 3.5 models too
+- that is a strong candidate explanation for why `9B q8_0` regressed from the earlier pre-guard speed-positive state
 
 ## 8. New MTP quant audit and checked-in override files
 

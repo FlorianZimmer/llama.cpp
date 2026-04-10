@@ -1,101 +1,103 @@
 USER_GOAL:
-Review the current private native-MTP state in this llama.cpp mirror and produce a concrete next-step optimization plan for getting real net-positive end-to-end speedups on CUDA while staying upstream-friendly and maintainable.
+Review the current private native-MTP state in this llama.cpp mirror and answer two scope-defining questions for the next cycle:
 
-DELIVERABLE_TYPE: PLAN
+1. Should we spend another branch on deeper hybrid replay/guard economics for Qwen 3.5 native MTP, or is that too large/risky for this first upstream-oriented implementation?
+2. Should `Qwen3.5-35B-A3B` / `qwen35moe` stay in the native-MTP scope at all, or should it be removed/deferred because the expected upside is too small relative to the complexity and correctness cost?
+
+DELIVERABLE_TYPE: RESULT
 
 USER_REQUEST:
-Please review this private-mirror native-MTP implementation and produce a pragmatic optimization plan focused on real end-to-end speedups, not internal timing wins alone.
+Please review this private-mirror native-MTP implementation and give a concrete recommendation about branch scope and next actions.
 
-Important benchmark context from the latest full sweep on 2026-04-10:
+The main questions are:
 
-- Models tested:
-  - Qwen3.5-9B `UD-Q4_K_XL`
-  - Qwen3.5-9B `q8_0`
-  - Qwen3.5-27B `UD-Q4_K_XL`
-  - Qwen3.5-35B-A3B `Q4_K_M`
-  - Qwen3.5-35B-A3B `Q5_K_M`
-  - Qwen3.5-35B-A3B `UD-Q4_K_XL`
-- Cases tested: `primary`, `good`, `bad`
-- Parallel counts tested: `np=1`, `np=2`
-- Repeats: `3`
-- Current result:
-  - no checked model or quant is net-positive on `np=1`
-  - Qwen3.5-9B `q8_0` is still the only speed-positive path, but only on the easier `np=2` cases
-  - Qwen3.5-9B `UD-Q4_K_XL` is slower everywhere
-  - Qwen3.5-27B is speed-negative everywhere
-  - Qwen3.5-35B-A3B is speed-negative everywhere
-  - Qwen3.5-35B-A3B `Q4_K_M` is now `np=1` exact again after the landed post-replay guard fix
+1. We already know `Qwen3.5-9B q8_0` used to be clearly faster in an earlier branch state. Did the later correctness work regress that path in a fundamental way, and if so, is it worth targeting deeper hybrid replay/guard economics next?
+2. How do other public MTP-capable inference stacks handle the kinds of issues we ran into here:
+   - verifier fast-path / logits suppression
+   - replay / rollback after rejected drafts
+   - hybrid or recurrent state restoration
+   - dense vs MoE runtime economics
+   - exactness expectations at low draft depth
+3. Is `Qwen3.5-35B-A3B` / `qwen35moe` worth keeping in scope for the first upstreamable native-MTP series, or should it be explicitly deferred or removed for now?
 
-Representative exact `np=1` results:
+Please answer using the included local files as the source of truth for this private branch. For broader comparison, you may use public sources surgically.
 
-- 9B `UD-Q4_K_XL`: `175.91 -> 159.01 tok/s` (`0.904x`)
-- 9B `q8_0`: `150.53 -> 150.31 tok/s` (`0.999x`)
-- 27B `UD-Q4_K_XL`: `72.35 -> 62.27 tok/s` (`0.861x`)
-- 35B-A3B `Q4_K_M`: `228.26 -> 170.72 tok/s` (`0.748x`)
-- 35B-A3B `Q5_K_M`: `221.34 -> 167.90 tok/s` (`0.759x`)
-- 35B-A3B `UD-Q4_K_XL`: `202.80 -> 129.34 tok/s` (`0.638x`)
+Important: do not broaden into a generic literature survey. Focus on public implementations that are directly useful for this decision. Examples of useful targets if relevant:
 
-Representative speed-positive `np=2` results:
+- public upstream `ggml-org/llama.cpp` only where needed to compare with this branch
+- public inference stacks / engines that concretely support MTP or close speculative decoding variants for Qwen-class models, especially where replay/rollback, verifier batching, or MoE support are documented or visible in code
 
-- 9B `q8_0`, `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
-- 9B `q8_0`, `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+What I want back:
 
-Representative profile summaries from the new per-step instrumentation:
+1. A direct answer to whether the next step should be:
+   - a deeper hybrid replay/guard branch
+   - a narrower dense-only cleanup branch
+   - or a stop/defer decision because the remaining ceiling is likely structural for the current one-token native-MTP design
+2. A direct answer to whether `qwen35moe` should stay in scope for the first upstreamable series.
+3. A short comparison against other public MTP-capable stacks:
+   - how they handle replay / verifier / state problems
+   - what they do differently from this branch if anything materially relevant
+   - whether any of those ideas look realistically portable here
+4. A pragmatic recommended path for this private mirror in priority order, with explicit “do now”, “separate later branch”, and “drop/defer” buckets.
 
-- 9B `UD-Q4_K_XL`, `primary np=1`:
-  - acceptance `12/15 (0.800)`
-  - `draft ~= 21.2 ms`
-  - `accept ~= 75.5 ms`
-  - `replay ~= 30.8 ms`
-- 9B `q8_0`, `primary np=1`:
-  - acceptance `12/15 (0.800)`
-  - `draft ~= 23.6 ms`
-  - `accept ~= 99.6 ms`
-  - `replay ~= 8.6 ms`
-- 27B `UD-Q4_K_XL`, `bad np=2`:
-  - acceptance `140/184 (0.761)`
-  - `draft ~= 127.7 ms`
-  - `accept ~= 958.1 ms`
-  - `replay ~= 395.1 ms`
+Critical benchmark context:
 
-Important quantization-side follow-up found after the sweep:
+- This branch already had an earlier faster `Qwen3.5-9B q8_0` state under the current harness, before the permanent replay guard:
+  - from `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `150.83 -> 163.23 tok/s` (`1.082x`)
+  - `good np=1`: `148.88 -> 153.38 tok/s` (`1.030x`)
+  - `primary np=2`: `128.08 -> 138.55 tok/s` (`1.082x`)
+  - `good np=2`: `131.40 -> 145.13 tok/s` (`1.104x`)
+- Current branch state after the permanent hybrid/recurrent post-replay guard:
+  - from `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `150.53 -> 150.31 tok/s` (`0.999x`)
+  - `good np=1`: `148.62 -> 139.40 tok/s` (`0.938x`)
+  - `primary np=2`: `127.85 -> 133.26 tok/s` (`1.042x`)
+  - `good np=2`: `132.66 -> 137.12 tok/s` (`1.034x`)
+  - `bad np=1`: `148.82 -> 125.10 tok/s` (`0.841x`)
+  - `bad np=2`: `132.99 -> 115.83 tok/s` (`0.871x`)
 
-- the `Qwen3.5-35B-A3B Q4_K_M` `bad np=1` exactness failure was not just a generic runtime bug, but it also was not explained by quantization alone
-- all A3B MTP GGUFs preserve the same MTP metadata and tensor set
-- the only differing MTP tensor across the tested A3B quants is:
-  - `blk.40.nextn.eh_proj.weight`
-- that tensor is:
-  - `Q4_K` in the failing `Q4_K_M` GGUF
-  - `Q5_K` in the passing `Q5_K_M` GGUF
-  - `Q8_0` in the passing `UD-Q4_K_XL` GGUF
-- BF16-vs-quant audit on that tensor showed:
-  - `Q4_K`: `rel_rmse ~= 0.0759`, cosine `~= 0.9971`
-  - `Q5_K`: `rel_rmse ~= 0.0417`, cosine `~= 0.9991`
-  - `Q8_0`: `rel_rmse ~= 0.0086`, cosine `~= 0.9999`
-- checked-in balanced recommendation for that tensor is `Q5_K`
-- checked-in strict recommendation for that tensor is `Q8_0`
-- the balanced `Q4_K_M` rebuild is now the canonical GGUF on disk
-- the remaining exactness issue was isolated to the first speculative step after replay on the hybrid/recurrent path
-- the current branch now fixes that conservatively by forcing one plain verifier step immediately after replay on hybrid/recurrent native-MTP slots
+Current branch-wide reading from the full 2026-04-10 matrix:
 
-Please:
-1. Identify the most likely remaining bottlenecks in the current implementation.
-2. Propose upstream-friendly optimization steps in priority order.
-3. Keep the plan benchmark-gated after each step against:
-   - greedy baseline
-   - the immediately previous native-MTP step
-4. Explicitly call out which ideas are likely not worth doing yet.
-5. Distinguish:
-   - dense-model generic work that could improve 9B and 27B
-   - work that may help MoE correctness or stability but is unlikely to rescue speed
-   - work that is runtime-side versus work that is really quantization-side
-6. Use the provided local file excerpts and docs as the source of truth for this private branch.
-7. If you need public upstream context, fetch it surgically from public `ggml-org/llama.cpp` only for exact files or symbols that matter. Do not broaden into a full-repo read.
+- no checked model or quant is net-positive on `np=1`
+- only `Qwen3.5-9B q8_0` remains speed-positive at all, and only on the easier `np=2` cases
+- `Qwen3.5-9B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-27B UD-Q4_K_XL` is slower everywhere
+- `Qwen3.5-35B-A3B` is slower everywhere
+- `Qwen3.5-35B-A3B Q4_K_M` is now `np=1` exact again after the replay guard fix, but still far from speed-positive
+
+Very important local finding from the new visibility pass:
+
+- speculative accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
+- representative coverage from `/tmp/native-mtp-step-01`:
+  - `9B q8_0 primary np=1`: `15/15` pure-fast-path, `15/15` logits-suppressed
+  - `9B UD-Q4 good np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+  - `27B UD-Q4 bad np=2`: `180/186` pure-fast-path, `180/186` logits-suppressed
+- this means the earlier “maybe split pure verifier rows out of mixed chunks” idea is now probably not the main win
+
+Another very important local finding:
+
+- in this branch, `Qwen3.5` dense is currently classified as `hybrid` in libllama too, not just `Qwen3.5-MoE`
+- so the current one-step post-replay guard is already the live policy on the checked 9B and 27B targets, not just on A3B
+- a trial “dense cooldown” branch produced no distinct `cooldown_hits`; it collapsed into the same guard behavior and was dropped
+
+MoE-specific reality check:
+
+- `Qwen3.5-35B-A3B` native MTP is now functionally/correctness-clean on the checked `np=1` cases
+- but it is still materially slower than baseline on every checked quant
+- current local belief is that this may simply not be a good speed target even with a cleaner implementation, because the model is already a fast active-parameter MoE path and the current native-MTP depth is only one token
+
+Please do not just say “more profiling needed”. I want a specific call:
+
+- continue deeper on hybrid replay/guard economics now
+- or stop here and narrow scope for the first upstreamable series
 
 CONSTRAINTS:
-- Prefer small-to-medium scoped steps over large speculative rewrites.
-- Preserve the current validated correctness contract:
-  - `np=1` exactness matters
-  - `np>1` on hybrid/recurrent native-MTP is stability-focused, not strict batch-invariant exactness
-- Focus on runtime/server/graph overhead before suggesting deeper kernel or scheduler redesign.
-- Stay close to something that could plausibly be upstreamed in pieces.
+
+- preserve the already-validated `np=1` exactness contract on the checked dense and A3B cases
+- prefer upstream-friendly conclusions over heroic local-only hacks
+- separate:
+  - “worth doing in this private mirror next”
+  - “worth exploring later in a dedicated branch”
+  - “not worth keeping in scope for v1”
+- if you use public upstream or other public projects, fetch them surgically and explain exactly why they matter

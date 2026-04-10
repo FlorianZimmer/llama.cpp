@@ -41,6 +41,11 @@ STEP_RE = re.compile(
     r" drafted=(?P<drafted>\d+)"
     r" accepted=(?P<accepted>\d+)"
     r" replay=(?P<replay>[01])"
+    r" fast=(?P<fast>[01])"
+    r" logits_suppressed=(?P<logits_suppressed>[01])"
+    r" forced_plain=(?P<forced_plain>[01])"
+    r" cooldown=(?P<cooldown>[01])"
+    r" guard=(?P<guard>[01])"
     r" draft=(?P<draft_us>\d+)\s+us"
     r" snapshot=(?P<snapshot_us>\d+)\s+us"
     r" accept=(?P<accept_us>\d+)\s+us"
@@ -129,6 +134,11 @@ class ProfileTotals:
                 "drafted": int(match.group("drafted")),
                 "accepted": int(match.group("accepted")),
                 "replay": int(match.group("replay")),
+                "fast": int(match.group("fast")),
+                "logits_suppressed": int(match.group("logits_suppressed")),
+                "forced_plain": int(match.group("forced_plain")),
+                "cooldown": int(match.group("cooldown")),
+                "guard": int(match.group("guard")),
                 "draft_us": int(match.group("draft_us")),
                 "snapshot_us": int(match.group("snapshot_us")),
                 "accept_us": int(match.group("accept_us")),
@@ -146,17 +156,18 @@ class ProfileTotals:
         if self.acceptance_generated > 0:
             acceptance_rate = self.acceptance_accepted / self.acceptance_generated
 
-        step_count = len(self.steps)
-        step_drafted = sum(step["drafted"] for step in self.steps)
-        step_accepted = sum(step["accepted"] for step in self.steps)
+        speculative_steps = [step for step in self.steps if step["forced_plain"] == 0]
+        step_count = len(speculative_steps)
+        step_drafted = sum(step["drafted"] for step in speculative_steps)
+        step_accepted = sum(step["accepted"] for step in speculative_steps)
         step_acceptance_rate = None if step_drafted == 0 else step_accepted / step_drafted
         step_totals_us = {
-            "draft": sum(step["draft_us"] for step in self.steps),
-            "snapshot": sum(step["snapshot_us"] for step in self.steps),
-            "accept": sum(step["accept_us"] for step in self.steps),
-            "restore": sum(step["restore_us"] for step in self.steps),
-            "replay": sum(step["replay_us"] for step in self.steps),
-            "total": sum(step["total_us"] for step in self.steps),
+            "draft": sum(step["draft_us"] for step in speculative_steps),
+            "snapshot": sum(step["snapshot_us"] for step in speculative_steps),
+            "accept": sum(step["accept_us"] for step in speculative_steps),
+            "restore": sum(step["restore_us"] for step in speculative_steps),
+            "replay": sum(step["replay_us"] for step in speculative_steps),
+            "total": sum(step["total_us"] for step in speculative_steps),
         }
         step_mean_us = {
             key: None if step_count == 0 else value / step_count
@@ -195,10 +206,19 @@ class ProfileTotals:
                 "count": step_count,
                 "drafted": step_drafted,
                 "accepted": step_accepted,
-                "replay_steps": sum(step["replay"] for step in self.steps),
+                "replay_steps": sum(step["replay"] for step in speculative_steps),
                 "acceptance_rate": step_acceptance_rate,
                 "totals_us": step_totals_us,
                 "mean_us": step_mean_us,
+            },
+            "step_visibility": {
+                "all_steps": len(self.steps),
+                "speculative_steps": step_count,
+                "pure_fast_path_steps": sum(step["fast"] for step in speculative_steps),
+                "logits_suppressed_steps": sum(step["logits_suppressed"] for step in speculative_steps),
+                "forced_plain_steps": sum(step["forced_plain"] for step in self.steps),
+                "cooldown_hits": sum(step["cooldown"] for step in self.steps),
+                "guard_hits": sum(step["guard"] for step in self.steps),
             },
             "steps": self.steps,
         }
