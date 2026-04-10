@@ -2,6 +2,12 @@
 
 Date: 2026-04-10
 
+Status note (2026-04-11):
+
+This branch is kept as historical context.
+The current fork-level native-MTP line is now paused.
+The implementation works, the kept dense `np=1` path remains exact, and the latest dense-only branch recovered a real win on `Qwen3.5-9B q8_0`, but broader dense speedups did not survive across the checked targets and the remaining gap now looks structural rather than local.
+
 This note tracks the remaining upstream-friendly native-MTP performance work after the backend-resident seed transport landed. The work here is intentionally benchmark-gated.
 
 ## Goal
