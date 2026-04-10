@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
+#include "llama-mtp.h"
 #include "llama-adapter.h"
 
 #include <cstdint>
@@ -200,10 +201,19 @@ public:
 
 class llm_graph_input_mtp_seed : public llm_graph_input_i {
 public:
-    llm_graph_input_mtp_seed(uint32_t n_embd, uint32_t n_mtp, const float * seed) :
+    llm_graph_input_mtp_seed(
+            uint32_t n_embd,
+            uint32_t n_mtp,
+            llama_mtp_seed_mode mode,
+            const float * seed,
+            ggml_tensor * seed_backend,
+            uint64_t seed_generation) :
         n_embd(n_embd),
         n_mtp(n_mtp),
-        seed(seed) {
+        mode(mode),
+        seed(seed),
+        seed_backend(seed_backend),
+        seed_generation(seed_generation) {
     }
     ~llm_graph_input_mtp_seed() override = default;
 
@@ -215,7 +225,10 @@ public:
 
     const uint32_t n_embd;
     uint32_t n_mtp;
+    llama_mtp_seed_mode mode;
     const float * seed;
+    ggml_tensor * seed_backend;
+    uint64_t seed_generation;
 };
 
 class llm_graph_input_mtp_tokens : public llm_graph_input_i {
@@ -586,9 +599,12 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const float                  * mtp_seed;
-    const llama_token            * mtp_tokens;
-    uint32_t                       n_mtp;
+    llama_mtp_seed_mode           mtp_seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    const float                  * mtp_seed = nullptr;
+    ggml_tensor                  * mtp_seed_backend = nullptr;
+    uint64_t                       mtp_seed_generation = 0;
+    const llama_token            * mtp_tokens = nullptr;
+    uint32_t                       n_mtp = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -658,12 +674,33 @@ struct llm_graph_params {
             return false;
         }
 
-        if ((mtp_seed == nullptr) != (other.mtp_seed == nullptr)) {
+        if (mtp_seed_mode != other.mtp_seed_mode) {
             return false;
         }
 
         if ((mtp_tokens == nullptr) != (other.mtp_tokens == nullptr)) {
             return false;
+        }
+
+        switch (mtp_seed_mode) {
+            case LLAMA_MTP_SEED_MODE_NONE:
+                break;
+            case LLAMA_MTP_SEED_MODE_HOST:
+                if ((mtp_seed == nullptr) != (other.mtp_seed == nullptr)) {
+                    return false;
+                }
+                break;
+            case LLAMA_MTP_SEED_MODE_BACKEND:
+                if ((mtp_seed_backend == nullptr) != (other.mtp_seed_backend == nullptr)) {
+                    return false;
+                }
+                if (mtp_seed_backend != other.mtp_seed_backend) {
+                    return false;
+                }
+                if (mtp_seed_generation != other.mtp_seed_generation) {
+                    return false;
+                }
+                break;
         }
 
         if (samplers.size() > 0) {
@@ -813,7 +850,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_mtp_seed_mode      mtp_seed_mode;
     const float                  * mtp_seed;
+    ggml_tensor                  * mtp_seed_backend;
+    const uint64_t                 mtp_seed_generation;
     const llama_token            * mtp_tokens;
     const uint32_t                 n_mtp;
 

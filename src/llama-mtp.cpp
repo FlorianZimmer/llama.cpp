@@ -4,6 +4,17 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <limits>
+
+static ggml_context_ptr llama_mtp_init_ctx(size_t n_tensors) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ std::max<size_t>(1, n_tensors) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    return ggml_context_ptr { ggml_init(params) };
+}
 
 static bool llm_arch_supports_native_mtp(const llm_arch arch) {
     switch (arch) {
@@ -15,11 +26,47 @@ static bool llm_arch_supports_native_mtp(const llm_arch arch) {
     }
 }
 
+bool llama_mtp_backend_seed_state::ready() const {
+    return backend != nullptr &&
+        buft != nullptr &&
+        n_embd > 0 &&
+        generation > 0 &&
+        seed_cache_dev != nullptr &&
+        seed_batch_dev != nullptr &&
+        seed_cache_rows.size() == LLAMA_MAX_SEQ &&
+        seed_batch_rows.size() == LLAMA_MAX_SEQ;
+}
+
+bool llama_mtp_backend_seed_state::matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const {
+    return this->backend == backend && this->buft == buft && this->n_embd == n_embd && ready();
+}
+
+void llama_mtp_backend_seed_state::clear_capture_views() {
+    capture_ctxs.clear();
+}
+
+void llama_mtp_backend_seed_state::clear() {
+    clear_capture_views();
+    seed_cache_rows.clear();
+    seed_batch_rows.clear();
+    seed_cache_dev = nullptr;
+    seed_batch_dev = nullptr;
+    buf.reset();
+    ctx_views.reset();
+    ctx_roots.reset();
+    backend = nullptr;
+    buft = nullptr;
+    n_embd = 0;
+    generation = 0;
+}
+
 void llama_mtp_state::clear() {
     accepted.clear();
     draft.clear();
     seed_epoch = 1;
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
     std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
+    clear_backend_capture_views();
 }
 
 void llama_mtp_state::reserve(uint32_t n_embd, uint32_t n_pos_per_embd) {
@@ -30,6 +77,7 @@ void llama_mtp_state::reserve(uint32_t n_embd, uint32_t n_pos_per_embd) {
 
     if (!enabled()) {
         seed_embd.clear();
+        clear_backend_seed_storage();
         return;
     }
 
@@ -55,6 +103,91 @@ void llama_mtp_state::next_seed_epoch() {
         seed_epoch = 1;
         std::fill(seed_epoch_by_seq.begin(), seed_epoch_by_seq.end(), 0);
     }
+    seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+}
+
+void llama_mtp_state::set_seed_mode(llama_mtp_seed_mode mode) {
+    seed_mode = mode;
+}
+
+bool llama_mtp_state::ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    if (!enabled() || backend == nullptr || buft == nullptr || n_embd == 0) {
+        return false;
+    }
+
+    if (seed_backend.matches(backend, buft, n_embd)) {
+        return true;
+    }
+
+    seed_backend.clear();
+
+    seed_backend.backend = backend;
+    seed_backend.buft = buft;
+    seed_backend.n_embd = n_embd;
+    seed_backend.generation = backend_seed_generation_next++;
+    if (backend_seed_generation_next == 0) {
+        backend_seed_generation_next = 1;
+    }
+
+    seed_backend.ctx_roots = llama_mtp_init_ctx(2);
+    seed_backend.ctx_views = llama_mtp_init_ctx(2*LLAMA_MAX_SEQ);
+    if (!seed_backend.ctx_roots || !seed_backend.ctx_views) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_dev = ggml_new_tensor_2d(seed_backend.ctx_roots.get(), GGML_TYPE_F32, n_embd, LLAMA_MAX_SEQ);
+    if (!seed_backend.seed_cache_dev || !seed_backend.seed_batch_dev) {
+        seed_backend.clear();
+        return false;
+    }
+
+    ggml_set_name(seed_backend.seed_cache_dev, "mtp_seed_cache_dev");
+    ggml_set_name(seed_backend.seed_batch_dev, "mtp_seed_batch_dev");
+
+    seed_backend.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(seed_backend.ctx_roots.get(), buft));
+    if (!seed_backend.buf) {
+        seed_backend.clear();
+        return false;
+    }
+
+    seed_backend.seed_cache_rows.resize(LLAMA_MAX_SEQ);
+    seed_backend.seed_batch_rows.resize(LLAMA_MAX_SEQ);
+
+    for (int32_t i = 0; i < LLAMA_MAX_SEQ; ++i) {
+        const size_t offset_cache = (size_t) i * seed_backend.seed_cache_dev->nb[1];
+        const size_t offset_batch = (size_t) i * seed_backend.seed_batch_dev->nb[1];
+
+        auto * cache_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_cache_dev, n_embd, offset_cache);
+        auto * batch_row = ggml_view_1d(seed_backend.ctx_views.get(), seed_backend.seed_batch_dev, n_embd, offset_batch);
+        if (!cache_row || !batch_row) {
+            seed_backend.clear();
+            return false;
+        }
+
+        ggml_set_name(cache_row, "mtp_seed_cache_row");
+        ggml_set_name(batch_row, "mtp_seed_batch_row");
+
+        if (ggml_backend_view_init(cache_row) != GGML_STATUS_SUCCESS ||
+            ggml_backend_view_init(batch_row) != GGML_STATUS_SUCCESS) {
+            seed_backend.clear();
+            return false;
+        }
+
+        seed_backend.seed_cache_rows[i] = cache_row;
+        seed_backend.seed_batch_rows[i] = batch_row;
+    }
+
+    return true;
+}
+
+void llama_mtp_state::clear_backend_seed_storage() {
+    seed_backend.clear();
+}
+
+void llama_mtp_state::clear_backend_capture_views() {
+    seed_backend.clear_capture_views();
 }
 
 float * llama_mtp_state::seed_row(llama_seq_id seq_id) {

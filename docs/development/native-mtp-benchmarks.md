@@ -10,6 +10,17 @@ Commit used for the code under test:
 
 - `01de729d4` (`native MTP: document np>1 exactness limits`)
 
+Backend seed transport update on 2026-04-10:
+
+- Branch under test: `feat/native-mtp-backend-seed`
+- Change: native-MTP seed transport can now keep verifier seed rows on the backend for CUDA/non-host paths instead of doing backend -> host -> backend each step
+- Validation status:
+  - exact and measured: CUDA Berlin `np=1/2`, CUDA Moon `np=1/2`
+  - known stress case unchanged: CUDA Rust `np=2` still demonstrates the documented hybrid/recurrent `np>1` exactness limitation
+- rollout/debug aids kept in-tree:
+  - `LLAMA_MTP_BACKEND_SEED_DEBUG=1` mirrors host seed rows and verifies backend cache/batch rows against them after synchronize
+  - `LLAMA_MTP_BACKEND_SEED_FORCE_HOST=1` is only for comparison/debugging; on non-host multi-sequence CUDA it reproduces the older host round-trip behavior and is not the validated fast path
+
 Backend availability on this host:
 
 - Benchmarked: CPU, CUDA
@@ -24,6 +35,8 @@ Native MTP for Qwen 3.5 is now wired end-to-end in llama.cpp: HF to GGUF convers
 The main known limitation is still the documented hybrid/recurrent `-np > 1` exactness gap. On near-tie tokens, verifier numerics can change with batch shape across multiple live sequences, so native `mtp` can diverge from baseline greedy decode even when rollback and replay logic restore the correct model state after rejected drafts. That limitation is documented rather than hidden behind an incorrect exactness guarantee.
 
 On this host and model, CPU exact cases landed around `1.20x` to `1.53x`, while CUDA exact cases landed around `1.02x` to `1.23x`. The representative stress case remains CUDA Rust `np=2`, which still demonstrates the known exactness limitation and can also be slightly slower than baseline.
+
+With the backend-resident seed transport enabled on CUDA, the exact Berlin and Moon cases remain exact while avoiding the old host round trip. On the validated Berlin `np=2` case, native MTP measured `160.46 / 160.04 tok/s` versus baseline `129.64 / 133.66 tok/s`. On the validated Moon `np=2` case, native MTP measured `139.45 / 139.75 tok/s` versus baseline `130.41 / 133.00 tok/s`.
 
 ## Method
 
@@ -123,30 +136,33 @@ Observed CUDA range:
 
 ## Speedup Backlog
 
-The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
+The items below are the remaining upstream-friendly performance ideas worth tracking after the current scratch-storage cleanup and backend-resident seed transport. The expected gains are rough ranges from the current CUDA profile on this host, not guarantees.
 
-### Priority 1: Backend-resident MTP seed path
+### Completed: Backend-resident MTP seed path
 
-- expected gain: roughly `+5%` to `+15%` on good CUDA workloads if implemented cleanly
-- scope: medium to high
-- reason: the native MTP path still copies the verifier hidden row back to host memory and then uploads it again as the MTP seed input
-- current status: explored, but not landed; the first view-based device-copy prototype was not stable enough for `np=1/2`, so the current tree keeps the safer host-backed path
+- landed on `feat/native-mtp-backend-seed`
+- result: validated exact CUDA path for Berlin `np=1/2` and Moon `np=1/2` without the backend -> host -> backend seed round trip
+- design that landed:
+  - persistent backend-owned `seed_cache_dev` and `seed_batch_dev`
+  - fixed-offset graph-visible backend view for `build_inp_mtp_seed()`
+  - explicit seed mode and generation-based graph reuse invalidation
+  - conservative fallback that keeps the host path for host-backed and single-sequence cases, while avoiding the old multi-sequence non-host host-round-trip path by default
 
-### Priority 2: Adaptive native-MTP backoff on replay-heavy prompts
+### Priority 1: Adaptive native-MTP backoff on replay-heavy prompts
 
 - expected gain: large on bad prompts, little or no change on good prompts
 - scope: medium
 - reason: once snapshotting was removed, replay became the dominant bad-case overhead on rejection-heavy prompts like the Rust stress case
 - risk: any adaptive policy has to stay understandable and upstream-friendly; it should not silently trade correctness or make the server behavior hard to reason about
 
-### Priority 3: Replay-path reduction
+### Priority 2: Replay-path reduction
 
 - expected gain: modest on exact/easy prompts, more meaningful on prompts with lower draft acceptance
 - scope: medium to high
 - reason: replay is now the second largest remaining native-MTP overhead on many CUDA runs
 - examples: cheaper replay batching, less redundant verifier work after rejection, or avoiding replay entirely on cases where the state can be proven equivalent
 
-### Priority 4: Small server hot-path cleanup
+### Priority 3: Small server hot-path cleanup
 
 - expected gain: low
 - scope: small

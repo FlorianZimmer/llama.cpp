@@ -245,7 +245,10 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
+                    llama_mtp_seed_mode   mtp_seed_mode = LLAMA_MTP_SEED_MODE_NONE,
                         const float       * mtp_seed   = nullptr,
+                        ggml_tensor       * mtp_seed_backend = nullptr,
+                          uint64_t          mtp_seed_generation = 0,
                         const llama_token * mtp_tokens = nullptr,
                           uint32_t          n_mtp      = 0) const;
 

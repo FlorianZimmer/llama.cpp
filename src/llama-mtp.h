@@ -3,17 +3,50 @@
 #include "llama-batch.h"
 #include "llama.h"
 
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
 #include <cstdint>
 #include <map>
 #include <vector>
 
 struct llama_model;
+struct ggml_context;
+struct ggml_tensor;
 
 struct llama_mtp_desc {
     bool     supported            = false;
     uint32_t n_predict            = 0;
     uint32_t n_draft              = 0;
     bool     dedicated_embeddings = false;
+};
+
+enum llama_mtp_seed_mode : uint8_t {
+    LLAMA_MTP_SEED_MODE_NONE    = 0,
+    LLAMA_MTP_SEED_MODE_HOST    = 1,
+    LLAMA_MTP_SEED_MODE_BACKEND = 2,
+};
+
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    uint32_t                   n_embd         = 0;
+    uint64_t                   generation     = 0;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+
+    ggml_context_ptr        ctx_roots;
+    ggml_context_ptr        ctx_views;
+    ggml_backend_buffer_ptr buf;
+
+    std::vector<ggml_tensor *>      seed_cache_rows;
+    std::vector<ggml_tensor *>      seed_batch_rows;
+    std::vector<ggml_context_ptr>   capture_ctxs;
+
+    bool ready() const;
+    bool matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const;
+    void clear();
+    void clear_capture_views();
 };
 
 struct llama_mtp_state {
@@ -27,6 +60,9 @@ struct llama_mtp_state {
     std::vector<float>       seed_by_seq;
     std::vector<uint32_t>    seed_epoch_by_seq;
     uint32_t                 seed_epoch = 1;
+    llama_mtp_seed_mode      seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    uint64_t                 backend_seed_generation_next = 1;
+    llama_mtp_backend_seed_state seed_backend;
 
     std::vector<llama_token>    ubatch_token;
     std::vector<llama_pos>      ubatch_pos;
@@ -41,6 +77,10 @@ struct llama_mtp_state {
     void clear();
     void reserve(uint32_t n_embd, uint32_t n_pos_per_embd);
     void next_seed_epoch();
+    void set_seed_mode(llama_mtp_seed_mode mode);
+    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+    void clear_backend_seed_storage();
+    void clear_backend_capture_views();
 
     float * seed_row(llama_seq_id seq_id);
     const float * seed_row(llama_seq_id seq_id) const;
