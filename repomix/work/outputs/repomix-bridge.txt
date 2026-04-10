@@ -12,6 +12,7 @@ repomix/
     01_REQUEST.md
     02_CONTEXT_NOTES.md
     03_CODE_EXCERPTS.md
+    04_UPSTREAM_DIFF_SUMMARY.md
 scripts/
   audit_mtp_quantization.py
   validate_mtp_cuda.py
@@ -258,6 +259,11 @@ Files that matter most for this review:
 - `docs/development/native-mtp-optimization-plan.md`
 - `docs/development/native-mtp-model-prep.md`
 
+If more surrounding context is needed beyond the included files:
+
+- consult public `ggml-org/llama.cpp` upstream surgically
+- use `repomix/work/04_UPSTREAM_DIFF_SUMMARY.md` first to see which files in this private branch differ from upstream and therefore must not be treated as upstream-equivalent
+
 ================
 File: repomix/work/00_BROWSER_INSTRUCTIONS.md
 ================
@@ -277,6 +283,7 @@ You are an AI assistant running in a browser. You received a Repomix-packed cont
   - optional constraints (time, stack, risk tolerance, etc.)
 - Repo context: selected source files and configs
 - Optional `repomix/work/02_CONTEXT_NOTES.md` (short excerpts only)
+- Optional `repomix/work/04_UPSTREAM_DIFF_SUMMARY.md` describing what this private branch changes relative to public `upstream/master`
 
 ## Hard rules
 - Produce **exactly one** final deliverable section: `DELIVERABLE_FOR_CODEX_CLI`.
@@ -284,6 +291,8 @@ You are an AI assistant running in a browser. You received a Repomix-packed cont
 - Do not include filler, long summaries, or generic explanations.
 - When referencing code, always include **file paths** and (if possible) **symbols** (functions/classes).
 - If something is missing from context, state the smallest assumption needed and continue.
+- If more surrounding context is needed than is included here, you may consult the public `ggml-org/llama.cpp` upstream repository surgically.
+- Treat the included local files and `04_UPSTREAM_DIFF_SUMMARY.md` as authoritative for what changed in this private branch.
 
 ---
 
@@ -341,6 +350,149 @@ Provide:
 - A minimal next step plan (<= 6 steps)
 
 End after `DELIVERABLE_FOR_CODEX_CLI`. No extra text.
+
+================
+File: repomix/work/04_UPSTREAM_DIFF_SUMMARY.md
+================
+# Upstream Diff Summary
+
+This private branch should be reviewed relative to public `upstream/master`.
+
+If you need omitted surrounding context, you may consult the public upstream repository surgically, but do not assume this private branch matches upstream in the files listed below.
+
+## Current review target
+
+- branch: `feat/native-mtp-upstream-v1-prep`
+- local upstream base used here: `upstream/master` at `d6f3030047f85a98b009189e76f441fe818ea44d`
+
+## Important branch fact
+
+The live branch was just narrowed to dense Qwen 3.5 native MTP only.
+
+That means:
+
+- `qwen35` native-MTP remains in scope
+- `qwen35moe` native-MTP support was removed again from the live branch
+- `Qwen3.5-35B-A3B` / MoE is no longer part of the live V1 code or benchmark scope
+
+Some historical notes in the included docs still describe the removed MoE path because that history matters for planning, but the live code path under review is dense-only.
+
+## High-level change groups vs upstream master
+
+### Native-MTP runtime and API additions
+
+- `include/llama.h`
+- `src/llama-mtp.h`
+- `src/llama-mtp.cpp`
+- `src/llama-context.cpp`
+- `src/llama-context.h`
+- `src/llama-graph.cpp`
+- `src/llama-graph.h`
+- `common/speculative.cpp`
+- `common/sampling.cpp`
+- `common/sampling.h`
+- `common/common.h`
+- `common/arg.cpp`
+
+What changed:
+
+- native-MTP capability and metadata helpers
+- native draft entrypoints
+- backend-resident seed transport
+- graph input support for native-MTP seed rows
+- direct output-token / logits controls used by the greedy verifier fast path
+
+### Qwen 3.5 model / conversion support
+
+- `convert_hf_to_gguf.py`
+- `gguf-py/gguf/constants.py`
+- `src/llama-model.cpp`
+- `src/llama-model.h`
+- `src/models/qwen35.cpp`
+- `src/models/models.h`
+- `src/CMakeLists.txt`
+- `src/llama-arch.cpp`
+
+What changed:
+
+- Qwen 3.5 MTP metadata / tensor conversion support
+- dense Qwen 3.5 native-MTP graph-builder support
+- native-MTP runtime registration and wiring
+
+### Server integration and runtime profiling
+
+- `tools/server/server-context.cpp`
+- `tools/server/server-task.cpp`
+- `tools/server/README.md`
+- `tools/server/tests/unit/test_speculative.py`
+- `tools/server/tests/utils.py`
+- `tools/cli/README.md`
+
+What changed:
+
+- `--spec-type mtp` server-side integration
+- greedy verifier accept fast path
+- optional raw-logit suppression for token-only verifier batches
+- rollback / replay plumbing for native MTP
+- per-step timing / visibility logging
+
+### Benchmarking and quant-audit tooling
+
+- `scripts/validate_mtp_cuda.py`
+- `scripts/audit_mtp_quantization.py`
+
+What changed:
+
+- strict CUDA baseline-vs-MTP validation
+- per-step acceptance / timing parsing
+- quant audit support for native-MTP tensors
+
+## Diff stat against upstream master
+
+Current working-branch diff stat, excluding docs and repomix files:
+
+```text
+ common/arg.cpp                                     |   4 +-
+ common/common.h                                    |   1 +
+ common/sampling.cpp                                |  37 +
+ common/sampling.h                                  |   4 +
+ common/speculative.cpp                             |   7 +
+ convert_hf_to_gguf.py                              |  82 +-
+ gguf-py/gguf/constants.py                          |  16 +-
+ include/llama.h                                    |  65 ++
+ scripts/audit_mtp_quantization.py                  | 321 +++++++
+ scripts/validate_mtp_cuda.py                       | 767 +++++++++++++++++
+ src/CMakeLists.txt                                 |   1 +
+ src/llama-arch.cpp                                 |  12 +-
+ src/llama-context.cpp                              | 533 +++++++++++-
+ src/llama-context.h                                |  21 +-
+ src/llama-graph.cpp                                | 114 ++-
+ src/llama-graph.h                                  | 115 +++
+ src/llama-model.cpp                                |  65 +-
+ src/llama-model.h                                  |   5 +
+ src/llama-mtp.cpp                                  | 276 ++++++
+ src/llama-mtp.h                                    |  96 +++
+ src/models/models.h                                |  14 +
+ src/models/qwen35.cpp                              | 105 ++-
+ tools/cli/README.md                                |   1 +
+ tools/server/README.md                             |   2 +-
+ tools/server/server-context.cpp                    | 932 ++++++++++++++++++++-
+ tools/server/server-task.cpp                       |  13 +
+ tools/server/tests/unit/test_speculative.py        |  48 ++
+ tools/server/tests/utils.py                        |   3 +
+```
+
+## What not to assume from public upstream
+
+Do not assume public upstream already contains:
+
+- native-MTP API surface
+- native Qwen 3.5 dense draft path
+- output-token / logits suppression controls used here
+- current server-side native-MTP replay / profiling logic
+- CUDA validator / quant-audit scripts used here
+
+If you need omitted context from public upstream, fetch only the smallest surrounding files or symbols needed to understand these local changes.
 
 ================
 File: scripts/audit_mtp_quantization.py
@@ -666,165 +818,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-================
-File: repomix/work/03_CODE_EXCERPTS.md
-================
-# Code Excerpts
-
-These notes point at the local code that differs materially from public upstream and matters for the dense-only native-MTP review.
-
-## 1. Native-MTP capability is now dense-only
-
-File: `src/llama-mtp.cpp`
-
-Current capability gate:
-
-```cpp
-static bool llm_arch_supports_native_mtp(const llm_arch arch) {
-    switch (arch) {
-        case LLM_ARCH_QWEN35:
-            return true;
-        default:
-            return false;
-    }
-}
-```
-
-Why it matters:
-
-- the live branch no longer claims native-MTP support for `qwen35moe`
-- any next-step plan should treat this branch as dense-only unless it explicitly proposes reintroducing MoE later
-
-## 2. Dense runtime still uses the same generic native-MTP plumbing
-
-Files:
-
-- `include/llama.h`
-- `src/llama-mtp.h`
-- `src/llama-context.cpp`
-- `src/llama-graph.h`
-- `src/llama-graph.cpp`
-
-Important local API / runtime additions:
-
-```cpp
-LLAMA_API bool llama_model_has_native_mtp(const struct llama_model * model);
-LLAMA_API uint32_t llama_model_n_native_mtp_predict(const struct llama_model * model);
-
-LLAMA_API int32_t llama_native_mtp_draft_batch(...);
-LLAMA_API int32_t llama_native_mtp_draft(...);
-
-LLAMA_API void llama_set_output_tokens(struct llama_context * ctx, bool output_tokens);
-LLAMA_API void llama_set_output_logits(struct llama_context * ctx, bool output_logits);
-LLAMA_API llama_token llama_get_output_token_ith(struct llama_context * ctx, int32_t i);
-```
-
-Why it matters:
-
-- the branch already added the generic surface needed for the current fast accept path
-- a good next-step plan should avoid reopening solved output-transfer or seed-plumbing work unless there is new evidence
-
-## 3. Backend-resident seed transport already exists
-
-File: `src/llama-mtp.h`
-
-Relevant shape:
-
-```cpp
-struct llama_mtp_backend_seed_state {
-    ggml_backend_t             backend        = nullptr;
-    ggml_backend_buffer_type_t buft           = nullptr;
-    ggml_tensor *              seed_cache_dev = nullptr;
-    ggml_tensor *              seed_batch_dev = nullptr;
-    ...
-};
-```
-
-Why it matters:
-
-- this branch already removed a backend -> host -> backend seed round-trip
-- future work should build on this instead of proposing another standalone seed transport pass
-
-## 4. Dense Qwen 3.5 graph support is already in place
-
-File: `src/models/qwen35.cpp`
-
-What matters:
-
-- the dense builder already has the native-MTP graph path
-- the remaining problem is not model-family enablement
-- the remaining problem is runtime economics on the current one-token design
-
-## 5. Server hot path already has fast accept plus visibility
-
-File: `tools/server/server-context.cpp`
-
-Important local behavior:
-
-```cpp
-const bool pure_fast_path_verifier_batch =
-    has_output_rows && use_output_tokens && disable_output_logits;
-const bool logits_suppressed_for_accept =
-    has_output_rows && disable_output_logits;
-...
-SLT_INF(slot,
-        "native MTP step:"
-        " step=%d"
-        " drafted=%zu"
-        " accepted=%zu"
-        " replay=%d"
-        " fast=%d"
-        " logits_suppressed=%d"
-        " forced_plain=%d"
-        " guard=%d"
-        ...
-);
-```
-
-Current replay-guard scope:
-
-```cpp
-static bool server_native_mtp_needs_post_replay_guard(const llama_model * model) {
-    return llama_model_is_recurrent(model);
-}
-```
-
-Why it matters:
-
-- the broad hybrid guard was removed from dense `qwen35`
-- the live branch no longer carries a MoE-specific replay guard path
-- step-level visibility already exists, so any next plan can be benchmark-driven at the per-step level
-
-## 6. The validator is already strong enough for small-step optimization work
-
-File: `scripts/validate_mtp_cuda.py`
-
-Important points:
-
-- exact `np=1` comparison to greedy baseline
-- repeat support
-- JSON output
-- `--compare-json`
-- aggregate profile parsing
-- per-step visibility parsing
-
-Why it matters:
-
-- the next plan does not need a new benchmark harness before optimization work begins
-- each step can already be gated against both baseline and the previous native-MTP result
-
-## 7. Historical failures are still relevant even though MoE is out of scope
-
-The live branch removed MoE from code scope, but the review should still account for this history:
-
-- broad replay guard fixed correctness but regressed dense `9B q8_0`
-- draft-side caching / scheduler work did not survive repeated end-to-end tok/s testing
-- dense visibility showed fast-path coverage was already near-saturated
-- `9B q8_0` remains the only checked dense path with a meaningful `np=1` win
-- `9B UD-Q4_K_XL` and `27B UD-Q4_K_XL` still do not meet the likely maintenance bar
-
-That history lives mostly in the included docs and context notes, not in the live code paths anymore.
 
 ================
 File: src/models/qwen35.cpp
@@ -1317,6 +1310,265 @@ ggml_tensor * llm_build_qwen35::build_layer_ffn(ggml_tensor * cur, const int il)
 }
 
 ================
+File: repomix/work/03_CODE_EXCERPTS.md
+================
+# Code Excerpts
+
+These notes point at the local code that differs materially from public upstream and matters for the dense-only native-MTP review.
+
+## 1. Native-MTP capability is now dense-only
+
+File: `src/llama-mtp.cpp`
+
+Current capability gate:
+
+```cpp
+static bool llm_arch_supports_native_mtp(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+            return true;
+        default:
+            return false;
+    }
+}
+```
+
+Why it matters:
+
+- the live branch no longer claims native-MTP support for `qwen35moe`
+- any next-step plan should treat this branch as dense-only unless it explicitly proposes reintroducing MoE later
+
+## 2. Dense runtime still uses the same generic native-MTP plumbing
+
+Files:
+
+- `include/llama.h`
+- `src/llama-mtp.h`
+- `src/llama-context.cpp`
+- `src/llama-graph.h`
+- `src/llama-graph.cpp`
+
+Important local API / runtime additions:
+
+```cpp
+LLAMA_API bool llama_model_has_native_mtp(const struct llama_model * model);
+LLAMA_API uint32_t llama_model_n_native_mtp_predict(const struct llama_model * model);
+
+LLAMA_API int32_t llama_native_mtp_draft_batch(...);
+LLAMA_API int32_t llama_native_mtp_draft(...);
+
+LLAMA_API void llama_set_output_tokens(struct llama_context * ctx, bool output_tokens);
+LLAMA_API void llama_set_output_logits(struct llama_context * ctx, bool output_logits);
+LLAMA_API llama_token llama_get_output_token_ith(struct llama_context * ctx, int32_t i);
+```
+
+Why it matters:
+
+- the branch already added the generic surface needed for the current fast accept path
+- a good next-step plan should avoid reopening solved output-transfer or seed-plumbing work unless there is new evidence
+
+## 3. Backend-resident seed transport already exists
+
+File: `src/llama-mtp.h`
+
+Relevant shape:
+
+```cpp
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+    ...
+};
+```
+
+Why it matters:
+
+- this branch already removed a backend -> host -> backend seed round-trip
+- future work should build on this instead of proposing another standalone seed transport pass
+
+## 4. Dense Qwen 3.5 graph support is already in place
+
+File: `src/models/qwen35.cpp`
+
+What matters:
+
+- the dense builder already has the native-MTP graph path
+- the remaining problem is not model-family enablement
+- the remaining problem is runtime economics on the current one-token design
+
+## 5. Server hot path already has fast accept plus visibility
+
+File: `tools/server/server-context.cpp`
+
+Important local behavior:
+
+```cpp
+const bool pure_fast_path_verifier_batch =
+    has_output_rows && use_output_tokens && disable_output_logits;
+const bool logits_suppressed_for_accept =
+    has_output_rows && disable_output_logits;
+...
+SLT_INF(slot,
+        "native MTP step:"
+        " step=%d"
+        " drafted=%zu"
+        " accepted=%zu"
+        " replay=%d"
+        " fast=%d"
+        " logits_suppressed=%d"
+        " forced_plain=%d"
+        " guard=%d"
+        ...
+);
+```
+
+Current replay-guard scope:
+
+```cpp
+static bool server_native_mtp_needs_post_replay_guard(const llama_model * model) {
+    return llama_model_is_recurrent(model);
+}
+```
+
+Why it matters:
+
+- the broad hybrid guard was removed from dense `qwen35`
+- the live branch no longer carries a MoE-specific replay guard path
+- step-level visibility already exists, so any next plan can be benchmark-driven at the per-step level
+
+## 6. The validator is already strong enough for small-step optimization work
+
+File: `scripts/validate_mtp_cuda.py`
+
+Important points:
+
+- exact `np=1` comparison to greedy baseline
+- repeat support
+- JSON output
+- `--compare-json`
+- aggregate profile parsing
+- per-step visibility parsing
+
+Why it matters:
+
+- the next plan does not need a new benchmark harness before optimization work begins
+- each step can already be gated against both baseline and the previous native-MTP result
+
+## 7. Historical failures are still relevant even though MoE is out of scope
+
+The live branch removed MoE from code scope, but the review should still account for this history:
+
+- broad replay guard fixed correctness but regressed dense `9B q8_0`
+- draft-side caching / scheduler work did not survive repeated end-to-end tok/s testing
+- dense visibility showed fast-path coverage was already near-saturated
+- `9B q8_0` remains the only checked dense path with a meaningful `np=1` win
+- `9B UD-Q4_K_XL` and `27B UD-Q4_K_XL` still do not meet the likely maintenance bar
+
+That history lives mostly in the included docs and context notes, not in the live code paths anymore.
+
+================
+File: src/llama-mtp.h
+================
+#pragma once
+
+#include "llama-batch.h"
+#include "llama.h"
+
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
+#include <cstdint>
+#include <map>
+#include <vector>
+
+struct llama_model;
+struct ggml_context;
+struct ggml_tensor;
+
+struct llama_mtp_desc {
+    bool     supported            = false;
+    uint32_t n_predict            = 0;
+    uint32_t n_draft              = 0;
+    bool     dedicated_embeddings = false;
+};
+
+enum llama_mtp_seed_mode : uint8_t {
+    LLAMA_MTP_SEED_MODE_NONE    = 0,
+    LLAMA_MTP_SEED_MODE_HOST    = 1,
+    LLAMA_MTP_SEED_MODE_BACKEND = 2,
+};
+
+struct llama_mtp_backend_seed_state {
+    ggml_backend_t             backend        = nullptr;
+    ggml_backend_buffer_type_t buft           = nullptr;
+    uint32_t                   n_embd         = 0;
+    uint64_t                   generation     = 0;
+    ggml_tensor *              seed_cache_dev = nullptr;
+    ggml_tensor *              seed_batch_dev = nullptr;
+
+    ggml_context_ptr        ctx_roots;
+    ggml_context_ptr        ctx_views;
+    ggml_backend_buffer_ptr buf;
+
+    std::vector<ggml_tensor *>      seed_cache_rows;
+    std::vector<ggml_tensor *>      seed_batch_rows;
+    std::vector<ggml_context_ptr>   capture_ctxs;
+
+    bool ready() const;
+    bool matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const;
+    void clear();
+    void clear_capture_views();
+};
+
+struct llama_mtp_state {
+    llama_mtp_desc desc;
+    uint32_t       n_embd = 0;
+    uint32_t       n_pos_per_embd = 0;
+
+    std::vector<float>       seed_embd;
+    std::vector<llama_token> accepted;
+    std::vector<llama_token> draft;
+    std::vector<float>       seed_by_seq;
+    std::vector<uint32_t>    seed_epoch_by_seq;
+    uint32_t                 seed_epoch = 1;
+    llama_mtp_seed_mode      seed_mode = LLAMA_MTP_SEED_MODE_NONE;
+    uint64_t                 backend_seed_generation_next = 1;
+    llama_mtp_backend_seed_state seed_backend;
+
+    std::vector<llama_token>    ubatch_token;
+    std::vector<llama_pos>      ubatch_pos;
+    std::vector<int32_t>        ubatch_n_seq_id;
+    std::vector<llama_seq_id *> ubatch_seq_id;
+    std::vector<llama_seq_id>   ubatch_seq_id_unq;
+    std::vector<int32_t>        ubatch_seq_idx;
+    std::vector<int8_t>         ubatch_output;
+    std::vector<llama_seq_id>   temp_seq_ids;
+    std::vector<uint8_t>        temp_seq_used;
+
+    void clear();
+    void reserve(uint32_t n_embd, uint32_t n_pos_per_embd);
+    void next_seed_epoch();
+    void set_seed_mode(llama_mtp_seed_mode mode);
+    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+    void clear_backend_seed_storage();
+    void clear_backend_capture_views();
+
+    float * seed_row(llama_seq_id seq_id);
+    const float * seed_row(llama_seq_id seq_id) const;
+    bool has_seed(llama_seq_id seq_id) const;
+    void mark_seed(llama_seq_id seq_id);
+    llama_ubatch ubatch_reserve(uint32_t n_seq);
+
+    bool enabled() const {
+        return desc.supported && desc.n_draft > 0;
+    }
+};
+
+llama_mtp_desc llama_mtp_init_desc(const llama_model & model);
+
+================
 File: src/llama-mtp.cpp
 ================
 #include "llama-mtp.h"
@@ -1596,106 +1848,6 @@ llama_mtp_desc llama_mtp_init_desc(const llama_model & model) {
 }
 
 ================
-File: src/llama-mtp.h
-================
-#pragma once
-
-#include "llama-batch.h"
-#include "llama.h"
-
-#include "ggml-backend.h"
-#include "ggml-cpp.h"
-
-#include <cstdint>
-#include <map>
-#include <vector>
-
-struct llama_model;
-struct ggml_context;
-struct ggml_tensor;
-
-struct llama_mtp_desc {
-    bool     supported            = false;
-    uint32_t n_predict            = 0;
-    uint32_t n_draft              = 0;
-    bool     dedicated_embeddings = false;
-};
-
-enum llama_mtp_seed_mode : uint8_t {
-    LLAMA_MTP_SEED_MODE_NONE    = 0,
-    LLAMA_MTP_SEED_MODE_HOST    = 1,
-    LLAMA_MTP_SEED_MODE_BACKEND = 2,
-};
-
-struct llama_mtp_backend_seed_state {
-    ggml_backend_t             backend        = nullptr;
-    ggml_backend_buffer_type_t buft           = nullptr;
-    uint32_t                   n_embd         = 0;
-    uint64_t                   generation     = 0;
-    ggml_tensor *              seed_cache_dev = nullptr;
-    ggml_tensor *              seed_batch_dev = nullptr;
-
-    ggml_context_ptr        ctx_roots;
-    ggml_context_ptr        ctx_views;
-    ggml_backend_buffer_ptr buf;
-
-    std::vector<ggml_tensor *>      seed_cache_rows;
-    std::vector<ggml_tensor *>      seed_batch_rows;
-    std::vector<ggml_context_ptr>   capture_ctxs;
-
-    bool ready() const;
-    bool matches(ggml_backend_t backend, ggml_backend_buffer_type_t buft, uint32_t n_embd) const;
-    void clear();
-    void clear_capture_views();
-};
-
-struct llama_mtp_state {
-    llama_mtp_desc desc;
-    uint32_t       n_embd = 0;
-    uint32_t       n_pos_per_embd = 0;
-
-    std::vector<float>       seed_embd;
-    std::vector<llama_token> accepted;
-    std::vector<llama_token> draft;
-    std::vector<float>       seed_by_seq;
-    std::vector<uint32_t>    seed_epoch_by_seq;
-    uint32_t                 seed_epoch = 1;
-    llama_mtp_seed_mode      seed_mode = LLAMA_MTP_SEED_MODE_NONE;
-    uint64_t                 backend_seed_generation_next = 1;
-    llama_mtp_backend_seed_state seed_backend;
-
-    std::vector<llama_token>    ubatch_token;
-    std::vector<llama_pos>      ubatch_pos;
-    std::vector<int32_t>        ubatch_n_seq_id;
-    std::vector<llama_seq_id *> ubatch_seq_id;
-    std::vector<llama_seq_id>   ubatch_seq_id_unq;
-    std::vector<int32_t>        ubatch_seq_idx;
-    std::vector<int8_t>         ubatch_output;
-    std::vector<llama_seq_id>   temp_seq_ids;
-    std::vector<uint8_t>        temp_seq_used;
-
-    void clear();
-    void reserve(uint32_t n_embd, uint32_t n_pos_per_embd);
-    void next_seed_epoch();
-    void set_seed_mode(llama_mtp_seed_mode mode);
-    bool ensure_backend_seed_storage(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
-    void clear_backend_seed_storage();
-    void clear_backend_capture_views();
-
-    float * seed_row(llama_seq_id seq_id);
-    const float * seed_row(llama_seq_id seq_id) const;
-    bool has_seed(llama_seq_id seq_id) const;
-    void mark_seed(llama_seq_id seq_id);
-    llama_ubatch ubatch_reserve(uint32_t n_seq);
-
-    bool enabled() const {
-        return desc.supported && desc.n_draft > 0;
-    }
-};
-
-llama_mtp_desc llama_mtp_init_desc(const llama_model & model);
-
-================
 File: docs/development/native-mtp-model-prep.md
 ================
 # Native MTP Model Prep
@@ -1877,136 +2029,6 @@ This matters because `/mnt/models` can fill up quickly during BF16 and multi-qua
 - `Qwen3.5-9B UD-Q4_K_XL` improved with the dense replay-policy narrowing but is still not a clean speed-positive target
 - `Qwen3.5-27B UD-Q4_K_XL` stayed exact on the checked CUDA cases but is still speed-negative
 - the remaining dense problem is runtime economics, not missing MTP metadata or an obvious dense MTP-head quantization bug
-
-================
-File: docs/development/native-mtp-optimization-plan.md
-================
-# Native MTP Optimization Plan
-
-This branch is now explicitly scoped to dense Qwen 3.5 native MTP only.
-
-## V1 Scope
-
-- keep native-MTP support only for `qwen35`
-- active speed target: `Qwen3.5-9B q8_0`
-- supporting dense regression coverage:
-  - `Qwen3.5-9B UD-Q4_K_XL`
-  - `Qwen3.5-27B UD-Q4_K_XL`
-- keep `np=1` exactness against greedy baseline
-- treat `np>1` as stability-only on the current hybrid path
-
-Removed from this V1 prep branch:
-
-- `qwen35moe` native-MTP support
-- `Qwen3.5-35B-A3B` as an active benchmark or optimization target
-- MoE-specific quantization overrides and replay-guard policy from the live V1 path
-
-## Current Dense Reading
-
-Current dense rerun artifacts:
-
-- `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
-- `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
-- `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
-
-Current branch result:
-
-- `Qwen3.5-9B q8_0`
-  - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
-  - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
-  - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
-- `Qwen3.5-9B UD-Q4_K_XL`
-  - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
-  - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
-  - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
-- `Qwen3.5-27B UD-Q4_K_XL`
-  - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
-  - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
-  - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
-
-Interpretation:
-
-- the only checked `np=1` dense win worth carrying is `9B q8_0`
-- `9B UD-Q4_K_XL` improved but is still not a reliable speed-positive target
-- `27B UD-Q4_K_XL` remains regression coverage, not a near-term speed target
-- the current one-token native-MTP design still has narrow upside and little room for extra recurring overhead
-
-## What The Branch Already Ruled Out
-
-These items were already tried and should not be reopened as “easy next wins”:
-
-- dedicated MTP scheduler / result cache
-  - draft-bucket movement did not survive repeated end-to-end benchmarking
-- broad hybrid-level post-replay plain-step guard
-  - regressed dense `qwen35`, especially `9B q8_0`
-- separate dense cooldown experiment
-  - created no useful behavior beyond the broad guard and was dropped
-- mixed-chunk verifier split as the next likely win
-  - step visibility showed dense accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
-- MoE as a speed target
-  - required correctness rescue work and still stayed materially speed-negative
-
-## Important Regression / Recovery
-
-Under the same newer harness:
-
-- earlier dense result:
-  - `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
-  - `primary np=1`: `1.082x`
-  - `good np=1`: `1.030x`
-- broad-guard regression:
-  - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
-  - `primary np=1`: `0.999x`
-  - `good np=1`: `0.938x`
-- current dense-only recovery:
-  - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
-  - `primary np=1`: `1.081x`
-  - `good np=1`: `1.032x`
-
-So the branch did recover the earlier dense `q8_0` win once the broad replay guard was removed from dense `qwen35`.
-
-## What We Already Tried On Hybrid-State Behavior
-
-We already tried the shallow hybrid-state experiments:
-
-- rollback / restore / replay hardening
-- replay-logit tracing
-- disabling the greedy accept fast path as an isolation test
-- a one-step post-replay cooldown / plain-step guard
-- broad guard on all hybrid Qwen 3.5 models
-- narrowed guard to avoid regressing dense `qwen35`
-
-We have not yet done the deeper runtime-state design used by systems like vLLM or SGLang:
-
-- explicit speculative branch-state storage beyond the current restore/replay path
-- deeper draft+verify+rewind integration inside libllama
-- multi-token native drafting
-
-That deeper work is outside this V1 prep branch.
-
-## V1 Next-Step Rule
-
-The next branch should stay dense-only and answer one question:
-
-- can dense `qwen35` achieve a repeatable `np=1` single-user win of at least about `1.05x` on `9B q8_0` without breaking exactness and without becoming quant-fragile?
-
-Practical stop condition:
-
-- if the next dense-only branch cannot recover a consistent `>= 5%` `np=1` win on `9B q8_0` while keeping exactness, stop and document the current single-token native-MTP ceiling
-
-## Benchmark Gate
-
-Keep using:
-
-- [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py)
-- [native-mtp-benchmarks.md](native-mtp-benchmarks.md)
-
-Every kept runtime change must beat:
-
-- greedy baseline on the same dense model and prompt
-- the immediately previous native-MTP result
-
-Prefer removal over accumulation if a change does not survive the repeated median gate.
 
 ================
 File: scripts/validate_mtp_cuda.py
@@ -2778,6 +2800,136 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
+
+================
+File: docs/development/native-mtp-optimization-plan.md
+================
+# Native MTP Optimization Plan
+
+This branch is now explicitly scoped to dense Qwen 3.5 native MTP only.
+
+## V1 Scope
+
+- keep native-MTP support only for `qwen35`
+- active speed target: `Qwen3.5-9B q8_0`
+- supporting dense regression coverage:
+  - `Qwen3.5-9B UD-Q4_K_XL`
+  - `Qwen3.5-27B UD-Q4_K_XL`
+- keep `np=1` exactness against greedy baseline
+- treat `np>1` as stability-only on the current hybrid path
+
+Removed from this V1 prep branch:
+
+- `qwen35moe` native-MTP support
+- `Qwen3.5-35B-A3B` as an active benchmark or optimization target
+- MoE-specific quantization overrides and replay-guard policy from the live V1 path
+
+## Current Dense Reading
+
+Current dense rerun artifacts:
+
+- `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
+- `/tmp/native-mtp-v1-triage/qwen35-9b-ud-q4.json`
+- `/tmp/native-mtp-v1-triage/qwen35-27b-ud-q4.json`
+
+Current branch result:
+
+- `Qwen3.5-9B q8_0`
+  - `primary np=1`: `150.94 -> 163.10 tok/s` (`1.081x`)
+  - `good np=1`: `148.90 -> 153.65 tok/s` (`1.032x`)
+  - `bad np=1`: `148.89 -> 147.56 tok/s` (`0.991x`)
+- `Qwen3.5-9B UD-Q4_K_XL`
+  - `primary np=1`: `175.39 -> 167.94 tok/s` (`0.957x`)
+  - `good np=1`: `196.31 -> 182.85 tok/s` (`0.931x`)
+  - `primary np=2`: `156.34 -> 157.28 tok/s` (`1.006x`)
+- `Qwen3.5-27B UD-Q4_K_XL`
+  - `primary np=1`: `72.26 -> 59.71 tok/s` (`0.826x`)
+  - `good np=1`: `70.96 -> 68.41 tok/s` (`0.964x`)
+  - `bad np=2`: `59.17 -> 32.92 tok/s` (`0.556x`)
+
+Interpretation:
+
+- the only checked `np=1` dense win worth carrying is `9B q8_0`
+- `9B UD-Q4_K_XL` improved but is still not a reliable speed-positive target
+- `27B UD-Q4_K_XL` remains regression coverage, not a near-term speed target
+- the current one-token native-MTP design still has narrow upside and little room for extra recurring overhead
+
+## What The Branch Already Ruled Out
+
+These items were already tried and should not be reopened as “easy next wins”:
+
+- dedicated MTP scheduler / result cache
+  - draft-bucket movement did not survive repeated end-to-end benchmarking
+- broad hybrid-level post-replay plain-step guard
+  - regressed dense `qwen35`, especially `9B q8_0`
+- separate dense cooldown experiment
+  - created no useful behavior beyond the broad guard and was dropped
+- mixed-chunk verifier split as the next likely win
+  - step visibility showed dense accept rows are already almost entirely pure fast-path verifier rows with logits suppressed
+- MoE as a speed target
+  - required correctness rescue work and still stayed materially speed-negative
+
+## Important Regression / Recovery
+
+Under the same newer harness:
+
+- earlier dense result:
+  - `/tmp/native-mtp-bench-20260410/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.082x`
+  - `good np=1`: `1.030x`
+- broad-guard regression:
+  - `/tmp/native-mtp-bench-20260410-post-replay-guard/qwen35-9b-q8_0.json`
+  - `primary np=1`: `0.999x`
+  - `good np=1`: `0.938x`
+- current dense-only recovery:
+  - `/tmp/native-mtp-v1-triage/qwen35-9b-q8_0.json`
+  - `primary np=1`: `1.081x`
+  - `good np=1`: `1.032x`
+
+So the branch did recover the earlier dense `q8_0` win once the broad replay guard was removed from dense `qwen35`.
+
+## What We Already Tried On Hybrid-State Behavior
+
+We already tried the shallow hybrid-state experiments:
+
+- rollback / restore / replay hardening
+- replay-logit tracing
+- disabling the greedy accept fast path as an isolation test
+- a one-step post-replay cooldown / plain-step guard
+- broad guard on all hybrid Qwen 3.5 models
+- narrowed guard to avoid regressing dense `qwen35`
+
+We have not yet done the deeper runtime-state design used by systems like vLLM or SGLang:
+
+- explicit speculative branch-state storage beyond the current restore/replay path
+- deeper draft+verify+rewind integration inside libllama
+- multi-token native drafting
+
+That deeper work is outside this V1 prep branch.
+
+## V1 Next-Step Rule
+
+The next branch should stay dense-only and answer one question:
+
+- can dense `qwen35` achieve a repeatable `np=1` single-user win of at least about `1.05x` on `9B q8_0` without breaking exactness and without becoming quant-fragile?
+
+Practical stop condition:
+
+- if the next dense-only branch cannot recover a consistent `>= 5%` `np=1` win on `9B q8_0` while keeping exactness, stop and document the current single-token native-MTP ceiling
+
+## Benchmark Gate
+
+Keep using:
+
+- [scripts/validate_mtp_cuda.py](../../scripts/validate_mtp_cuda.py)
+- [native-mtp-benchmarks.md](native-mtp-benchmarks.md)
+
+Every kept runtime change must beat:
+
+- greedy baseline on the same dense model and prompt
+- the immediately previous native-MTP result
+
+Prefer removal over accumulation if a change does not survive the repeated median gate.
 
 ================
 File: docs/development/native-mtp-benchmarks.md
