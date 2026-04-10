@@ -18,7 +18,13 @@ Current branch framing:
 
 - `master`: fork baseline plus minimal fork-specific documentation
 - `research/xquant-on-hold`: experimental XQuant KV rematerialization snapshot
-- `feat/native-mtp-qwen35-*`: native MTP research branches preserved as working but paused experiments
+- `research/native-mtp-*`: native MTP runtime and benchmark branches preserved as working but paused experiments
+- `archive/native-mtp-base-2026-04`: preserved base snapshot for the native-MTP series
+
+Current experimental scope:
+
+- XQuant: preserved as an on-hold research line focused on KV rematerialization
+- native MTP: preserved as an on-hold research line focused on Qwen 3.5 speculative decoding inside llama.cpp
 
 Current native-MTP status:
 
@@ -38,7 +44,7 @@ Why it is paused:
 So the current reading is simple: native MTP in this fork works, but its speedup is too narrow and too constrained to keep pushing as a short local optimization series.
 Reaching the broader gains seen in runtimes such as vLLM or SGLang would require deeper runtime-state work rather than more small heuristics.
 
-The XQuant prototype is also on hold. See [docs/experiments/xquant.md](docs/experiments/xquant.md).
+The XQuant prototype is also on hold, but this fork is no longer just an XQuant snapshot. It now preserves multiple experiment lines, with XQuant and native MTP as the current documented research tracks.
 
 Related notes:
 
