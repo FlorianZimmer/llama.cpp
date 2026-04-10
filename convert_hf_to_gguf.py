@@ -5316,6 +5316,15 @@ class _Qwen3_5MTPBase(_LinearAttentionVReorderBase):
         if name not in remapped_shared:
             raise ValueError(f"Unexpected Qwen3.5 MTP tensor: {name}")
 
+        if name in {
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.norm.weight",
+            "mtp.shared_head.norm.weight",
+        }:
+            # Qwen 3.5 RMSNorm stores zero-centered weights and applies (1 + w) at runtime.
+            data_torch = data_torch + 1
+
         tensor_type = remapped_shared[name]
         for bid in range(base_layer, self.block_count):
             yield (self.format_tensor_name(tensor_type, bid, ".weight"), data_torch)
