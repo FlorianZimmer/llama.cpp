@@ -5270,6 +5270,8 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
 
 class _Qwen3_5MTPBase(_LinearAttentionVReorderBase):
+    model_arch = gguf.MODEL_ARCH.QWEN35  # overridden by subclasses
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
