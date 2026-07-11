@@ -20,3 +20,10 @@ Before iterating on xquant, note that shared models live under `/Users/florian/L
 
 ## Security & Configuration Tips
 Report vulnerabilities through `SECURITY.md`; never include secrets or proprietary weights in issues. GPU backends depend on vendor SDKs (CUDA, SYCL, MUSA), so document the driver/runtime versions you validated. Keep shared commands relative to the repo root so instructions remain shell-agnostic.
+
+## Task Sizing and Scope Discipline
+
+- When the user identifies the files, desired change, and acceptance criteria, make the direct edit and run focused verification.
+- Do not create design documents, implementation plans, tracking artifacts, or commits beyond the requested changes unless the user asks or a genuine unresolved design, cross-cutting dependency, or material scope decision requires it.
+- Use brainstorming or detailed planning only for new behavior, architecture decisions, or genuinely ambiguous requirements.
+- Skills guide execution; they do not authorize expanding the accepted scope.
